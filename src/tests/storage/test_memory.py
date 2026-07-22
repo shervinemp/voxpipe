@@ -80,6 +80,23 @@ class TestMemoryStoreRetrieve(unittest.TestCase):
         results = mem.retrieve("game", top_k=5)
         self.assertTrue(any("game info" in r["content"] for r in results))
 
+    def test_session_and_global_pools(self):
+        mem = self._make()
+        mem.store("Global system rules for python coding.", session_id=None, role="system")
+        mem.store("Alice session preference for dark mode.", session_id="alice", role="user")
+        mem.store("Bob session preference for light mode.", session_id="bob", role="user")
+
+        alice_res = mem.retrieve("preference coding mode", session_id="alice", include_global=True, top_k=5)
+        alice_contents = [r["content"] for r in alice_res]
+        self.assertIn("Alice session preference for dark mode.", alice_contents)
+        self.assertIn("Global system rules for python coding.", alice_contents)
+        self.assertNotIn("Bob session preference for light mode.", alice_contents)
+
+        alice_only = mem.retrieve("preference coding mode", session_id="alice", include_global=False, top_k=5)
+        alice_only_contents = [r["content"] for r in alice_only]
+        self.assertIn("Alice session preference for dark mode.", alice_only_contents)
+        self.assertNotIn("Global system rules for python coding.", alice_only_contents)
+
 
 class TestMemoryEviction(unittest.TestCase):
     """Eviction by count and TTL."""

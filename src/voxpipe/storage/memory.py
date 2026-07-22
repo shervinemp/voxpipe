@@ -1,4 +1,4 @@
-"""SQLite-backed conversation memory with FTS5 keyword search."""
+"""SQLite-backed conversation memory with FTS5 keyword search and session/global pool support."""
 
 import hashlib
 import json
@@ -30,6 +30,7 @@ class Memory(Retriever):
             self._conn.executescript("""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
+                    session_id TEXT,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     meta TEXT DEFAULT '{}',
@@ -39,7 +40,15 @@ class Memory(Retriever):
                     ON conversations(created_at);
                 CREATE INDEX IF NOT EXISTS idx_conv_role
                     ON conversations(role);
+                CREATE INDEX IF NOT EXISTS idx_conv_session
+                    ON conversations(session_id);
             """)
+            cur = self._conn.execute("PRAGMA table_info(conversations)")
+            cols = [row[1] for row in cur.fetchall()]
+            if "session_id" not in cols:
+                self._conn.execute("ALTER TABLE conversations ADD COLUMN session_id TEXT")
+                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)")
+
             try:
                 self._conn.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS conv_fts "
@@ -53,19 +62,22 @@ class Memory(Retriever):
             except sqlite3.OperationalError:
                 pass
 
-    def store(self, content: str, **kwargs):
+    def store(self, content: str, session_id: str | None = None, **kwargs):
         role = kwargs.get("role", "user")
-        meta = kwargs.get("meta")
+        meta = kwargs.get("meta") or {}
+        if session_id and "session_id" not in meta:
+            meta["session_id"] = session_id
+
         entry_id = hashlib.md5(
             f"{role}:{content}:{time.time()}".encode()
         ).hexdigest()[:16]
-        meta_str = json.dumps(meta or {})
+        meta_str = json.dumps(meta)
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO conversations "
-                "(id, role, content, meta, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (entry_id, role, content, meta_str, time.time()),
+                "(id, session_id, role, content, meta, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (entry_id, session_id, role, content, meta_str, time.time()),
             )
             try:
                 self._conn.execute(
@@ -76,38 +88,60 @@ class Memory(Retriever):
                 pass
             self._evict_old()
 
-    def retrieve(self, query: str, top_k: int = 3,
-                 **kwargs) -> list[dict]:
+    def retrieve(self, query: str, top_k: int = 3, session_id: str | None = None,
+                 include_global: bool = True, **kwargs) -> list[dict]:
         role = kwargs.get("role")
         keywords = [w for w in query.lower().split() if len(w) > 3]
         if not keywords:
             return []
         results = []
         seen = set()
+
+        sess_clause = ""
+        params_extra = []
+        if session_id is not None:
+            if include_global:
+                sess_clause = " AND (c.session_id = ? OR c.session_id IS NULL) "
+                params_extra.append(session_id)
+            else:
+                sess_clause = " AND c.session_id = ? "
+                params_extra.append(session_id)
+        else:
+            if not include_global:
+                sess_clause = " AND c.session_id IS NULL "
+
         try:
             for kw in keywords[:5]:
+                sql_params = [f'"{kw}"']
                 if role:
+                    sql_params.append(role)
+                    sql_params.extend(params_extra)
+                    sql_params.append(top_k)
                     cur = self._conn.execute(
-                        "SELECT c.content, c.role, c.created_at "
+                        "SELECT c.content, c.role, c.created_at, c.session_id "
                         "FROM conversations c WHERE c.rowid IN ("
                         "SELECT rowid FROM conv_fts WHERE conv_fts MATCH ?)"
-                        "AND c.role = ? ORDER BY c.created_at DESC LIMIT ?",
-                        (f'"{kw}"', role, top_k),
+                        f"AND c.role = ? {sess_clause} ORDER BY c.created_at DESC LIMIT ?",
+                        tuple(sql_params),
                     )
                 else:
+                    sql_params.extend(params_extra)
+                    sql_params.append(top_k)
                     cur = self._conn.execute(
-                        "SELECT c.content, c.role, c.created_at "
+                        "SELECT c.content, c.role, c.created_at, c.session_id "
                         "FROM conversations c WHERE c.rowid IN ("
                         "SELECT rowid FROM conv_fts WHERE conv_fts MATCH ?)"
-                        "ORDER BY c.created_at DESC LIMIT ?",
-                        (f'"{kw}"', top_k),
+                        f"{sess_clause} ORDER BY c.created_at DESC LIMIT ?",
+                        tuple(sql_params),
                     )
                 for row in cur.fetchall():
                     if row[0] not in seen:
                         seen.add(row[0])
                         results.append({
-                            "content": row[0], "role": row[1],
+                            "content": row[0],
+                            "role": row[1],
                             "created_at": row[2],
+                            "session_id": row[3],
                         })
                         if len(results) >= top_k:
                             return results
