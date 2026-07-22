@@ -50,10 +50,11 @@ class Session:
             name="_confirm",
             description=(
                 "Confirm or resolve a pending ToolChoice or permission request using its unique UID.\n"
-                "When a tool requests user permission or parameter selection, invoke this tool once the user responds.\n"
+                "Match keys from the ToolChoice payload: pick one item for list options (e.g. choice={'slot': '2'} from {'slot': ['1','2']}), or provide text for open keys (e.g. choice={'answer': 'user response'}).\n"
                 "Examples:\n"
-                "- Permission confirmation: choice={'allow': true, 'remember': false} (set remember=true if user says 'always' or 'remember')\n"
-                "- Selection choice: choice={'slot': '2'} or choice={'answer': 'user selection'}"
+                "- Permission: choice={'allow': true, 'remember': false} (set remember=true if user says 'always' or 'remember')\n"
+                "- Option selection: choice={'slot': '2'}\n"
+                "- Open text choice: choice={'answer': 'user input'}"
             ),
             parameters=Tool.Parameter(
                 type="object",
