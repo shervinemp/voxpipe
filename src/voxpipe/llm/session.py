@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from functools import partial
 import asyncio
 import inspect
@@ -12,7 +13,7 @@ from ..core.exceptions import LLMError, ToolError
 
 from .model import LLM
 from .conversation import Conversation
-from .tools import Tool, ToolCall, ToolResult, ToolChoice
+from .tools import Tool, ToolCall, ToolResult, ToolChoice, ToolRegistry
 
 
 class Session:
@@ -40,30 +41,96 @@ class Session:
         if "_confirm" in self.conversation.tools:
             return
         if not any(
-            getattr(t, "may_return_choice", False)
+            getattr(t, "may_return_choice", False) or getattr(t, "requires_permission", False)
             for t in self.conversation.tools.values()
-        ):
+        ) and not any("pending" in self.conversation.get_meta(tn) for tn in self.conversation.tools):
             return
+
         self.conversation.tools["_confirm"] = Tool(
             name="_confirm",
-            description="Call this with the user's resolved parameters to confirm a pending action.",
+            description="Confirm or resolve a pending choice or permission request using its UID.",
             parameters=Tool.Parameter(
                 type="object",
                 properties={
-                    "action": Tool.Parameter(type="string", description="The tool to confirm"),
-                    "params": Tool.Parameter(type="object", description="The resolved parameters"),
+                    "uid": Tool.Parameter(type="string", description="The unique ToolChoice UID"),
+                    "choice": Tool.Parameter(type="object", description="The dictionary payload resolving the choice"),
                 },
-                required=["action", "params"],
+                required=["uid", "choice"],
             ),
             callback=self._on_confirm,
             instruction="Call _confirm when the user has made their choice.",
         )
 
-    def _on_confirm(self, action: str, params: dict) -> ToolResult:
-        tool = self.conversation.tools.get(action)
+    def _on_confirm(self, uid: str = None, choice: dict = None, **kwargs) -> ToolResult:
+        if kwargs:
+            if not uid and "uid" in kwargs:
+                uid = kwargs["uid"]
+            if not choice:
+                if "choice" in kwargs and isinstance(kwargs["choice"], dict):
+                    choice = kwargs["choice"]
+                else:
+                    choice = {k: v for k, v in kwargs.items() if k != "uid"}
+
+        if not uid:
+            raise ToolError("Missing required parameter 'uid' for _confirm.")
+
+        found_call, found_choice, target_tool_name = None, None, None
+        for t_name in self.conversation.tools:
+            meta = self.conversation.get_meta(t_name)
+            pending = meta.get("pending", {})
+            if uid in pending:
+                target_tool_name = t_name
+                found_call, found_choice = pending[uid]
+                break
+
+        if not found_call:
+            raise ToolError(f"No pending ToolChoice found for UID '{uid}'")
+
+        if isinstance(choice, str):
+            try:
+                choice = json.loads(choice)
+            except Exception:
+                raise ToolError("Parameter 'choice' could not be parsed as valid JSON.")
+
+        if choice is None or not isinstance(choice, dict):
+            raise ToolError("Parameter 'choice' must be a dictionary.")
+
+        expected_keys = set(found_choice.choices_dict.keys()) - {"uid"}
+        given_keys = set(choice.keys()) - {"uid"}
+
+        if expected_keys == {"allow", "remember"} and "allow" in given_keys:
+            raw_allow = choice["allow"]
+            raw_remember = choice.get("remember", False)
+            allow = raw_allow if isinstance(raw_allow, bool) else str(raw_allow).lower() in {"true", "1"}
+            remember = raw_remember if isinstance(raw_remember, bool) else str(raw_remember).lower() in {"true", "1"}
+            if remember:
+                self.conversation.set_permission(target_tool_name, allow)
+
+            self.conversation.get_meta(target_tool_name).get("pending", {}).pop(uid, None)
+
+            if allow:
+                tool = self.conversation.tools.get(target_tool_name)
+                if tool is None:
+                    raise ToolError(f"Unknown tool '{target_tool_name}' for _confirm")
+                return tool._execute_direct(**found_call.arguments)
+            else:
+                return ToolResult(
+                    {"status": "cancelled", "action": target_tool_name},
+                    speech=f"Action {target_tool_name} was cancelled."
+                )
+
+        if expected_keys != given_keys:
+            raise ToolError(
+                f"_confirm choice keys {list(given_keys)} do not match expected keys {list(expected_keys)}"
+            )
+
+        self.conversation.get_meta(target_tool_name).get("pending", {}).pop(uid, None)
+        tool = self.conversation.tools.get(target_tool_name)
         if tool is None:
-            raise ToolError(f"Unknown tool '{action}' for _confirm")
-        return tool(**params)
+            raise ToolError(f"Unknown tool '{target_tool_name}' for _confirm")
+        final_args = dict(found_call.arguments)
+        final_args.update(choice)
+        return tool._execute_direct(**final_args)
 
     def reset(self, conversation: Optional[Conversation] = None):
         """Reset conversation and provider state without replacing the session."""
@@ -171,12 +238,14 @@ class Session:
                     is_final = (iteration == self.max_tool_iterations)
                     tc = "none" if is_final else "auto"
                     yield from self._generate_response(tool_choice=tc)
-                    results = self.tool_caller.gather()
+                    results = self.tool_caller.gather(conversation=self.conversation)
                     if not results:
                         break
                     any_error = False
-                    for name, result in results.items():
+                    for name, exec_res in results.items():
+                        result = exec_res.result
                         if isinstance(result, ToolChoice):
+                            self._register_confirm()
                             self.conversation.add_tool_message(f"{name}: {result.result}")
                             self.conversation.add_assistant_message("Ask the user, then call _confirm.")
                             if result.speech:
@@ -240,7 +309,7 @@ class Session:
                 tool_dispatched = True
                 response_chunks.clear()
                 if kwargs.get("tool_choice") != "none":
-                    self.tool_caller(tool, **tool_args)
+                    self.tool_caller(tool, tool_call=chunk, **tool_args)
                 else:
                     self.logger.warning("Spurious tool call in final pass, ignoring %s", tool_name)
             else:
@@ -254,16 +323,24 @@ class Session:
                 yield final_response
 
 
+@dataclass
+class ToolExecutionResult:
+    tool_call: ToolCall
+    result: ToolResult | ToolChoice | str
+
+
 class ToolCaller:
 
     def __init__(self):
         self._loop: asyncio.AbstractEventLoop = None
         self._loop_thread: threading.Thread = None
         self._loop_ready_event = threading.Event()
-        self._futures: Queue[Tuple[str, asyncio.Future]] = None
+        self._futures: Queue[Tuple[ToolCall, asyncio.Future]] = None
         self.logger = get_logger(__name__)
 
-    def __call__(self, tool, **tool_args):
+    def __call__(self, tool, tool_call: ToolCall | None = None, **tool_args):
+        if tool_call is None:
+            tool_call = ToolCall(name=tool.name, arguments=tool_args)
         tool_callable = partial(tool.__call__, **tool_args)
 
         if asyncio.iscoroutinefunction(tool.callback) or inspect.iscoroutinefunction(getattr(tool_callable, "func", None)):
@@ -274,21 +351,29 @@ class ToolCaller:
             future = asyncio.run_coroutine_threadsafe(
                 asyncio.to_thread(tool_callable), self._loop
             )
-        self._futures.put((tool.name, future))
+        self._futures.put((tool_call, future))
 
-    def gather(self) -> Dict[str, Any]:
+    def gather(self, conversation: Conversation | None = None) -> Dict[str, ToolExecutionResult]:
         responses = {}
         while not self._futures.empty():
-            tool_name, future = self._futures.get()
+            tool_call, future = self._futures.get()
+            tool_name = tool_call.name
             try:
                 self.logger.debug("Gathering tool %s ...", tool_name)
-                responses[tool_name] = future.result(timeout=10.0)
-                self.logger.debug("Gathered tool %s: %s", tool_name, str(responses[tool_name])[:80])
+                res = future.result(timeout=10.0)
+                if isinstance(res, ToolChoice) and conversation is not None:
+                    meta = conversation.get_meta(tool_name)
+                    pending_map = meta.setdefault("pending", {})
+                    pending_map[res.uid] = (tool_call, res)
+                responses[tool_name] = ToolExecutionResult(tool_call=tool_call, result=res)
+                self.logger.debug("Gathered tool %s: %s", tool_name, str(res)[:80])
             except TimeoutError:
-                responses[tool_name] = f"Tool Error: {tool_name} timed out"
+                err_msg = f"Tool Error: {tool_name} timed out"
+                responses[tool_name] = ToolExecutionResult(tool_call=tool_call, result=err_msg)
                 self.logger.error(f"Tool {tool_name} timed out")
             except Exception as e:
-                responses[tool_name] = f"Tool Error: {e}"
+                err_msg = f"Tool Error: {e}"
+                responses[tool_name] = ToolExecutionResult(tool_call=tool_call, result=err_msg)
                 self.logger.error(
                     f"Error calling tool {tool_name}: {e}", exc_info=True
                 )

@@ -53,10 +53,13 @@ class MessageList(list):
         else:
             return Message.asdict(super().__getitem__(key))
 
-    def __setitem__(self, key: int | slice, value: Message | Dict[str, str]):
+    def __setitem__(self, key: int | slice, value: Any):
         if isinstance(key, slice):
-            for i in range(len(self))[key]:
-                self.__setitem__(i, value)
+            converted = [
+                v if isinstance(v, Message) else Message.from_dict(v)
+                for v in value
+            ]
+            super().__setitem__(key, converted)
         else:
             v = (
                 value
@@ -88,6 +91,28 @@ class Conversation:
         self._system: str = ""
         self._tools: Dict[str, Tool] = {}
         self._cutoff_idx: int = 0
+        self._meta: Dict[str, Dict[str, Any]] = {}
+
+    def get_meta(self, tool_name: str) -> Dict[str, Any]:
+        return self._meta.setdefault(tool_name, {})
+
+    def set_meta(self, tool_name: str, key: str, value: Any):
+        self.get_meta(tool_name)[key] = value
+
+    def clear_meta(self):
+        self._meta.clear()
+
+    def get_permission(self, tool_name: str) -> bool | None:
+        return self.get_meta(tool_name).get("_permission")
+
+    def set_permission(self, tool_name: str, allow: bool | None):
+        if allow is None:
+            self.get_meta(tool_name).pop("_permission", None)
+        else:
+            self.set_meta(tool_name, "_permission", allow)
+
+    def revoke_permission(self, tool_name: str):
+        self.set_permission(tool_name, None)
 
     def set_system_message(self, content: str):
         self._system = content
@@ -110,6 +135,7 @@ class Conversation:
     def clear(self):
         self._messages.clear()
         self._token_counts.clear()
+        self._meta.clear()
 
     @property
     def messages(self) -> List[Dict[str, str]]:
@@ -139,6 +165,7 @@ class Conversation:
             "system": self._system,
             "messages": [m.asdict() for m in list.__iter__(self._messages)],
             "cutoff_idx": self._cutoff_idx,
+            "_meta": self._meta,
         }
 
     @classmethod
@@ -149,6 +176,7 @@ class Conversation:
             conv._messages.append(Message.from_dict(msg_data))
             conv._token_counts.append(0)
         conv._cutoff_idx = data.get("cutoff_idx", 0)
+        conv._meta = data.get("_meta", {})
         return conv
 
     def save(self, path: str):

@@ -19,15 +19,17 @@ from voxpipe.llm.session import Session
 
 
 def _has_model():
-    from voxpipe.storage.manager import ensure_downloaded
     try:
-        ensure_downloaded("Gemma4E4B")
-        return True
+        from voxpipe.storage.manager import is_downloaded
+        return is_downloaded("Gemma4E4B")
     except Exception:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _has_model(), reason="Gemma4E4B GGUF not downloaded")
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not _has_model(), reason="Gemma4E4B GGUF not downloaded"),
+]
 
 
 class TestPipelineIntegration(unittest.TestCase):

@@ -3,6 +3,21 @@ from unittest.mock import patch
 import numpy as np
 
 from voxpipe.tts.model import TTSProviders
+import pytest
+
+
+def _has_kokoro():
+    try:
+        from voxpipe.storage.manager import is_downloaded
+        return is_downloaded("Kokoro")
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not _has_kokoro(), reason="Kokoro ONNX weights not downloaded"),
+]
 
 
 class TestTTS(unittest.TestCase):

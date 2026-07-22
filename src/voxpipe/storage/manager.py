@@ -85,3 +85,44 @@ def ensure_downloaded(
         return results
 
     raise ModelError(f"Model {name!r} has no files entry.")
+
+
+def is_downloaded(
+    name: str,
+    local_dir: str | None = None,
+) -> bool:
+    """Check whether all model files exist on disk and pass integrity checks without downloading."""
+    try:
+        with open(_MANIFEST_PATH) as f:
+            manifest = yaml.safe_load(f)
+
+        entry = manifest.get(name)
+        if not entry:
+            return False
+
+        base = _resolve_path(entry.get("local_dir", ""), local_dir)
+
+        if entry.get("backend") == "huggingface":
+            dest = os.path.join(base, entry["file"])
+            if not os.path.exists(dest):
+                return False
+            verify_file_sha256(dest, entry["sha256"])
+            if "mtp" in entry:
+                mtp_dest = os.path.join(base, entry["mtp"]["file"])
+                if not os.path.exists(mtp_dest):
+                    return False
+                verify_file_sha256(mtp_dest, entry["mtp"]["sha256"])
+            return True
+
+        if "files" in entry:
+            for key, info in entry["files"].items():
+                dest = os.path.join(base, os.path.basename(info["url"]))
+                if not os.path.exists(dest):
+                    return False
+                verify_file_sha256(dest, info["sha256"])
+            return True
+
+        return False
+    except Exception:
+        return False
+

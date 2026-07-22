@@ -7,7 +7,7 @@ This script demonstrates how to set up and run the ASR pipeline.
 
 import sys
 
-from .model import default_class
+from .model import ASRProviders
 
 from ..core.utils import setup_logging, get_logger
 
@@ -38,7 +38,7 @@ def main():
     logger = get_logger(__name__)
 
     args = parse_asr_args().__dict__
-    model = default_class(**args)
+    model = ASRProviders.ParakeetV2(**args)
 
     logger.info("Starting ASR...")
     model.start()

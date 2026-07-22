@@ -4,6 +4,21 @@ from unittest.mock import patch, MagicMock
 from voxpipe.asr.models import ParakeetV2
 from voxpipe.tts.model import TTSProviders
 from voxpipe.core.config import config
+import pytest
+
+
+def _has_kokoro():
+    try:
+        from voxpipe.storage.manager import is_downloaded
+        return is_downloaded("Kokoro")
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not _has_kokoro(), reason="Kokoro ONNX weights not downloaded"),
+]
 
 
 class TestASR(unittest.TestCase):

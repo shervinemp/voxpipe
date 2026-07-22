@@ -468,7 +468,7 @@ class LiteLLMProvider(LLM):
                 rc = getattr(delta, "reasoning_content", None)
                 if rc:
                     self.logger.debug(
-                        "openai chunk[%d] reasoning=%s", chunk_count, rc[:50]
+                        "openai chunk reasoning=%s", rc[:50]
                     )
 
             for tc in (getattr(delta, "tool_calls", None) or ()):

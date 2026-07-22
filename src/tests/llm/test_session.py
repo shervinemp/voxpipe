@@ -459,7 +459,7 @@ class TestSessionConfirm(unittest.TestCase):
 
     def test_on_confirm_dispatches_to_tool(self):
         from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolResult
+        from voxpipe.llm.tools import Tool, ToolResult, ToolCall, ToolChoice
         from voxpipe.llm.conversation import Conversation
         captured = []
         def fn(x: int) -> ToolResult:
@@ -472,14 +472,59 @@ class TestSessionConfirm(unittest.TestCase):
         llm.count_tokens = MagicMock(return_value=1)
         sess = Session(llm=llm, conversation=conv)
         try:
-            result = sess._on_confirm(action="test", params={"x": 42})
+            call = ToolCall(name="test", arguments={"x": 42})
+            choice = ToolChoice(result={"uid": "tc_1234", "allow": [True, False], "remember": [True, False]})
+            conv.get_meta("test")["pending"] = {"tc_1234": (call, choice)}
+            result = sess._on_confirm(uid="tc_1234", choice={"allow": True, "remember": False})
             self.assertIsInstance(result, ToolResult)
             self.assertEqual(captured, [42])
             self.assertIn("42", result.result)
         finally:
             sess.close()
 
-    def test_on_confirm_unknown_tool_raises(self):
+    def test_on_confirm_permission_remember(self):
+        from voxpipe.llm.session import Session
+        from voxpipe.llm.tools import Tool, ToolResult, ToolCall, ToolChoice
+        from voxpipe.llm.conversation import Conversation
+        captured = []
+        def fn(x: int) -> ToolResult:
+            captured.append(x)
+            return ToolResult(result={"x": x})
+        conv = Conversation()
+        conv.tools["test"] = Tool.from_callable("test", fn)
+        llm = MagicMock()
+        llm.create_context_strategy = MagicMock(return_value=MagicMock())
+        llm.count_tokens = MagicMock(return_value=1)
+        sess = Session(llm=llm, conversation=conv)
+        try:
+            call = ToolCall(name="test", arguments={"x": 99})
+            choice = ToolChoice(result={"uid": "tc_5678", "allow": [True, False], "remember": [True, False]})
+            conv.get_meta("test")["pending"] = {"tc_5678": (call, choice)}
+            result = sess._on_confirm(uid="tc_5678", choice={"allow": True, "remember": True})
+            self.assertIsInstance(result, ToolResult)
+            self.assertEqual(captured, [99])
+            self.assertTrue(conv.get_meta("test").get("_permission"))
+        finally:
+            sess.close()
+
+    def test_on_confirm_mismatched_keys_raises(self):
+        from voxpipe.llm.session import Session
+        from voxpipe.llm.tools import ToolCall, ToolChoice
+        from voxpipe.core.exceptions import ToolError
+        llm = MagicMock()
+        llm.create_context_strategy = MagicMock(return_value=MagicMock())
+        llm.count_tokens = MagicMock(return_value=1)
+        sess = Session(llm=llm)
+        try:
+            call = ToolCall(name="test", arguments={})
+            choice = ToolChoice(result={"uid": "tc_9999", "allow": [True, False], "remember": [True, False]})
+            sess.conversation.get_meta("test")["pending"] = {"tc_9999": (call, choice)}
+            with self.assertRaises(ToolError):
+                sess._on_confirm(uid="tc_9999", choice={"allow": True})  # Missing 'remember'
+        finally:
+            sess.close()
+
+    def test_on_confirm_unknown_uid_raises(self):
         from voxpipe.llm.session import Session
         from voxpipe.core.exceptions import ToolError
         llm = MagicMock()
@@ -488,7 +533,7 @@ class TestSessionConfirm(unittest.TestCase):
         sess = Session(llm=llm)
         try:
             with self.assertRaises(ToolError):
-                sess._on_confirm(action="nonexistent", params={})
+                sess._on_confirm(uid="nonexistent", choice={"allow": True, "remember": False})
         finally:
             sess.close()
 

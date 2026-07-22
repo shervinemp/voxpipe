@@ -57,3 +57,7 @@ voxpipe = ["config.defaults.yaml"]
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]
 python_files = "test_*.py"
+markers = [
+    "integration: heavy integration benchmarks requiring full model loading in memory",
+]
+addopts = "-m 'not integration'"

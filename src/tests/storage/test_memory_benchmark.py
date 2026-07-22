@@ -28,17 +28,19 @@ def _model_key() -> str:
 
 def _has_model() -> bool:
     try:
-        from voxpipe.storage.manager import ensure_downloaded
-        ensure_downloaded(_model_key())
-        return True
+        from voxpipe.storage.manager import is_downloaded
+        return is_downloaded(_model_key())
     except Exception:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _has_model(),
-    reason="GGUF model not downloaded -- run python -m voxpipe.llm.download first",
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not _has_model(),
+        reason="GGUF model not downloaded -- run python -m voxpipe.llm.download first",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------

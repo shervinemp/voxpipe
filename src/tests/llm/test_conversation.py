@@ -152,3 +152,18 @@ class TestConversation(unittest.TestCase):
         conv = Conversation()
         conv.tools = {"t1": t}
         self.assertIn("t1", conv.tools)
+
+    def test_message_list_slice_assignment(self):
+        from voxpipe.llm.conversation import MessageList, Message
+        msg_list = MessageList([
+            {"role": "user", "content": "1"},
+            {"role": "assistant", "content": "2"},
+        ])
+        new_msgs = [
+            {"role": "user", "content": "updated 1"},
+            Message(role=Message.Role.assistant, content="updated 2"),
+        ]
+        msg_list[0:2] = new_msgs
+        self.assertEqual(msg_list[0]["content"], "updated 1")
+        self.assertEqual(msg_list[1]["content"], "updated 2")
+

@@ -9,7 +9,7 @@ import sys
 
 from ..core.utils import setup_logging, get_logger
 
-from .model import TTS
+from .model import TTSProviders
 
 
 def main():
@@ -20,7 +20,7 @@ def main():
     logger = get_logger(__name__)
 
     try:
-        tts = TTS()
+        tts = TTSProviders.Kokoro()
         tts.start()
 
         logger.info("Starting continuous TTS loop. Type 'exit' to quit.")

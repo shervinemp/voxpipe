@@ -17,6 +17,20 @@ from voxpipe.tts.model import TTSProviders
 from voxpipe.core.config import config
 
 
+def _has_kokoro():
+    try:
+        from voxpipe.storage.manager import is_downloaded
+        return is_downloaded("Kokoro")
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not _has_kokoro(), reason="Kokoro ONNX weights not downloaded"),
+]
+
+
 # ---------------------------------------------------------------------------
 # Edit-distance helpers
 # ---------------------------------------------------------------------------

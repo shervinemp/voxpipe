@@ -13,12 +13,12 @@ class TestToolResultChoice(unittest.TestCase):
 
     def test_tool_choice_inherits_speech(self):
         from voxpipe.llm.tools import ToolChoice
-        c = ToolChoice(result="test", speech="Which one?")
+        c = ToolChoice(result={"item": "test"}, speech="Which one?")
         self.assertEqual(c.speech, "Which one?")
 
     def test_tool_choice_no_speech(self):
         from voxpipe.llm.tools import ToolChoice
-        c = ToolChoice(result=["a", "b"])
+        c = ToolChoice(result={"slots": ["a", "b"]})
         self.assertIsNone(c.speech)
 
     def test_tool_choice_is_tool_result(self):
@@ -176,3 +176,59 @@ class TestToolSerialization(unittest.TestCase):
         d = p.to_dict()
         self.assertEqual(d["type"], "string")
         self.assertNotIn("description", d)
+
+
+class TestPermissionAndMeta(unittest.TestCase):
+    """Tool._meta, UID auto-generation, and permission interception behavior."""
+
+    def setUp(self):
+        from voxpipe.llm.tools import Tool
+        Tool.clear_meta()
+
+    def test_tool_choice_auto_uid(self):
+        from voxpipe.llm.tools import ToolChoice
+        tc = ToolChoice(result={"choice": ["A", "B"]})
+        self.assertTrue(tc.uid.startswith("tc_"))
+        self.assertIn("uid", tc.choices_dict)
+
+    def test_tool_meta_get_set_clear(self):
+        from voxpipe.llm.tools import Tool
+        Tool.set_meta("my_tool", "custom_key", 123)
+        self.assertEqual(Tool.get_meta("my_tool").get("custom_key"), 123)
+        Tool.clear_meta()
+        self.assertEqual(Tool.get_meta("my_tool"), {})
+
+    def test_permission_interception_none(self):
+        from voxpipe.llm.tools import Tool, ToolChoice
+        def sensitive_action(target: str) -> dict:
+            return {"deleted": target}
+        t = Tool.from_callable("delete", sensitive_action)
+        t.requires_permission = True
+        res = t(target="file.txt")
+        self.assertIsInstance(res, ToolChoice)
+        self.assertIn("allow", res.choices_dict)
+        self.assertIn("remember", res.choices_dict)
+        self.assertTrue(res.uid.startswith("tc_"))
+
+    def test_permission_interception_remember_true(self):
+        from voxpipe.llm.tools import Tool, ToolResult
+        def sensitive_action(target: str) -> dict:
+            return {"deleted": target}
+        t = Tool.from_callable("delete", sensitive_action)
+        t.requires_permission = True
+        Tool.set_meta("delete", "_permission", True)
+        res = t(target="file.txt")
+        self.assertIsInstance(res, ToolResult)
+        self.assertIn("file.txt", res.result)
+
+    def test_permission_interception_remember_false(self):
+        from voxpipe.llm.tools import Tool, ToolResult
+        def sensitive_action(target: str) -> dict:
+            return {"deleted": target}
+        t = Tool.from_callable("delete", sensitive_action)
+        t.requires_permission = True
+        Tool.set_meta("delete", "_permission", False)
+        res = t(target="file.txt")
+        self.assertIsInstance(res, ToolResult)
+        self.assertIn("permanently denied", res.result)
+

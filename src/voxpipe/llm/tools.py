@@ -18,6 +18,11 @@ def _returns_choice(annotation) -> bool:
         return False
 
 
+from functools import wraps
+import json
+import uuid
+
+
 @dataclass
 class ToolCall:
     """Represents a requested tool call from the LLM."""
@@ -27,28 +32,98 @@ class ToolCall:
 
 @dataclass(init=False)
 class ToolResult:
-    _result: str | list | dict
+    _result: dict
     speech: str | None = None
+    uid: str = ""
 
-    def __init__(self, result: str | list | dict, speech: str | None = None):
+    def __init__(self, result: dict | str, speech: str | None = None, uid: str | None = None):
+        self.uid = uid or f"tr_{uuid.uuid4().hex[:8]}"
+        if isinstance(result, str):
+            result = {"result": result}
+        elif not isinstance(result, dict):
+            raise TypeError(f"ToolResult result must be a dict, got {type(result).__name__}")
         self._result = result
         self.speech = speech
 
     @property
+    def raw_result(self) -> dict:
+        return self._result
+
+    @property
     def result(self) -> str:
-        r = self._result
-        return r if isinstance(r, str) else str(r)
+        return json.dumps(self._result, default=str)
 
 
 @dataclass(init=False)
 class ToolChoice(ToolResult):
-    def __init__(self, result: str | list | dict, speech: str | None = None):
-        super().__init__(result=result, speech=speech)
+    def __init__(self, result: dict, speech: str | None = None, uid: str | None = None):
+        if not isinstance(result, dict):
+            raise TypeError(f"ToolChoice result must be a dict, got {type(result).__name__}")
+        res = dict(result)
+        gen_uid = uid or f"tc_{uuid.uuid4().hex[:8]}"
+        if "uid" not in res:
+            res["uid"] = gen_uid
+        super().__init__(result=res, speech=speech, uid=res["uid"])
+
+    @property
+    def choices_dict(self) -> dict:
+        return self._result
 
     @property
     def result(self) -> str:
         data = super().result
         return f"Available options: {data}"
+
+
+import threading
+
+
+class ToolRegistry:
+    """Registry class managing registered tools and metadata storage space keyed by tool_name."""
+    _registry: ClassVar[Dict[str, "Tool"]] = {}
+    _meta: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    _lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @classmethod
+    def get_meta(cls, tool_name: str) -> Dict[str, Any]:
+        with cls._lock:
+            return cls._meta.setdefault(tool_name, {})
+
+    @classmethod
+    def set_meta(cls, tool_name: str, key: str, value: Any):
+        with cls._lock:
+            cls._meta.setdefault(tool_name, {})[key] = value
+
+    @classmethod
+    def clear(cls):
+        with cls._lock:
+            cls._registry.clear()
+            cls._meta.clear()
+
+
+def permission(fn: Callable = None):
+    """Decorator or wrapper requiring user permission to execute the decorated tool function."""
+    if fn is None:
+        return lambda f: permission(f)
+
+    tool_name = getattr(fn, "__name__", "tool")
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        perm = ToolRegistry.get_meta(tool_name).get("_permission")
+        if perm is True:
+            return fn(*args, **kwargs)
+        elif perm is False:
+            return ToolResult(
+                {"error": f"Permission permanently denied for tool '{tool_name}'"},
+                speech=f"Permission for {tool_name} was denied."
+            )
+        else:
+            return ToolChoice(
+                {"allow": [True, False], "remember": [True, False]},
+                speech=f"Permission requested to run {tool_name}."
+            )
+    return wrapper
 
 
 @dataclass
@@ -133,14 +208,51 @@ class Tool:
         def __str__(self) -> str:
             return str(self.to_dict())
 
+    _registry: ClassVar[Dict[str, "Tool"]] = ToolRegistry._registry
+
+    @classmethod
+    def get_meta(cls, tool_name: str) -> Dict[str, Any]:
+        return ToolRegistry.get_meta(tool_name)
+
+    @classmethod
+    def set_meta(cls, tool_name: str, key: str, value: Any):
+        ToolRegistry.set_meta(tool_name, key, value)
+
+    @classmethod
+    def clear_meta(cls):
+        ToolRegistry.clear()
+
     name: str
     description: str
     parameters: Optional[Parameter] = field(default=None)
     callback: Optional[Callable] = None
     instruction: Optional[str] = None
     may_return_choice: Optional[bool] = None
+    requires_permission: Optional[bool] = False
 
     def __call__(self, **kwargs) -> ToolResult:
+        if self.callback is None:
+            raise ToolError(
+                f"Tool '{self.name}' has no callback registered."
+            )
+        conversation = kwargs.pop("_conversation", None)
+        if self.requires_permission:
+            perm = conversation.get_meta(self.name).get("_permission") if conversation is not None else ToolRegistry.get_meta(self.name).get("_permission")
+            if perm is True:
+                return self._execute_direct(**kwargs)
+            elif perm is False:
+                return ToolResult(
+                    {"error": f"Permission permanently denied for tool '{self.name}'"},
+                    speech=f"Permission for {self.name} was denied."
+                )
+            else:
+                return ToolChoice(
+                    {"allow": [True, False], "remember": [True, False]},
+                    speech=f"Permission requested to run {self.name}."
+                )
+        return self._execute_direct(**kwargs)
+
+    def _execute_direct(self, **kwargs) -> ToolResult:
         if self.callback is None:
             raise ToolError(
                 f"Tool '{self.name}' has no callback registered."

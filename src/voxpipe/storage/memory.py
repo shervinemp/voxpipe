@@ -45,6 +45,11 @@ class Memory(Retriever):
                     "CREATE VIRTUAL TABLE IF NOT EXISTS conv_fts "
                     "USING fts5(content, tokenize='porter')"
                 )
+                self._conn.execute(
+                    "CREATE TRIGGER IF NOT EXISTS conv_fts_del "
+                    "AFTER DELETE ON conversations BEGIN "
+                    "DELETE FROM conv_fts WHERE rowid = old.rowid; END;"
+                )
             except sqlite3.OperationalError:
                 pass
 
@@ -52,7 +57,7 @@ class Memory(Retriever):
         role = kwargs.get("role", "user")
         meta = kwargs.get("meta")
         entry_id = hashlib.md5(
-            f"{role}:{content}:{time.monotonic()}".encode()
+            f"{role}:{content}:{time.time()}".encode()
         ).hexdigest()[:16]
         meta_str = json.dumps(meta or {})
         with self._lock:
@@ -60,7 +65,7 @@ class Memory(Retriever):
                 "INSERT OR IGNORE INTO conversations "
                 "(id, role, content, meta, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (entry_id, role, content, meta_str, time.monotonic()),
+                (entry_id, role, content, meta_str, time.time()),
             )
             try:
                 self._conn.execute(
@@ -111,7 +116,7 @@ class Memory(Retriever):
             return []
 
     def _evict_old(self):
-        cutoff = time.monotonic() - self.ttl_seconds
+        cutoff = time.time() - (self.ttl_seconds if self.ttl_seconds > 0 else 1.0)
         self._conn.execute(
             "DELETE FROM conversations WHERE created_at < ?", (cutoff,))
         count = self._conn.execute(

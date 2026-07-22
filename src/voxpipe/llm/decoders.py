@@ -254,7 +254,7 @@ class GeneralDecoder(StreamDecoder):
                         return
                     except json.JSONDecodeError:
                         _log.warning("Failed to parse call-format args: %s", args[:200])
-                yield ToolCall(name="_parse_error", arguments={"raw": body})
+            yield ToolCall(name="_parse_error", arguments={"raw": body})
             return
         if fmt == "json":
             try:
