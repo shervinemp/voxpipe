@@ -103,54 +103,6 @@ src/
 5. **Sentence splitter** streams the response, yielding one sentence at a time
 6. **TTS** speaks each sentence; new input interrupts playback (barge-in)
 
-### LLM Session
-
-The session manages tool iteration, conversation pruning, and per-turn dispatch.
-
-```python
-from voxpipe.llm import Session, LLMProviders
-
-llm = LLMProviders.create("local", "Gemma4_12B")
-session = Session(llm=llm, max_tool_iterations=1)
-session.conversation.tools["my_tool"] = my_tool
-
-for chunk in session("hello"):
-    print(chunk)  # streamed LLM response
-```
-
-### Tools
-
-Tools return `ToolResult` or `ToolChoice` (for multi-step confirmations).
-
-```python
-from voxpipe.llm.tools import Tool, ToolChoice, ToolResult
-
-def save_game(slot: int | None = None):
-    if slot is None:
-        return ToolChoice(result={"slot": ["1","2","3","4","5"]})
-    return ToolResult(result={"status": "saved", "slot": slot})
-
-tool = Tool.from_callable("save_game", save_game)
-```
-
-If the return-type annotation includes `ToolChoice`, a `_confirm` tool is
-auto-registered. The LLM calls it with the user's selection to execute.
-
-### Memory
-
-Conversation history is stored in SQLite with FTS5 full-text search. The
-pipeline auto-injects relevant past turns before each LLM call.
-
-```python
-from voxpipe.storage.memory import Memory
-
-mem = Memory(db_path="history.db")
-mem.store("What is Elden Ring?", role="user")
-mem.store("Elden Ring is a game by FromSoftware.", role="assistant")
-results = mem.retrieve("Elden Ring", top_k=3)
-# [{"content": "...", "role": "assistant", "created_at": 12345.6}]
-```
-
 ### LLM Backends
 
 **Local GGUF** — config-driven, no hardcoded model classes.
@@ -173,19 +125,6 @@ llm:
   litellm:
     provider: "openai"
     model: "gpt-4o"
-```
-
-### LLM Session
-
-```bash
-uv sync --extra dev --extra tts --extra gguf --extra asr
-python -m pytest src/tests/ -v --tb=short
-```
-
-Memory benchmarks (requires a downloaded GGUF model):
-
-```bash
-python -m pytest src/tests/storage/test_memory_benchmark.py -v
 ```
 
 ## License
