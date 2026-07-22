@@ -36,11 +36,9 @@ class ToolResult:
     speech: str | None = None
     uid: str = ""
 
-    def __init__(self, result: dict | str, speech: str | None = None, uid: str | None = None):
+    def __init__(self, result: dict, speech: str | None = None, uid: str | None = None):
         self.uid = uid or f"tr_{uuid.uuid4().hex[:8]}"
-        if isinstance(result, str):
-            result = {"result": result}
-        elif not isinstance(result, dict):
+        if not isinstance(result, dict):
             raise TypeError(f"ToolResult result must be a dict, got {type(result).__name__}")
         self._result = result
         self.speech = speech
