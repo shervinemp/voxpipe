@@ -1,0 +1,59 @@
+[project]
+name = "voxpipe"
+version = "0.1.0"
+description = "Modular voice pipeline: ASR, LLM tool calling, streaming TTS"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "emoji>=2.14,<3",
+    "numpy>=2.4,<3",
+    "pydantic>=2.10,<3",
+    "pynput~=1.7.6",
+    "python-dotenv~=1.1.1",
+    "pyyaml~=6.0.2",
+    "requests>=2.32,<3",
+    "sounddevice~=0.5.2",
+    "soundfile~=0.13.1",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/shervinemp/voxpipe"
+Issues = "https://github.com/shervinemp/voxpipe/issues"
+
+[project.scripts]
+voxpipe = "voxpipe.__main__:main"
+
+[project.optional-dependencies]
+asr = ["onnx-asr~=0.6.1", "onnxruntime~=1.22.1"]
+tts = ["huggingface-hub~=0.32.6", "kokoro-onnx~=0.4.9"]
+gguf = ["huggingface-hub~=0.32.6", "llama-cpp-python>=0.3.16", "tiktoken>=0.7,<1"]
+litellm = ["litellm~=1.92.0"]
+all = ["voxpipe[asr,tts,gguf,litellm]"]
+dev = ["pytest>=8,<9"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["voxpipe*"]
+
+[tool.setuptools.package-data]
+voxpipe = ["config.defaults.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+python_files = "test_*.py"

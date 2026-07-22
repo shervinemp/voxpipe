@@ -1,0 +1,23 @@
+# voxpipe — minimal configuration example
+# Copy to config.yaml and edit.
+# Full defaults in src/voxpipe/data/config.defaults.yaml
+
+llm:
+  backend: "local"       # "local" (GGUF) or "litellm" (remote APIs)
+  model: "Gemma4_12B"
+  max_tool_iterations: 1
+
+  # Local GGUF models — each key matches manifest.yaml
+  local:
+    Gemma4_12B:
+      decoder: "legacy_xml"
+
+  # LiteLLM remote backends
+  # litellm:
+  #   provider: "ollama"
+  #   model: "qwen3:latest"
+  #   api_base: "http://localhost:11434"
+
+hotkeys:
+  push_to_talk: null
+  press_to_reset: null

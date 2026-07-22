@@ -1,0 +1,59 @@
+llm:
+  backend: "local"
+  model: "Gemma4_12B"
+  max_tool_iterations: 1
+
+  local:
+    Qwen3: &qwen
+      n_ctx: 40960
+      max_tokens: 8192
+      decoder: "legacy_xml"
+
+    _gemma4: &gemma4
+      n_ctx: 8192
+      max_tokens: 2048
+      type_k: "q4_0"
+      type_v: "q4_0"
+
+    Gemma4E2B:
+      <<: *gemma4
+      decoder: "gemma_e2b"
+
+    Gemma4E4B:
+      <<: *gemma4
+      decoder: "gemma_e2b"
+
+    Gemma4_12B:
+      <<: *gemma4
+      decoder: "legacy_xml"
+
+  litellm:
+    provider: "ollama"
+    model: "qwen3:latest"
+    api_base: "http://localhost:11434"
+    timeout: 60
+    max_tokens: 1024
+
+hotkeys:
+  enable: true
+  push_to_talk: null
+  press_to_reset: null
+
+tts:
+  provider: "Kokoro"
+  weights_dir: "model_files/tts"
+
+asr:
+  provider: "ParakeetV2"
+  weights_dir: "model_files/asr"
+  vad_threshold: 0.4
+  trailing_silence_ms: 800
+  leading_silence_ms: 1000
+  max_segment_duration: 0
+
+conversation_history:
+  enabled: true
+  db_path: "data/conversations.db"
+  max_entries: 1000
+  top_k: 2
+  ttl_days: 30
