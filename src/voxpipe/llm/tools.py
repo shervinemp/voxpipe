@@ -258,14 +258,18 @@ class Tool:
                 f"Tool '{self.name}' has no callback registered."
             )
         result = self.callback(**self._parse_args(**kwargs))
+        if result is None:
+            return ToolResult(result={"status": "success"})
         if isinstance(result, ToolResult):
             return result
         if isinstance(result, dict):
             return ToolResult(result=result)
         if isinstance(result, str):
             return ToolResult(result={"result": result})
-        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict) and isinstance(result[1], str):
-            return ToolResult(result=result[0], speech=result[1])
+        if isinstance(result, tuple) and len(result) == 2:
+            res_dict = result[0] if isinstance(result[0], dict) else {"result": str(result[0])}
+            if isinstance(result[1], str):
+                return ToolResult(result=res_dict, speech=result[1])
         raise TypeError(
             f"Tool '{self.name}' callback returned {type(result).__name__}, must return a dict, str, ToolResult, or (dict, str)"
         )
@@ -293,9 +297,15 @@ class Tool:
             if arg_name in properties:
                 json_type = properties[arg_name].type
                 if json_type == "integer":
-                    casted_args[arg_name] = int(arg_value)
+                    try:
+                        casted_args[arg_name] = int(arg_value)
+                    except (ValueError, TypeError):
+                        raise ToolError(f"Tool argument '{arg_name}' must be an integer.")
                 elif json_type == "number":
-                    casted_args[arg_name] = float(arg_value)
+                    try:
+                        casted_args[arg_name] = float(arg_value)
+                    except (ValueError, TypeError):
+                        raise ToolError(f"Tool argument '{arg_name}' must be a number.")
                 elif json_type == "boolean":
                     if isinstance(arg_value, bool):
                         casted_args[arg_name] = arg_value

@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Dict, Optional, Tuple
-from .tools import Tool
+from .tools import Tool, ToolCall, ToolChoice
 
 if TYPE_CHECKING:
     from .model import LLM
@@ -161,11 +161,27 @@ class Conversation:
         self._tools = tools
 
     def to_dict(self) -> Dict:
+        serialized_meta = {}
+        for t_name, meta_dict in self._meta.items():
+            s_meta = {}
+            for k, v in meta_dict.items():
+                if k == "pending" and isinstance(v, dict):
+                    s_pending = {}
+                    for uid, (call, choice) in v.items():
+                        s_pending[uid] = (
+                            {"name": call.name, "arguments": call.arguments},
+                            {"result": choice.raw_result, "speech": choice.speech, "uid": choice.uid},
+                        )
+                    s_meta["pending"] = s_pending
+                else:
+                    s_meta[k] = v
+            serialized_meta[t_name] = s_meta
+
         return {
             "system": self._system,
             "messages": [m.asdict() for m in list.__iter__(self._messages)],
             "cutoff_idx": self._cutoff_idx,
-            "_meta": self._meta,
+            "_meta": serialized_meta,
         }
 
     @classmethod
@@ -176,7 +192,24 @@ class Conversation:
             conv._messages.append(Message.from_dict(msg_data))
             conv._token_counts.append(0)
         conv._cutoff_idx = data.get("cutoff_idx", 0)
-        conv._meta = data.get("_meta", {})
+
+        raw_meta = data.get("_meta", {})
+        reconstructed_meta = {}
+        for t_name, meta_dict in raw_meta.items():
+            r_meta = {}
+            for k, v in meta_dict.items():
+                if k == "pending" and isinstance(v, dict):
+                    r_pending = {}
+                    for uid, (call_dict, choice_dict) in v.items():
+                        call_obj = ToolCall(name=call_dict["name"], arguments=call_dict.get("arguments", {}))
+                        choice_obj = ToolChoice(result=choice_dict["result"], speech=choice_dict.get("speech"), uid=choice_dict.get("uid"))
+                        r_pending[uid] = (call_obj, choice_obj)
+                    r_meta["pending"] = r_pending
+                else:
+                    r_meta[k] = v
+            reconstructed_meta[t_name] = r_meta
+
+        conv._meta = reconstructed_meta
         return conv
 
     def save(self, path: str):

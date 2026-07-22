@@ -167,3 +167,20 @@ class TestConversation(unittest.TestCase):
         self.assertEqual(msg_list[0]["content"], "updated 1")
         self.assertEqual(msg_list[1]["content"], "updated 2")
 
+    def test_meta_serialization_with_pending_objects(self):
+        from voxpipe.llm.conversation import Conversation
+        from voxpipe.llm.tools import ToolCall, ToolChoice
+        conv = Conversation()
+        call = ToolCall(name="test", arguments={"a": 1})
+        choice = ToolChoice(result={"uid": "tc_meta_1", "allow": [True, False], "remember": [True, False]})
+        conv.get_meta("test")["pending"] = {"tc_meta_1": (call, choice)}
+        
+        d = conv.to_dict()
+        conv2 = Conversation.from_dict(d)
+        meta2 = conv2.get_meta("test")
+        self.assertIn("pending", meta2)
+        self.assertIn("tc_meta_1", meta2["pending"])
+        c_call, c_choice = meta2["pending"]["tc_meta_1"]
+        self.assertEqual(c_call.name, "test")
+        self.assertEqual(c_choice.uid, "tc_meta_1")
+
