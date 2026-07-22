@@ -48,17 +48,29 @@ class Session:
 
         self.conversation.tools["_confirm"] = Tool(
             name="_confirm",
-            description="Confirm or resolve a pending choice or permission request using its UID.",
+            description=(
+                "Confirm or resolve a pending ToolChoice or permission request using its unique UID.\n"
+                "When a tool requests user permission or parameter selection, invoke this tool once the user responds.\n"
+                "Examples:\n"
+                "- Permission confirmation: choice={'allow': true, 'remember': false} (set remember=true if user says 'always' or 'remember')\n"
+                "- Selection choice: choice={'slot': '2'} or choice={'answer': 'user selection'}"
+            ),
             parameters=Tool.Parameter(
                 type="object",
                 properties={
-                    "uid": Tool.Parameter(type="string", description="The unique ToolChoice UID"),
-                    "choice": Tool.Parameter(type="object", description="The dictionary payload resolving the choice"),
+                    "uid": Tool.Parameter(
+                        type="string",
+                        description="The exact UID string from the pending ToolChoice payload (e.g. 'tc_1234')",
+                    ),
+                    "choice": Tool.Parameter(
+                        type="object",
+                        description="Dictionary payload mapping the selection keys to their values matching the ToolChoice options",
+                    ),
                 },
                 required=["uid", "choice"],
             ),
             callback=self._on_confirm,
-            instruction="Call _confirm when the user has made their choice.",
+            instruction="When the user answers a pending ToolChoice prompt, call _confirm with its uid and choice payload.",
         )
 
     def _on_confirm(self, uid: str = None, choice: dict = None, **kwargs) -> ToolResult:
