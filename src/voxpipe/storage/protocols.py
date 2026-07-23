@@ -18,7 +18,7 @@ class Query:
         return self.text or ""
 
 
-QueryInput = Union[str, List[float], Query, Any]
+QueryInput = Union[str, Any]
 
 
 @runtime_checkable
