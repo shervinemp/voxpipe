@@ -174,7 +174,7 @@ class Pipeline:
         original_query = text
         if self.memory:
             context = self.memory.retrieve(text, top_k=getattr(self, "_conv_top_k", 2))
-            injected = [f"(Earlier: {ctx['content'][:200]})" for ctx in context if ctx.get("content")]
+            injected = [f"(Earlier: {str(ctx['content'])[:200]})" for ctx in context if ctx.get("content")]
             if injected:
                 text = "\n".join(injected) + "\n" + text
 
