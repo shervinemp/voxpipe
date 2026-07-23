@@ -63,6 +63,10 @@ class SQLiteStorage(Storage):
                 pass
 
     def store(self, content: Any, bank: str = "global", **kwargs) -> Record:
+        session_id = kwargs.get("session_id")
+        if session_id and bank == "global":
+            bank = f"session:{session_id}" if not str(session_id).startswith("session:") else session_id
+
         role = kwargs.get("role", "user")
         meta = kwargs.get("meta") or {}
         if "bank" not in meta:
@@ -117,15 +121,24 @@ class SQLiteStorage(Storage):
         if not keywords:
             return []
 
+        session_id = kwargs.get("session_id")
+        include_global = kwargs.get("include_global", True)
+
         if isinstance(banks, str):
             target_banks = [banks]
         elif isinstance(banks, list):
-            target_banks = banks
+            target_banks = list(banks)
         else:
             target_banks = ["global"]
 
+        if session_id:
+            s_bank = f"session:{session_id}" if not session_id.startswith("session:") else session_id
+            target_banks = [s_bank, session_id]
+            if include_global:
+                target_banks.append("global")
+
         placeholders = ",".join("?" for _ in target_banks)
-        sess_clause = f" AND (c.session_id IN ({placeholders}) OR c.session_id IS NULL) " if target_banks else ""
+        sess_clause = f" AND (c.session_id IN ({placeholders})) " if target_banks else ""
 
         results: List[Record] = []
         seen = set()

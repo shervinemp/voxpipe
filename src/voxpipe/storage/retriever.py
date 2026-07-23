@@ -1,19 +1,5 @@
-"""Abstract interface for context retrieval and storage."""
+"""Re-export Retriever protocol for backward compatibility."""
 
-from abc import ABC, abstractmethod
+from .protocols import Retriever
 
-
-class Retriever(ABC):
-    @abstractmethod
-    def retrieve(self, query: str, top_k: int = 3,
-                 **kwargs) -> list[dict]:
-        """Result dicts with at least ``{"content": str}``."""
-
-    def store(self, content: str, **kwargs):
-        pass
-
-    def close(self):
-        pass
-
-    def get_state(self) -> str:
-        return ""
+__all__ = ["Retriever"]

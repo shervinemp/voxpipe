@@ -28,6 +28,21 @@ class Record:
 
     def __getitem__(self, key: str) -> Any:
         """Dual-access support: record['content'] or record.content."""
-        if hasattr(self, key):
+        if isinstance(key, str) and hasattr(self, key):
             return getattr(self, key)
-        return self.meta.get(key)
+        if isinstance(key, str) and key in self.meta:
+            return self.meta[key]
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        """Support 'key in record' syntax."""
+        if isinstance(key, str):
+            return hasattr(self, key) or key in self.meta
+        return False
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Dict-like get access for backward compatibility."""
+        try:
+            return self[key]
+        except (KeyError, TypeError):
+            return default

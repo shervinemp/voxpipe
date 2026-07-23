@@ -2,6 +2,9 @@ class VoiceControlError(Exception):
     """Base exception for all voice-control errors."""
 
 
+VoxpipeError = VoiceControlError
+
+
 class ConfigError(VoiceControlError):
     """Configuration loading or validation error."""
 
