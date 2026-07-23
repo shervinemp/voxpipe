@@ -110,6 +110,13 @@ class Session:
                 break
 
         if not found_call:
+            pending_state = self.state.tools.get_all_pending()
+            if uid in pending_state:
+                found_call, found_choice = pending_state[uid]
+                for t_name, tool in self.conversation.tools.items():
+                    target_tool_name = t_name
+
+        if not found_call:
             raise ToolError(f"No pending ToolChoice found for UID '{uid}'")
 
         if isinstance(choice, str):
@@ -129,10 +136,13 @@ class Session:
             raw_remember = choice.get("remember", False)
             allow = raw_allow if isinstance(raw_allow, bool) else str(raw_allow).lower() in {"true", "1"}
             remember = raw_remember if isinstance(raw_remember, bool) else str(raw_remember).lower() in {"true", "1"}
-            if remember:
+            if remember and target_tool_name:
+                self.state.tools.set_permission(target_tool_name, allow)
                 self.conversation.set_permission(target_tool_name, allow)
 
-            self.conversation.get_meta(target_tool_name).get("pending", {}).pop(uid, None)
+            if target_tool_name:
+                self.conversation.get_meta(target_tool_name).get("pending", {}).pop(uid, None)
+            self.state.tools.remove_pending(uid)
 
             if allow:
                 tool = self.conversation.tools.get(target_tool_name)
