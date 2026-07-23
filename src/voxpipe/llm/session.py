@@ -18,6 +18,9 @@ from .context import ContextHandler, DropOldestStrategy
 from ..storage import MemoryStore, RAMStorage, SQLiteStorage, Record
 
 
+from .state import SessionState, SessionStateDictProxy
+
+
 class Session:
 
     def __init__(
@@ -41,7 +44,8 @@ class Session:
         self.context_handler = context_handler or ContextHandler(max_turns=max_turns, memory=memory)
         self._context_strategy = self.context_handler
 
-        self._session_state = dict()
+        self.state = SessionState()
+        self._session_state = SessionStateDictProxy(self.state)
         self._lock = threading.Lock()
 
         self.tool_caller.start()
@@ -158,7 +162,7 @@ class Session:
         """Reset conversation and provider state without replacing the session."""
         with self._lock:
             self.conversation = conversation or Conversation()
-            self._session_state.clear()
+            self.state.clear()
 
     def close(self):
         """Release the background tool execution loop."""
@@ -168,42 +172,15 @@ class Session:
         """Save session to a directory."""
         os.makedirs(path, exist_ok=True)
         self.conversation.save(os.path.join(path, "conversation.json"))
-        state = {}
-        with self._lock:
-            for k, v in self._session_state.items():
-                if k == "model_state" and not save_kv_cache:
-                    continue
-                if isinstance(v, (bytes, bytearray)):
-                    continue
-                state[k] = v
-        with open(os.path.join(path, "state.json"), "w") as f:
-            json.dump(state, f, indent=2)
-
-        if save_kv_cache:
-            state_data = self._session_state.get("model_state")
-            if isinstance(state_data, (bytes, bytearray)):
-                with open(os.path.join(path, "kv_cache.bin"), "wb") as f:
-                    f.write(state_data)
+        self.state.save(path, save_binary=save_kv_cache)
 
     @classmethod
     def load(cls, path: str, llm: LLM) -> "Session":
         """Load session from a directory with a fresh LLM instance."""
         conv_path = os.path.join(path, "conversation.json")
-        state_path = os.path.join(path, "state.json")
-        kv_path = os.path.join(path, "kv_cache.bin")
-
         conversation = Conversation.load(conv_path) if os.path.exists(conv_path) else Conversation()
         session = cls(llm=llm, conversation=conversation)
-
-        if os.path.exists(state_path):
-            with open(state_path) as f:
-                state = json.load(f)
-                session._session_state.update(state)
-
-        if os.path.exists(kv_path):
-            with open(kv_path, "rb") as f:
-                session._session_state["model_state"] = f.read()
-
+        session.state.load(path)
         return session
 
     def complete_once(
