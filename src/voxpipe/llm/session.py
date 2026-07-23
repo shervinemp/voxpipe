@@ -31,9 +31,11 @@ class Session:
         max_tool_iterations: int = 1,
         context_handler: Optional[ContextHandler] = None,
         memory: Optional[Any] = None,
+        session_id: str = "default",
     ):
         self.logger = get_logger(__name__)
         self.llm = llm
+        self.session_id = session_id
         self.conversation = conversation or Conversation()
         self.tool_caller = ToolCaller()
         self.max_tool_iterations = max_tool_iterations
@@ -237,7 +239,7 @@ class Session:
                 self.conversation.add_user_message(query)
                 self.logger.info(f"{query=}")
 
-            self.context_handler.handle(self.conversation, self.llm)
+            self.context_handler.handle(self.conversation, self.llm, session_id=self.session_id)
             self.logger.info("Starting LLM call...")
 
             if self.max_tool_iterations == 0:
