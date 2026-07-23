@@ -40,7 +40,13 @@ class RAMStorage(Storage):
         top_k: int = 3,
         **kwargs,
     ) -> List[Record]:
-        query_str = str(query).lower()
+        from .protocols import Query
+        if isinstance(query, Query):
+            query_str = (query.text or "").lower()
+            top_k = query.top_k or top_k
+        else:
+            query_str = str(query).lower()
+
         keywords = [w for w in query_str.split() if len(w) > 2]
         if not keywords and query_str:
             keywords = [query_str]

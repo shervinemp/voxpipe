@@ -105,8 +105,14 @@ class SQLiteStorage(Storage):
         top_k: int = 3,
         **kwargs,
     ) -> List[Record]:
+        from .protocols import Query
+        if isinstance(query, Query):
+            query_str = query.text or ""
+            top_k = query.top_k or top_k
+        else:
+            query_str = str(query)
+
         role = kwargs.get("role")
-        query_str = str(query)
         keywords = [w for w in query_str.lower().split() if len(w) > 2]
         if not keywords:
             return []
