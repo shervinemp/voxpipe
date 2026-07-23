@@ -52,16 +52,24 @@ class TestSessionManager(unittest.TestCase):
         self.assertTrue(self.manager.delete_session("sess_to_delete"))
         self.assertFalse(self.manager.delete_session("sess_to_delete"))
 
-    def test_export_zip(self):
+    def test_export_and_import_zip(self):
         session = Session(llm=self.mock_llm)
         session.conversation.add_user_message("Zip test message")
+        session.state.user.set("zip_var", "zip_val")
         self.manager.save_session(session, "sess_zip")
 
         zip_dest = os.path.join(self.tmp_dir, "exports", "sess_zip.zip")
         out_path = self.manager.export_zip("sess_zip", zip_dest)
 
         self.assertTrue(os.path.exists(out_path))
-        self.assertTrue(out_path.endswith(".zip"))
+
+        # Import into a new session ID
+        imported_id = self.manager.import_zip(out_path, session_id="sess_imported")
+        self.assertEqual(imported_id, "sess_imported")
+
+        loaded = self.manager.load_session("sess_imported", llm=self.mock_llm)
+        self.assertEqual(loaded.conversation.messages[-1]["content"], "Zip test message")
+        self.assertEqual(loaded.state.user.get("zip_var"), "zip_val")
 
 
 if __name__ == "__main__":

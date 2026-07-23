@@ -109,3 +109,20 @@ class SessionManager:
 
         self.logger.info("Exported session '%s' to zip %s", session_id, zip_path)
         return zip_path
+
+    def import_zip(self, zip_path: str, session_id: Optional[str] = None) -> str:
+        """Import a session from a .zip archive package into the sessions directory."""
+        if not os.path.exists(zip_path):
+            raise FileNotFoundError(f"Zip file '{zip_path}' not found")
+
+        if not session_id:
+            session_id = os.path.splitext(os.path.basename(zip_path))[0]
+
+        session_path = os.path.join(self.sessions_dir, session_id)
+        os.makedirs(session_path, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(session_path)
+
+        self.logger.info("Imported zip '%s' into session '%s'", zip_path, session_id)
+        return session_id
