@@ -172,11 +172,6 @@ class Pipeline:
             return
 
         original_query = text
-        if self.memory:
-            context = self.memory.retrieve(text, top_k=getattr(self, "_conv_top_k", 2))
-            injected = [f"(Earlier: {str(ctx['content'])[:200]})" for ctx in context if ctx.get("content")]
-            if injected:
-                text = "\n".join(injected) + "\n" + text
 
         self._response_parts = []
         self._llm_busy = True

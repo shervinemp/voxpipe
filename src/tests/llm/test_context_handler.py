@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, PropertyMock
 from voxpipe.llm.conversation import Conversation
-from voxpipe.llm.context import ContextHandler, DropOldestStrategy
+from voxpipe.llm.context import ContextHandler, MemoryHandler, DropOldestStrategy, MaxTurnsStrategy
 from voxpipe.storage import MemoryStore, RAMStorage
 
 
@@ -14,21 +14,21 @@ class TestContextHandler(unittest.TestCase):
         return m
 
     def test_context_handler_trim_and_auto_archive(self):
-        mem = MemoryStore(backend=RAMStorage(), bank="session:test")
-        handler = ContextHandler(max_turns=2, memory=mem, auto_archive=True)
+        mem = MemoryStore(backend=RAMStorage(), session_id="test")
+        handler = MemoryHandler(max_turns=2, memory_store=mem, amortize_step=1, auto_archive=True)
 
         conv = Conversation()
         for i in range(10):
             conv.add_user_message(f"message turn {i}")
 
-        llm = self._llm()
-        handler.handle(conv, llm, session_id="test")
+        changed = handler.pre_process(conv)
+        self.assertTrue(changed)
 
         # Verify trimming occurred
         self.assertLessEqual(conv.visible_count(), 6)
 
         # Verify auto-archival into RAM storage
-        archived = mem.retrieve("turn 0")
+        archived = mem.retrieve("message turn 0")
         self.assertGreater(len(archived), 0)
 
 

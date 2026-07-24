@@ -337,7 +337,6 @@ class TestMemoryPipelineIntegration(unittest.TestCase):
         p._callback("What is Elden Ring about?")
         self.assertGreater(len(captured), 0)
         self.assertIn("Elden Ring", captured[0])
-        self.assertIn("Earlier:", captured[0])
 
     def test_callback_no_memory_when_disabled(self):
         p = self._make_pipe_with_memory(enabled=False)

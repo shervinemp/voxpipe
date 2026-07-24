@@ -9,9 +9,15 @@ from .record import Record
 class MemoryStore:
     """High-level MemoryStore facade managing backend delegation and bank namespace scoping."""
 
-    def __init__(self, backend: Optional[Storage] = None, bank: str = "global"):
+    def __init__(
+        self,
+        backend: Optional[Storage] = None,
+        bank: Optional[str] = None,
+        session_id: str = "default",
+    ):
         self.backend = backend or RAMStorage()
-        self.bank = bank
+        self.session_id = session_id
+        self.bank = bank or f"session:{session_id}"
 
     def store(self, content: Any, **kwargs) -> Record:
         """Store content under the bound bank namespace."""
