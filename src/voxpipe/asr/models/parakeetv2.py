@@ -9,8 +9,7 @@ from .base import ModelBase
 from ...streaming.splitter import ConsumerProducer
 from ...core.utils import get_logger
 from ...core.exceptions import ASRError
-
-_asr_lock = threading.Lock()
+from ...core.engine import onnx_lock
 
 
 class ParakeetV2(ModelBase):
@@ -48,7 +47,7 @@ class ParakeetV2(ModelBase):
             leading_silence_duration=leading_ms / 1000.0,
             max_segment_duration=max_segment,
         )
-        self._lock = _asr_lock
+        self._lock = onnx_lock
 
         super().__init__(sound_device)
 
@@ -147,7 +146,7 @@ class Silero(ConsumerProducer):
         )
 
     def flush(self):
-        with _asr_lock:
+        with onnx_lock:
             if self._is_speech_segment:
                 self._is_speech_segment = False
                 self._silence_counter = 0
