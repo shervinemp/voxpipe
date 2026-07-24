@@ -1,12 +1,12 @@
 import unittest
-from voxpipe.storage import MemoryStore, RAMStorage, SQLiteStorage, Record
+from voxpipe.storage import MemoryStore, RAMStorage, SQLiteStorage
 import tempfile
 import os
 
 
 class TestMemoryStoreFacade(unittest.TestCase):
     def test_ram_storage_backend(self):
-        mem = MemoryStore(backend=RAMStorage(), bank="session:123")
+        mem = MemoryStore(storage=RAMStorage())
         mem.store("User prefers dark mode UI.")
         mem.store("User likes Python coding.")
 
@@ -15,7 +15,7 @@ class TestMemoryStoreFacade(unittest.TestCase):
         self.assertIn("dark mode", records[0].text)
 
     def test_on_the_fly_backend_swapping(self):
-        mem = MemoryStore(backend=RAMStorage(), bank="session:abc")
+        mem = MemoryStore(storage=RAMStorage())
         mem.store("RAM memory entry")
 
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -24,7 +24,7 @@ class TestMemoryStoreFacade(unittest.TestCase):
 
         try:
             # Swap backend on the fly!
-            mem.backend = sqlite_backend
+            mem.storage = sqlite_backend
             mem.store("SQLite memory entry")
 
             records = mem.retrieve("SQLite")

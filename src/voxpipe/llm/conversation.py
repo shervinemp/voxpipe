@@ -249,7 +249,7 @@ class Conversation:
     def set_token_count(self, idx: int, count: int):
         self._token_counts[idx] = count
 
-    def trim_oldest(self, excess: int, max_turns: int, llm: "LLM") -> int:
+    def trim_oldest(self, excess: int, max_turns: int = 20, llm: Optional[Any] = None) -> int:
         """Advance cutoff forward by *excess* messages. O(1) -- never deletes.
 
         A rare :meth:`compact` pass recreates the list when hidden messages
@@ -262,9 +262,11 @@ class Conversation:
         total_cut = 0
         for i in range(self._cutoff_idx, self._cutoff_idx + excess):
             if self._token_counts[i] == 0:
-                self._token_counts[i] = llm.count_tokens(
-                    self.get_message_content(i)
-                ) + 4
+                raw = self.get_message_content(i)
+                if llm and hasattr(llm, "count_tokens"):
+                    self._token_counts[i] = llm.count_tokens(raw) + 4
+                else:
+                    self._token_counts[i] = len(raw) // 4 + 4
             total_cut += self._token_counts[i]
 
         self._cutoff_idx += excess

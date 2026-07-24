@@ -25,16 +25,14 @@ QueryInput = Union[str, Any]
 class Retriever(Protocol):
     """Read-only retrieval interface (Web Search, static PDF RAG, etc.)."""
 
-    def retrieve(self, query: QueryInput, **kwargs) -> List[Record]:
-        ...
+    def retrieve(self, query: QueryInput, **kwargs) -> List[Record]: ...
 
 
 @runtime_checkable
 class Storer(Protocol):
     """Write-only storage interface (Loggers, event archival)."""
 
-    def store(self, content: Any, **kwargs) -> Any:
-        ...
+    def store(self, content: Any, **kwargs) -> Any: ...
 
 
 @runtime_checkable

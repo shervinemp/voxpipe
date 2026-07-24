@@ -9,7 +9,13 @@ from urllib.parse import urlparse
 from .conversation import Conversation
 from .context import MaxTurnsStrategy
 from .tools import ToolCall
-from .decoders import StreamDecoder, NativeDecoder, GeneralDecoder, LegacyXMLDecoder, GemmaE2BDecoder
+from .decoders import (
+    StreamDecoder,
+    NativeDecoder,
+    GeneralDecoder,
+    LegacyXMLDecoder,
+    GemmaE2BDecoder,
+)
 
 from ..core.utils import get_logger
 from ..core.config import config
@@ -22,10 +28,6 @@ class LLM(ABC):
     def __init__(self):
         # Initialize ContextManager in the base class or let subclasses handle it.
         pass
-
-    def create_context_strategy(self, max_turns: int = 20) -> Any:
-        """Return a context strategy for trimming conversation history."""
-        return MaxTurnsStrategy(max_turns)
 
     def __call__(
         self,
@@ -44,9 +46,7 @@ class LLM(ABC):
             yield from self.decoder(raw_stream)
         except Exception as e:
             # Check for specific timeouts or generic errors
-            self.logger.error(
-                f"Error during LLM inference: {e}", exc_info=True
-            )
+            self.logger.error(f"Error during LLM inference: {e}", exc_info=True)
             yield "Sorry, I encountered an error or timed out while processing your request."
 
     @abstractmethod
@@ -95,6 +95,7 @@ class GGUFLLM(LLM):
             model_path = entry.model_path
         else:
             from ..storage.manager import ensure_downloaded
+
             paths = ensure_downloaded(model_key)
             model_path = paths["model"]
 
@@ -134,12 +135,10 @@ class GGUFLLM(LLM):
         self._last_state = None
         self._lock = Lock()
 
-    def create_context_strategy(self, max_turns: int = 20):
-        return MaxTurnsStrategy(max_turns)
-
     @staticmethod
     def _download(model_key: str):
         from ..storage.manager import ensure_downloaded
+
         ensure_downloaded(model_key)
 
     def count_tokens(self, text: str) -> int:
@@ -154,6 +153,7 @@ class GGUFLLM(LLM):
         **kwargs,
     ) -> Generator[str | ToolCall, None, None]:
         import time as _time
+
         _infer_start = _time.monotonic()
         _token_count = 0
         with self._lock:
@@ -191,7 +191,12 @@ class GGUFLLM(LLM):
 
         elapsed = _time.monotonic() - _infer_start
         if _token_count and elapsed:
-            self.logger.info("Generated %d tokens in %.1fs (%.0f tok/s)", _token_count, elapsed, _token_count / elapsed)
+            self.logger.info(
+                "Generated %d tokens in %.1fs (%.0f tok/s)",
+                _token_count,
+                elapsed,
+                _token_count / elapsed,
+            )
 
 
 class LiteLLMProvider(LLM):
@@ -229,11 +234,11 @@ class LiteLLMProvider(LLM):
         self.logger = get_logger(self.__class__.__name__)
 
         if provider not in self.supported_providers:
-            raise ProviderError(
-                f"Unsupported LiteLLM provider: {provider!r}."
-            )
+            raise ProviderError(f"Unsupported LiteLLM provider: {provider!r}.")
         if not isinstance(model, str) or not 1 <= len(model.strip()) <= 256:
-            raise ProviderError("Model must be a non-empty string up to 256 characters.")
+            raise ProviderError(
+                "Model must be a non-empty string up to 256 characters."
+            )
         if "/" in model and not model.startswith(f"{provider}/"):
             raise ProviderError("The model prefix must match its configured provider.")
         if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 300:
@@ -252,7 +257,9 @@ class LiteLLMProvider(LLM):
             if api_base and self._is_loopback(api_base):
                 api_key = "sk-no-key-required"
             else:
-                raise ProviderError(f"{key_env} is required for the {provider} provider.")
+                raise ProviderError(
+                    f"{key_env} is required for the {provider} provider."
+                )
         if api_key is not None and not isinstance(api_key, str):
             raise ProviderError("Provider API keys must be strings.")
         if isinstance(api_key, str) and not api_key.strip():
@@ -272,14 +279,18 @@ class LiteLLMProvider(LLM):
         # synchronous iteration on Windows.
         if provider == "openai" and api_base and self._is_loopback(api_base):
             from openai import OpenAI
+
             self._openai_client = OpenAI(
-                base_url=api_base.rstrip("/") + "/v1" if "/v1" not in api_base else api_base,
+                base_url=(
+                    api_base.rstrip("/") + "/v1" if "/v1" not in api_base else api_base
+                ),
                 api_key=api_key or "sk-no-key-required",
             )
         else:
             if completion_fn is None:
                 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
                 from litellm import completion
+
                 completion_fn = completion
             if not callable(completion_fn):
                 raise ProviderError("completion_fn must be callable.")
@@ -311,7 +322,9 @@ class LiteLLMProvider(LLM):
         # ASVS 12.3.1 / 12.3.2: custom remote provider endpoints must use
         # certificate-validated HTTPS; plaintext is limited to local runtimes.
         if not LiteLLMProvider._is_loopback(api_base):
-            raise ProviderError("Plaintext provider endpoints are allowed on loopback only.")
+            raise ProviderError(
+                "Plaintext provider endpoints are allowed on loopback only."
+            )
 
     @staticmethod
     def _field(value, name: str, default=None):
@@ -334,8 +347,7 @@ class LiteLLMProvider(LLM):
         unexpected = set(kwargs) - self._allowed_generation_params
         if unexpected:
             raise LLMError(
-                "Unsupported generation parameters: "
-                + ", ".join(sorted(unexpected))
+                "Unsupported generation parameters: " + ", ".join(sorted(unexpected))
             )
         if not isinstance(tool_choice, (str, dict)):
             raise LLMError("tool_choice must be a string or object.")
@@ -413,9 +425,7 @@ class LiteLLMProvider(LLM):
                 arguments = entry["object_args"]
                 if arguments is None:
                     arguments = (
-                        json.loads(entry["arguments"])
-                        if entry["arguments"]
-                        else {}
+                        json.loads(entry["arguments"]) if entry["arguments"] else {}
                     )
                 # ASVS 1.5.2 / 15.3.5: accept only a JSON object as tool input.
                 if not isinstance(arguments, dict):
@@ -467,11 +477,9 @@ class LiteLLMProvider(LLM):
             else:
                 rc = getattr(delta, "reasoning_content", None)
                 if rc:
-                    self.logger.debug(
-                        "openai chunk reasoning=%s", rc[:50]
-                    )
+                    self.logger.debug("openai chunk reasoning=%s", rc[:50])
 
-            for tc in (getattr(delta, "tool_calls", None) or ()):
+            for tc in getattr(delta, "tool_calls", None) or ():
                 index = getattr(tc, "index", 0) if hasattr(tc, "index") else 0
                 function = getattr(tc, "function", {}) or {}
                 entry = tool_call_buffer.setdefault(
@@ -534,12 +542,14 @@ class LLMProviders:
         if backend == "litellm":
             llm_cfg: dict = config.get("llm.litellm", {})
             return LiteLLMProvider(**llm_cfg)
-        raise ProviderError(f"Unknown LLM backend: {backend!r}. Expected one of: {', '.join(sorted(cls._BACKENDS))}.")
+        raise ProviderError(
+            f"Unknown LLM backend: {backend!r}. Expected one of: {', '.join(sorted(cls._BACKENDS))}."
+        )
 
     @classmethod
     def get(cls, name: str):
         """Legacy: resolve a provider name to a callable or class.
-        
+
         Used by llm/download.py. Local model keys return a _GGUFFactory;
         'LiteLLM' returns the LiteLLMProvider class.
         """

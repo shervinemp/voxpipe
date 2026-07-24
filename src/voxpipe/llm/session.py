@@ -13,9 +13,8 @@ from ..core.exceptions import LLMError, ToolError
 
 from .model import LLM
 from .conversation import Conversation
-from .tools import Tool, ToolCall, ToolResult, ToolChoice, ToolRegistry
-from .context import ContextHandler, MemoryHandler, MaxTurnsStrategy
-from ..storage import MemoryStore, RAMStorage, SQLiteStorage, Record
+from .tools import Tool, ToolCall, ToolResult, ToolChoice
+from .context import ContextHandler
 
 
 from .state import SessionState, SessionStateDictProxy
@@ -27,10 +26,8 @@ class Session:
         self,
         llm: LLM,
         conversation: Optional[Conversation] = None,
-        max_turns: int = 20,
         max_tool_iterations: int = 1,
         context_handler: Optional[ContextHandler] = None,
-        memory: Optional[Any] = None,
         session_id: str = "default",
     ):
         self.logger = get_logger(__name__)
@@ -39,13 +36,7 @@ class Session:
         self.conversation = conversation or Conversation()
         self.tool_caller = ToolCaller()
         self.max_tool_iterations = max_tool_iterations
-
-        if memory is not None and not isinstance(memory, MemoryStore):
-            memory = MemoryStore(backend=memory, session_id=session_id)
-        elif isinstance(memory, MemoryStore) and getattr(memory, "session_id", "default") == "default":
-            memory.session_id = session_id
-
-        self.context_handler = context_handler or MemoryHandler(strategy=MaxTurnsStrategy(max_turns=max_turns), memory_store=memory)
+        self.context_handler = context_handler
 
         self.state = SessionState()
         self._session_state = SessionStateDictProxy(self.state)
@@ -57,9 +48,13 @@ class Session:
         if "_confirm" in self.conversation.tools:
             return
         if not any(
-            getattr(t, "may_return_choice", False) or getattr(t, "requires_permission", False)
+            getattr(t, "may_return_choice", False)
+            or getattr(t, "requires_permission", False)
             for t in self.conversation.tools.values()
-        ) and not any("pending" in self.conversation.get_meta(tn) for tn in self.conversation.tools):
+        ) and not any(
+            "pending" in self.conversation.get_meta(tn)
+            for tn in self.conversation.tools
+        ):
             return
 
         self.conversation.tools["_confirm"] = Tool(
@@ -137,14 +132,24 @@ class Session:
         if expected_keys == {"allow", "remember"} and "allow" in given_keys:
             raw_allow = choice["allow"]
             raw_remember = choice.get("remember", False)
-            allow = raw_allow if isinstance(raw_allow, bool) else str(raw_allow).lower() in {"true", "1"}
-            remember = raw_remember if isinstance(raw_remember, bool) else str(raw_remember).lower() in {"true", "1"}
+            allow = (
+                raw_allow
+                if isinstance(raw_allow, bool)
+                else str(raw_allow).lower() in {"true", "1"}
+            )
+            remember = (
+                raw_remember
+                if isinstance(raw_remember, bool)
+                else str(raw_remember).lower() in {"true", "1"}
+            )
             if remember and target_tool_name:
                 self.state.tools.set_permission(target_tool_name, allow)
                 self.conversation.set_permission(target_tool_name, allow)
 
             if target_tool_name:
-                self.conversation.get_meta(target_tool_name).get("pending", {}).pop(uid, None)
+                self.conversation.get_meta(target_tool_name).get("pending", {}).pop(
+                    uid, None
+                )
             self.state.tools.remove_pending(uid)
 
             if allow:
@@ -155,7 +160,7 @@ class Session:
             else:
                 return ToolResult(
                     {"status": "cancelled", "action": target_tool_name},
-                    speech=f"Action {target_tool_name} was cancelled."
+                    speech=f"Action {target_tool_name} was cancelled.",
                 )
 
         if expected_keys != given_keys:
@@ -191,7 +196,11 @@ class Session:
     def load(cls, path: str, llm: LLM) -> "Session":
         """Load session from a directory with a fresh LLM instance."""
         conv_path = os.path.join(path, "conversation.json")
-        conversation = Conversation.load(conv_path) if os.path.exists(conv_path) else Conversation()
+        conversation = (
+            Conversation.load(conv_path)
+            if os.path.exists(conv_path)
+            else Conversation()
+        )
         session = cls(llm=llm, conversation=conversation)
         session.state.load(path)
         return session
@@ -248,7 +257,7 @@ class Session:
                 yield from self._generate_response(tool_choice="none")
             else:
                 for iteration in range(self.max_tool_iterations + 1):
-                    is_final = (iteration == self.max_tool_iterations)
+                    is_final = iteration == self.max_tool_iterations
                     tc = "none" if is_final else "auto"
                     yield from self._generate_response(tool_choice=tc)
                     results = self.tool_caller.gather(conversation=self.conversation)
@@ -259,12 +268,18 @@ class Session:
                         result = exec_res.result
                         if isinstance(result, ToolChoice):
                             self._register_confirm()
-                            self.conversation.add_tool_message(f"{name}: {result.result}")
-                            self.conversation.add_assistant_message("Ask the user, then call _confirm.")
+                            self.conversation.add_tool_message(
+                                f"{name}: {result.result}"
+                            )
+                            self.conversation.add_assistant_message(
+                                "Ask the user, then call _confirm."
+                            )
                             if result.speech:
                                 yield result.speech
                         elif isinstance(result, ToolResult):
-                            self.conversation.add_tool_message(f"{name}: {result.result}")
+                            self.conversation.add_tool_message(
+                                f"{name}: {result.result}"
+                            )
                             if result.speech:
                                 self.conversation.add_assistant_message(result.speech)
                                 yield result.speech
@@ -272,7 +287,9 @@ class Session:
                                 self.conversation.add_tool_message(
                                     "Now, generate an answer based only on the returned responses."
                                 )
-                        elif isinstance(result, str) and result.startswith("Tool Error:"):
+                        elif isinstance(result, str) and result.startswith(
+                            "Tool Error:"
+                        ):
                             any_error = True
                             self.conversation.add_tool_message(f"{name}: {result}")
                         else:
@@ -285,8 +302,12 @@ class Session:
                         )
 
             self.tool_caller.drain()
+            if self.context_handler:
+                self.context_handler.post_process(self.conversation)
 
-    def _generate_response(self, _retry_count: int = 0, **kwargs) -> Generator[str, None, None]:
+    def _generate_response(
+        self, _retry_count: int = 0, **kwargs
+    ) -> Generator[str, None, None]:
         if _retry_count > 2:
             self.logger.error("Too many tool parse retries. Aborting.")
             yield "I encountered a persistent error processing tool calls."
@@ -309,22 +330,30 @@ class Session:
                     self.conversation.add_tool_message(
                         "Tool Error: Could not parse tool call. Please try again with valid JSON."
                     )
-                    yield from self._generate_response(_retry_count=_retry_count + 1, tool_choice="none")
+                    yield from self._generate_response(
+                        _retry_count=_retry_count + 1, tool_choice="none"
+                    )
                     return
                 tool = self.conversation.tools.get(tool_name)
                 if tool is None:
-                    self.logger.warning(f"Tool '{tool_name}' not found in conversation tools.")
+                    self.logger.warning(
+                        f"Tool '{tool_name}' not found in conversation tools."
+                    )
                     self.conversation.add_tool_message(
                         f"Tool Error: '{tool_name}' is not a recognized tool. Available: {list(self.conversation.tools.keys())}."
                     )
-                    yield from self._generate_response(_retry_count=_retry_count + 1, tool_choice="none")
+                    yield from self._generate_response(
+                        _retry_count=_retry_count + 1, tool_choice="none"
+                    )
                     return
                 tool_dispatched = True
                 response_chunks.clear()
                 if kwargs.get("tool_choice") != "none":
                     self.tool_caller(tool, tool_call=chunk, **tool_args)
                 else:
-                    self.logger.warning("Spurious tool call in final pass, ignoring %s", tool_name)
+                    self.logger.warning(
+                        "Spurious tool call in final pass, ignoring %s", tool_name
+                    )
             else:
                 response_chunks.append(chunk)
 
@@ -356,17 +385,19 @@ class ToolCaller:
             tool_call = ToolCall(name=tool.name, arguments=tool_args)
         tool_callable = partial(tool.__call__, **tool_args)
 
-        if asyncio.iscoroutinefunction(tool.callback) or inspect.iscoroutinefunction(getattr(tool_callable, "func", None)):
-            future = asyncio.run_coroutine_threadsafe(
-                tool_callable(), self._loop
-            )
+        if asyncio.iscoroutinefunction(tool.callback) or inspect.iscoroutinefunction(
+            getattr(tool_callable, "func", None)
+        ):
+            future = asyncio.run_coroutine_threadsafe(tool_callable(), self._loop)
         else:
             future = asyncio.run_coroutine_threadsafe(
                 asyncio.to_thread(tool_callable), self._loop
             )
         self._futures.put((tool_call, future))
 
-    def gather(self, conversation: Conversation | None = None) -> Dict[str, ToolExecutionResult]:
+    def gather(
+        self, conversation: Conversation | None = None
+    ) -> Dict[str, ToolExecutionResult]:
         responses = {}
         while not self._futures.empty():
             tool_call, future = self._futures.get()
@@ -378,18 +409,22 @@ class ToolCaller:
                     meta = conversation.get_meta(tool_name)
                     pending_map = meta.setdefault("pending", {})
                     pending_map[res.uid] = (tool_call, res)
-                responses[tool_name] = ToolExecutionResult(tool_call=tool_call, result=res)
+                responses[tool_name] = ToolExecutionResult(
+                    tool_call=tool_call, result=res
+                )
                 self.logger.debug("Gathered tool %s: %s", tool_name, str(res)[:80])
             except TimeoutError:
                 err_msg = f"Tool Error: {tool_name} timed out"
-                responses[tool_name] = ToolExecutionResult(tool_call=tool_call, result=err_msg)
+                responses[tool_name] = ToolExecutionResult(
+                    tool_call=tool_call, result=err_msg
+                )
                 self.logger.error(f"Tool {tool_name} timed out")
             except Exception as e:
                 err_msg = f"Tool Error: {e}"
-                responses[tool_name] = ToolExecutionResult(tool_call=tool_call, result=err_msg)
-                self.logger.error(
-                    f"Error calling tool {tool_name}: {e}", exc_info=True
+                responses[tool_name] = ToolExecutionResult(
+                    tool_call=tool_call, result=err_msg
                 )
+                self.logger.error(f"Error calling tool {tool_name}: {e}", exc_info=True)
 
         return responses
 
@@ -424,9 +459,7 @@ class ToolCaller:
 
         self._loop_ready_event.wait(timeout=5.0)
         if not self._loop_ready_event.is_set():
-            raise LLMError(
-                "Failed to start background asyncio loop within timeout."
-            )
+            raise LLMError("Failed to start background asyncio loop within timeout.")
 
     def stop(self):
         """Stops the background asyncio event loop gracefully."""
@@ -437,9 +470,7 @@ class ToolCaller:
                 pass  # loop already closed
             self._loop_thread.join(timeout=5)
             if self._loop_thread.is_alive():
-                self.logger.warning(
-                    "Background loop thread did not stop gracefully."
-                )
+                self.logger.warning("Background loop thread did not stop gracefully.")
             self._loop_thread = None
 
     def __enter__(self):
