@@ -1,12 +1,31 @@
-"""ContextHandler and eviction policies for managing conversation context windows and memory retrieval."""
-
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Protocol, runtime_checkable
 from ..core.utils import get_logger
 
 if TYPE_CHECKING:
     from .conversation import Conversation
     from .model import LLM
     from ..storage.base import MemoryStore
+
+
+@runtime_checkable
+class EvictionPolicy(Protocol):
+    """Protocol for conversation context eviction trimming policies."""
+
+    def trim(self, conversation: "Conversation", llm: "LLM") -> List[Any]:
+        """Trim oldest messages and return list of evicted Message objects."""
+        ...
+
+
+@runtime_checkable
+class ContextStrategy(Protocol):
+    """Protocol for conversation context strategy handling."""
+
+    def handle(self, conversation: "Conversation", llm: "LLM", session_id: str = "default", **kwargs) -> bool:
+        """Process active conversation context.
+
+        Returns True if conversation context was modified (trimmed or augmented), False otherwise.
+        """
+        ...
 
 
 class DropOldestStrategy:
@@ -81,10 +100,17 @@ class ContextHandler:
         self.memory = memory
         self.auto_archive = auto_archive
 
-    def handle(self, conversation: "Conversation", llm: "LLM", session_id: str = "default") -> None:
-        """Process active conversation: trim window, archive evicted turns, and inject memory."""
+    def handle(self, conversation: "Conversation", llm: "LLM", session_id: str = "default") -> bool:
+        """Process active conversation: trim window, archive evicted turns, and inject memory.
+
+        Returns True if the conversation context was modified, False otherwise.
+        """
+        modified = False
+
         # 1. Execute eviction trimming
         evicted = self.eviction_policy.trim(conversation, llm)
+        if evicted:
+            modified = True
 
         # 2. Archive evicted messages if memory is present
         if self.auto_archive and self.memory and evicted:
@@ -100,13 +126,15 @@ class ContextHandler:
             if getattr(last_msg, "role", None) in ("user", "User"):
                 query_str = getattr(last_msg, "content", "")
                 if query_str and len(query_str) > 3:
-                    bank_name = f"session:{session_id}"
                     records = self.memory.retrieve(query_str, top_k=2, fallback="global")
                     if records:
                         snippets = [r.text for r in records if r.text != query_str]
                         if snippets:
                             self.logger.info("Injected %d memory records into context", len(snippets))
+                            modified = True
 
-    def trim(self, conversation: "Conversation", llm: "LLM") -> None:
+        return modified
+
+    def trim(self, conversation: "Conversation", llm: "LLM") -> bool:
         """Backwards compatible delegate method for legacy callers."""
-        self.handle(conversation, llm)
+        return self.handle(conversation, llm)
