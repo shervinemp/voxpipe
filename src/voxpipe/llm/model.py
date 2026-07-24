@@ -7,7 +7,7 @@ from typing import Any, Dict, Generator
 from urllib.parse import urlparse
 
 from .conversation import Conversation
-from .context import DropOldestStrategy
+from .context import MaxTurnsStrategy
 from .tools import ToolCall
 from .decoders import StreamDecoder, NativeDecoder, GeneralDecoder, LegacyXMLDecoder, GemmaE2BDecoder
 
@@ -23,9 +23,9 @@ class LLM(ABC):
         # Initialize ContextManager in the base class or let subclasses handle it.
         pass
 
-    def create_context_strategy(self, max_turns: int = 20):
+    def create_context_strategy(self, max_turns: int = 20) -> Any:
         """Return a context strategy for trimming conversation history."""
-        return DropOldestStrategy(max_turns)
+        return MaxTurnsStrategy(max_turns)
 
     def __call__(
         self,
@@ -135,7 +135,7 @@ class GGUFLLM(LLM):
         self._lock = Lock()
 
     def create_context_strategy(self, max_turns: int = 20):
-        return DropOldestStrategy(max_turns)
+        return MaxTurnsStrategy(max_turns)
 
     @staticmethod
     def _download(model_key: str):

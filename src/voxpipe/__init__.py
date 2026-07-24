@@ -2,7 +2,7 @@
 
 __version__ = "0.1.1"
 
-from voxpipe.llm import Session, SessionManager, SessionState, Conversation, ContextHandler, MemoryHandler, ContextStrategy, EvictionStrategy, EvictionPolicy, MaxTurnsStrategy, DropOldestStrategy, Tool
+from voxpipe.llm import Session, SessionManager, SessionState, Conversation, ContextHandler, MemoryHandler, EvictionStrategy, MaxTurnsStrategy, Tool
 from voxpipe.storage import Record, Query, QueryInput, Retriever, Storer, Storage, RAMStorage, SQLiteStorage, MemoryStore
 
 __all__ = [
@@ -13,11 +13,8 @@ __all__ = [
     "Conversation",
     "ContextHandler",
     "MemoryHandler",
-    "ContextStrategy",
     "EvictionStrategy",
-    "EvictionPolicy",
     "MaxTurnsStrategy",
-    "DropOldestStrategy",
     "Tool",
     "Record",
     "Query",

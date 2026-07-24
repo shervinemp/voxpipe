@@ -10,7 +10,7 @@ class TestSessionIntegration(unittest.TestCase):
     def _make_mock_llm(self, tokens: list[str], decoder=None):
         from voxpipe.llm.decoders import GeneralDecoder
         from voxpipe.llm.model import LLM
-        from voxpipe.llm.context import DropOldestStrategy
+        from voxpipe.llm.context import MaxTurnsStrategy
         _decoder = decoder or GeneralDecoder()
 
         class MockLLM(LLM):
@@ -18,7 +18,7 @@ class TestSessionIntegration(unittest.TestCase):
             def _infer(self, conversation, *, session_state, **kwargs):
                 yield from tokens
             def create_context_strategy(self, max_turns=20):
-                return DropOldestStrategy(max_turns)
+                return MaxTurnsStrategy(max_turns)
             def count_tokens(self, text):
                 return max(1, len(text) // 2)
 
@@ -80,8 +80,8 @@ class TestSessionIntegration(unittest.TestCase):
             decoder = GeneralDecoder()
             _call_count = 0
             def create_context_strategy(self, max_turns=20):
-                from voxpipe.llm.context import DropOldestStrategy
-                return DropOldestStrategy(max_turns)
+                from voxpipe.llm.context import MaxTurnsStrategy
+                return MaxTurnsStrategy(max_turns)
             def count_tokens(self, text):
                 return max(1, len(text) // 2)
             def __call__(self, conversation, session_state=None, **kwargs):
@@ -142,8 +142,8 @@ class TestSessionIntegration(unittest.TestCase):
 
         class LockTestLLM:
             def create_context_strategy(self, max_turns=20):
-                from voxpipe.llm.context import DropOldestStrategy
-                return DropOldestStrategy(max_turns)
+                from voxpipe.llm.context import MaxTurnsStrategy
+                return MaxTurnsStrategy(max_turns)
             def count_tokens(self, text):
                 return max(1, len(text) // 2)
             def __call__(self, conversation, session_state=None, **kwargs):
@@ -226,14 +226,14 @@ class TestSessionMethods(unittest.TestCase):
     def _make_mock_llm(self, tokens):
         from voxpipe.llm.model import LLM
         from voxpipe.llm.decoders import GeneralDecoder
-        from voxpipe.llm.context import DropOldestStrategy
+        from voxpipe.llm.context import MaxTurnsStrategy
         _decoder = GeneralDecoder()
         class M(LLM):
             decoder = _decoder
             def _infer(self, conversation, *, session_state, **kwargs):
                 yield from tokens
             def create_context_strategy(self, max_turns=20):
-                return DropOldestStrategy(max_turns)
+                return MaxTurnsStrategy(max_turns)
             def count_tokens(self, text):
                 return max(1, len(text) // 2)
         llm = M()
@@ -547,8 +547,8 @@ class TestSessionConfirm(unittest.TestCase):
             decoder = GeneralDecoder()
             called = False
             def create_context_strategy(self, max_turns=20):
-                from voxpipe.llm.context import DropOldestStrategy
-                return DropOldestStrategy(max_turns)
+                from voxpipe.llm.context import MaxTurnsStrategy
+                return MaxTurnsStrategy(max_turns)
             def count_tokens(self, text):
                 return max(1, len(text) // 2)
             def __call__(self, conversation, session_state=None, **kwargs):

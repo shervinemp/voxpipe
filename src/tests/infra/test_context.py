@@ -3,10 +3,10 @@ import unittest
 from unittest.mock import MagicMock, PropertyMock
 
 
-class TestDropOldestStrategy(unittest.TestCase):
+class TestMaxTurnsStrategy(unittest.TestCase):
     def setUp(self):
-        from voxpipe.llm.context import DropOldestStrategy
-        self.strat = DropOldestStrategy(max_turns=3)
+        from voxpipe.llm.context import MaxTurnsStrategy
+        self.strat = MaxTurnsStrategy(max_turns=3)
 
     def _conv(self, n_msgs):
         from voxpipe.llm.conversation import Conversation
@@ -15,28 +15,18 @@ class TestDropOldestStrategy(unittest.TestCase):
             c.add_user_message(f"msg{i}")
         return c
 
-    def _llm(self):
-        m = MagicMock()
-        m.count_tokens.return_value = 10
-        type(m).n_ctx = PropertyMock(return_value=4096)
-        type(m).max_tokens = PropertyMock(return_value=512)
-        return m
-
-    def test_does_not_trim_below_max_turns(self):
+    def test_does_not_blip_below_max_turns(self):
         c = self._conv(3)
-        self.strat.trim(c, self._llm())
-        self.assertEqual(len(c._messages), 3)
+        self.assertFalse(self.strat(c))
 
-    def test_trims_to_max_turns(self):
+    def test_blips_above_max_turns(self):
         c = self._conv(10)
-        self.strat.trim(c, self._llm())
-        self.assertLessEqual(c.visible_count(), 6)
+        self.assertTrue(self.strat(c))
 
     def test_empty_conversation(self):
         from voxpipe.llm.conversation import Conversation
         c = Conversation()
-        self.strat.trim(c, self._llm())
-        self.assertEqual(len(c._messages), 0)
+        self.assertFalse(self.strat(c))
 
 
 class TestConsumerProducer(unittest.TestCase):

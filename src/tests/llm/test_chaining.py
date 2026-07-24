@@ -13,7 +13,7 @@ def _make_mock_llm(tokens_per_call, decoder=None):
     """
     from voxpipe.llm.decoders import GeneralDecoder
     from voxpipe.llm.model import LLM
-    from voxpipe.llm.context import DropOldestStrategy
+    from voxpipe.llm.context import MaxTurnsStrategy
     _decoder = decoder or GeneralDecoder()
 
     class MockLLM(LLM):
@@ -27,7 +27,7 @@ def _make_mock_llm(tokens_per_call, decoder=None):
             yield from tokens
 
         def create_context_strategy(self, max_turns=20):
-            return DropOldestStrategy(max_turns)
+            return MaxTurnsStrategy(max_turns)
 
         def count_tokens(self, text):
             return max(1, len(text) // 2)

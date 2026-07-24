@@ -14,7 +14,7 @@ from ..core.exceptions import LLMError, ToolError
 from .model import LLM
 from .conversation import Conversation
 from .tools import Tool, ToolCall, ToolResult, ToolChoice, ToolRegistry
-from .context import ContextHandler, MemoryHandler, DropOldestStrategy
+from .context import ContextHandler, MemoryHandler, MaxTurnsStrategy
 from ..storage import MemoryStore, RAMStorage, SQLiteStorage, Record
 
 
@@ -45,7 +45,7 @@ class Session:
         elif isinstance(memory, MemoryStore) and getattr(memory, "session_id", "default") == "default":
             memory.session_id = session_id
 
-        self.context_handler = context_handler or MemoryHandler(max_turns=max_turns, memory_store=memory)
+        self.context_handler = context_handler or MemoryHandler(strategy=MaxTurnsStrategy(max_turns=max_turns), memory_store=memory)
 
         self.state = SessionState()
         self._session_state = SessionStateDictProxy(self.state)
@@ -241,10 +241,7 @@ class Session:
                 self.logger.info(f"{query=}")
 
             if self.context_handler:
-                if hasattr(self.context_handler, "pre_process"):
-                    self.context_handler.pre_process(self.conversation)
-                else:
-                    self.context_handler.handle(self.conversation, self.llm, session_id=self.session_id)
+                self.context_handler.pre_process(self.conversation)
             self.logger.info("Starting LLM call...")
 
             if self.max_tool_iterations == 0:

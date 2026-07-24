@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, PropertyMock
 from voxpipe.llm.conversation import Conversation
-from voxpipe.llm.context import ContextHandler, MemoryHandler, DropOldestStrategy, MaxTurnsStrategy
+from voxpipe.llm.context import ContextHandler, MemoryHandler, MaxTurnsStrategy
 from voxpipe.storage import MemoryStore, RAMStorage
 
 
@@ -15,7 +15,7 @@ class TestContextHandler(unittest.TestCase):
 
     def test_context_handler_trim_and_auto_archive(self):
         mem = MemoryStore(backend=RAMStorage(), session_id="test")
-        handler = MemoryHandler(max_turns=2, memory_store=mem, amortize_step=1, auto_archive=True)
+        handler = MemoryHandler(strategy=MaxTurnsStrategy(max_turns=2), memory_store=mem, amortize_k=1, auto_archive=True)
 
         conv = Conversation()
         for i in range(10):
