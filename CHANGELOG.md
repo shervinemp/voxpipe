@@ -40,6 +40,45 @@ changed; the upgrade notes are at the end.
 - **Sessions.** `SessionManager` rejects ids that escape its directory;
   importing an archive never restores tool permissions or pending calls.
 
+- **Voice activity detection.** Silero is a recurrent model, and it was being
+  restarted from a blank state for every 32 ms chunk (and run twice per chunk).
+  Its state is now carried along: quiet speech that used to produce no
+  utterance at all is heard, and speech over noise is detected sooner.
+- **Long replies.** Once synthesis got more than 33 sentences ahead of
+  playback the rest were dropped; the synthesiser now waits for the player.
+- **Taking turns.** A sentence that arrives just after the user barges in is
+  no longer spoken over them; an interruption that lands before the model has
+  been asked stops the turn before any tool runs; and an utterance the user
+  has already talked past is held and answered together with what follows.
+  `reset()` no longer carries the "user interrupted" note into the new
+  conversation, and `stop()` no longer answers everything still queued first.
+- **Tool rounds.** Interrupting while a tool runs no longer erases what was
+  said and done from history; a follow-up question asked while answering
+  another can be answered; a failed turn restores the message it had extended;
+  a blocking tool that never returns no longer keeps the process alive or
+  starves later tools; and a model-supplied argument named `self`, a JSON
+  `null` for an optional argument, or a malformed call ahead of a valid one
+  no longer break the turn.
+- **Transcripts.** Utterances with no letters ("42", "10:30") are answered
+  instead of being dropped as noise.
+- **Decoders and providers.** Gemma calls whose strings contain `, word:` are
+  parsed; `"parameters"` and stringified `"arguments"` are accepted; calls
+  that share a stream index are told apart by id; a local OpenAI-compatible
+  server is asked for the model by its bare id.
+- **Saved sessions.** Importing a damaged archive no longer destroys the
+  session it would have replaced; session files are written atomically; ids
+  that Windows would alias or refuse are rejected.
+- **Storage and models.** A file that is not a database, a corrupt model
+  file or a failed download now raise `StorageError` / `ModelError` that say
+  what to do; expired memories are no longer recalled; memories a failing
+  backend refused are offered again instead of being lost.
+- **Hotkeys.** A combination that cannot be parsed leaves the previous one
+  (and the microphone) as it was; assigning a hotkey while running works; a
+  held hotkey that is unregistered is released.
+- **Sentence splitting.** Initials ("Samuel L. Jackson") no longer split a
+  sentence; "3.50." and "Max." end one; list items on separate lines are
+  spoken one by one.
+
 ### Changed
 
 - Configuration is loaded on first use (`get_config()`), not at import, and
@@ -73,6 +112,17 @@ changed; the upgrade notes are at the end.
 - Dependencies `emoji` and `tiktoken` were unused and are gone; `soundfile`
   moved to the `dev` extra.
 
+- `Session.events()` and calling a session take `tool_choice=`; `context=` needs a
+  query. `Pipeline.submit(text)` queues typed text while `run()` is active,
+  and `run()` raises `ASRError` when recognition fails rather than returning.
+- Tool arguments are checked against the schema: `enum` values, arrays and
+  objects are enforced, and tool names must be identifiers. `@permission`
+  also works on a `Tool`.
+- `Pipeline.from_config(push_to_talk=...)` wins even over
+  `hotkeys.enable: false`, as the CLI flag always claimed.
+- The TTS queue starts on first use, so text in / speech out works without
+  `run()`.
+
 ### Upgrade notes
 
 | Before | Now |
@@ -97,3 +147,6 @@ changed; the upgrade notes are at the end.
 | `asr.enable()` / `asr.disable_w_passthrough()` | `asr.unmute()` / `asr.mute()` |
 | `tts._synthesize(...)`, `getattr(TTSProviders, name)` | `tts.synthesize(...)`, `TTSProviders.create(name)` |
 | `VoiceControlError` | `VoxpipeError` |
+| `text, annotation = qualify_transcript(t)`; `asr:utterance` handlers taking `annotation=` | `text = qualify_transcript(t)`; handlers receive the text only |
+| `ensure_downloaded` raising `ValueError` / `requests` errors | `ModelError` |
+| recogniser iteration skipping an utterance it failed to transcribe | it yields `""` for it |
