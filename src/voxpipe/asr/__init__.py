@@ -1,3 +1,6 @@
-from .model import ASRProviders
+"""Speech recognition: microphone capture, voice activity detection and ASR providers."""
 
-__all__ = ["ASRProviders"]
+from .model import ASRProviders
+from .vad import AudioGate, Silero
+
+__all__ = ["ASRProviders", "AudioGate", "Silero"]

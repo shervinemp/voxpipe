@@ -11,24 +11,15 @@ Run with:
 import time
 import unittest
 
-import pytest
-
+from voxpipe.llm.context import MaxTurnsStrategy, MemoryHandler
+from voxpipe.llm.conversation import Conversation
 from voxpipe.llm.model import GGUFLLM
 from voxpipe.llm.session import Session
-from voxpipe.llm.conversation import Conversation
 from voxpipe.llm.tools import Tool, ToolCall
 
+from ._integration import LLAMA, requires_model
 
-def _has_model():
-    from voxpipe.storage.manager import ensure_downloaded
-    try:
-        ensure_downloaded("Gemma4E4B")
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _has_model(), reason="Gemma4E4B GGUF not downloaded")
+pytestmark = requires_model("Gemma4E4B", LLAMA)
 
 
 class TestModelBehavior(unittest.TestCase):
@@ -45,8 +36,7 @@ class TestModelBehavior(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         t0 = time.monotonic()
-        cls._model = GGUFLLM("Gemma4E4B")
-        cls._model.logger = type("L", (), {"info": print, "warning": print})()
+        cls._model = GGUFLLM.from_config("Gemma4E4B")
         print(f"\nModel loaded in {time.monotonic()-t0:.1f}s")
 
     def _run_once(self, message: str, with_tools: bool,
@@ -69,12 +59,11 @@ class TestModelBehavior(unittest.TestCase):
             )
         if with_tools:
             t = Tool.from_callable("retrieve", lambda q: "")
-            t.instruction = "Call when asked about entities or facts."
             conv.tools["retrieve"] = t
         conv.add_user_message(message)
 
         calls = []
-        for chunk in self._model(conv, session_state={}):
+        for chunk in self._model(conv):
             if isinstance(chunk, ToolCall):
                 calls.append(chunk)
         return calls
@@ -155,10 +144,7 @@ class TestModelBehavior(unittest.TestCase):
 
     def test_tool_call_format_is_parseable(self):
         """When model calls a tool natively, verify ToolCall is yielded correctly."""
-        from voxpipe.llm.decoders import GeneralDecoder, GemmaE2BDecoder
-
         t = Tool.from_callable("retrieve", lambda q: "")
-        t.instruction = "Call when asked about entities or facts."
 
         native = 0
 
@@ -168,7 +154,7 @@ class TestModelBehavior(unittest.TestCase):
             conv.tools["retrieve"] = t
             conv.add_user_message("Tell me about Skyrim.")
 
-            for chunk in self._model(conv, session_state={}):
+            for chunk in self._model(conv):
                 if isinstance(chunk, ToolCall):
                     native += 1
                     break
@@ -186,8 +172,7 @@ class TestMultiTurn(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         t0 = time.monotonic()
-        cls._model = GGUFLLM("Gemma4E4B")
-        cls._model.logger = type("L", (), {"info": print, "warning": print})()
+        cls._model = GGUFLLM.from_config("Gemma4E4B")
         print(f"\nModel loaded in {time.monotonic()-t0:.1f}s")
 
     def setUp(self):
@@ -196,7 +181,9 @@ class TestMultiTurn(unittest.TestCase):
             "You are a voice-controlled game assistant. "
             "Respond conversationally and naturally."
         )
-        self.sess = Session(llm=self._model, conversation=self.conv)
+        self.sess = Session(
+            llm=self._model, conversation=self.conv, context_handler=MemoryHandler(MaxTurnsStrategy(max_turns=10))
+        )
 
     def tearDown(self):
         self.sess.close()
@@ -229,8 +216,8 @@ class TestMultiTurn(unittest.TestCase):
         """Many turns should not exceed max_turns."""
         for i in range(15):
             list(self.sess(f"Message {i}."))
-        self.assertLessEqual(len(self.conv.messages), 45,
-                             "messages should be bounded")
+        # System prompt, then at most ten turns of question and answer.
+        self.assertLessEqual(len(self.conv.messages), 21, "messages should be bounded")
 
 
 if __name__ == "__main__":

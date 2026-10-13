@@ -1,84 +1,162 @@
-from pynput import keyboard
-from typing import Dict, Set, Callable, Union, TypeAlias, ContextManager
+"""Global hotkeys: hold-to-activate and press-to-trigger key combinations."""
 
-HotkeyAction: TypeAlias = Union[
-    Callable[[], ContextManager[None]], Callable[[], None]
-]
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
+from typing import Any, Callable, Dict, FrozenSet, Hashable, Optional, Set, Union
+
+from ..core.exceptions import VoxpipeError
+from ..core.utils import get_logger
+
+# Called when a combination is pressed.  Returning a context manager makes it a hold
+# action: it is entered on press and exited when the combination is released.
+HotkeyAction = Union[Callable[[], AbstractContextManager], Callable[[], None]]
 
 
 class HotkeyDispatcher:
+    """Listens for key combinations system-wide and runs the actions registered for them.
+
+    Combinations use pynput's syntax, e.g. ``"<ctrl>+k"`` or ``"<ctrl_r>+<shift_r>"``.
+    A generic modifier (``<ctrl>``) matches either side; a sided one only its
+    own, where the platform tells the two apart.
+    Actions run on a worker thread, in order, never on the OS keyboard hook: a
+    slow action cannot stall the keyboard or get the hook removed.
+    """
+
     def __init__(self):
-        """Initializes the hotkey dispatcher."""
-        self.hotkeys: Dict[frozenset, HotkeyAction] = {}
-        self.active_contexts: Dict[frozenset, ContextManager[None]] = {}
-        self.pressed_keys: Set[keyboard.Key | keyboard.KeyCode] = set()
-        self.listener = keyboard.Listener(
-            on_press=self._on_press, on_release=self._on_release
-        )
+        # Imported here so that merely importing voxpipe needs no display server.
+        from pynput import keyboard
 
-    def _normalize_key(
-        self, key: keyboard.Key | keyboard.KeyCode | None
-    ) -> int | None:
-        """Forces all pynput keys into native Python integers."""
-        if key is None:
-            return None
-        if hasattr(key, "value"):
-            key = key.value
-        if hasattr(key, "vk") and key.vk is not None:
-            return key.vk
-        if hasattr(key, "char") and key.char is not None:
-            return ord(key.char.lower())
-        return hash(str(key))
+        self.logger = get_logger(__name__)
+        self._keyboard = keyboard
+        self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self._canonical = self.listener.canonical
 
-    def register(self, hotkey_string: str, action: HotkeyAction):
-        """Registers a hotkey with a specific action."""
-        parsed_keys = keyboard.HotKey.parse(hotkey_string)
-        hotkey = frozenset(self._normalize_key(k) for k in parsed_keys)
-        self.hotkeys[hotkey] = action
+        self._hotkeys: Dict[FrozenSet[Hashable], HotkeyAction] = {}
+        self._down: Dict[Hashable, FrozenSet[Hashable]] = {}  # physical key -> the tokens it satisfies
+        self._engaged: Set[FrozenSet[Hashable]] = set()  # combinations currently held
+        self._held: Dict[FrozenSet[Hashable], AbstractContextManager] = {}
+        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hotkey")
 
-    def unregister(self, hotkey_string: str):
-        """Unregisters a hotkey."""
-        parsed_keys = keyboard.HotKey.parse(hotkey_string)
-        hotkey = frozenset(self._normalize_key(k) for k in parsed_keys)
-        if hotkey in self.hotkeys:
-            del self.hotkeys[hotkey]
+    # --- registration ----------------------------------------------------
 
-    def _on_press(self, key: keyboard.Key | keyboard.KeyCode | None):
+    def register(self, hotkey_string: str, action: HotkeyAction) -> None:
+        """Bind ``action`` to a combination, replacing any action already bound to it."""
+        self._hotkeys[self._parse(hotkey_string)] = action
+
+    def unregister(self, hotkey_string: str) -> None:
+        """Remove a combination; if it is being held, its hold action is released first."""
+        combination = self._parse(hotkey_string)
+        self._hotkeys.pop(combination, None)
+        if combination in self._engaged:
+            self._engaged.discard(combination)
+            self._worker.submit(self._disengage, combination)
+
+    def is_registered(self, hotkey_string: str) -> bool:
+        return self._parse(hotkey_string) in self._hotkeys
+
+    def _parse(self, hotkey_string: str) -> FrozenSet[Hashable]:
+        try:
+            keys = self._keyboard.HotKey.parse(hotkey_string)
+        except ValueError as e:
+            raise VoxpipeError(
+                f"Invalid hotkey {hotkey_string!r}: write it like '<ctrl>+k', '<f8>' or '<ctrl_r>+<shift_r>'."
+            ) from e
+        return frozenset(self._token(key) for key in keys)
+
+    # --- key identity ----------------------------------------------------
+
+    def _token(self, key: Any) -> Hashable:
+        """A hashable identity for a key as written in a hotkey string."""
+        if isinstance(key, self._keyboard.Key):
+            return key
+        if key.char is not None:
+            return ("char", key.char.lower())
+        return ("vk", key.vk)
+
+    def _event_tokens(self, key: Any) -> FrozenSet[Hashable]:
+        """Every hotkey token a pressed key satisfies.
+
+        A physical key answers to its own identity, its canonical one and its
+        virtual-key code.  So left control satisfies ``<ctrl_l>`` (which pynput
+        parses to a key code) as well as ``<ctrl>``, and a letter is recognised
+        whatever modifiers are changing the character it types.
+        """
+        tokens = {self._token(key), self._token(self._canonical(key))}
+        code = key.value if isinstance(key, self._keyboard.Key) else key
+        if code.vk is not None:
+            tokens.add(("vk", code.vk))
+        return frozenset(tokens)
+
+    def _physical(self, key: Any) -> Hashable:
+        """Identity of the physical key, stable between its press and its release.
+
+        The character a key types, and on some platforms its key code too,
+        changes with the modifiers held, and a modifier may be released before
+        the key.  The canonical character does not change.
+        """
+        if isinstance(key, self._keyboard.Key):
+            return key
+        canonical = self._canonical(key)
+        character = getattr(canonical, "char", None)
+        if character:
+            return ("char", character.lower())
+        return ("vk", key.vk) if key.vk is not None else ("char", (key.char or "").lower())
+
+    # --- listener callbacks (OS hook thread: must return immediately) -----
+
+    def _on_press(self, key: Optional[Any]) -> None:
         if key is None:
             return
+        self._down[self._physical(key)] = self._event_tokens(key)
+        pressed = frozenset().union(*self._down.values())
+        for combination, action in list(self._hotkeys.items()):
+            # Fire on the transition to "held" only; key auto-repeat must not re-trigger.
+            if combination <= pressed and combination not in self._engaged:
+                self._engaged.add(combination)
+                self._worker.submit(self._engage, combination, action)
 
-        norm_key = self._normalize_key(key)
-        self.pressed_keys.add(norm_key)
+    def _on_release(self, key: Optional[Any]) -> None:
+        if key is None:
+            return
+        self._down.pop(self._physical(key), None)
+        pressed = frozenset().union(*self._down.values())
+        for combination in [c for c in self._engaged if not c <= pressed]:
+            self._engaged.discard(combination)
+            self._worker.submit(self._disengage, combination)
 
-        for hotkey, action in self.hotkeys.items():
-            if (
-                hotkey.issubset(self.pressed_keys)
-                and hotkey not in self.active_contexts
-            ):
-                context_manager = action()
-                if hasattr(context_manager, "__enter__") and hasattr(
-                    context_manager, "__exit__"
-                ):
-                    context_manager.__enter__()
-                    self.active_contexts[hotkey] = context_manager
+    # --- actions (worker thread) -----------------------------------------
 
-    def _on_release(self, key: keyboard.Key | keyboard.KeyCode | None):
-        norm_key = self._normalize_key(key)
+    def _engage(self, combination: FrozenSet[Hashable], action: HotkeyAction) -> None:
+        try:
+            result = action()
+            if isinstance(result, AbstractContextManager):
+                result.__enter__()
+                self._held[combination] = result
+        except Exception:  # noqa: BLE001 - a failing action must not kill the hotkey worker
+            self.logger.error("Hotkey action failed.", exc_info=True)
 
-        if norm_key in self.pressed_keys:
-            self.pressed_keys.remove(norm_key)
+    def _disengage(self, combination: FrozenSet[Hashable]) -> None:
+        held = self._held.pop(combination, None)
+        if held is None:
+            return
+        try:
+            held.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001 - see _engage
+            self.logger.error("Hotkey release action failed.", exc_info=True)
 
-        for hotkey, context_manager in list(self.active_contexts.items()):
-            if not hotkey.issubset(self.pressed_keys):
-                context_manager.__exit__(None, None, None)
-                del self.active_contexts[hotkey]
+    # --- lifecycle -------------------------------------------------------
 
-    def start(self):
-        """Starts the keyboard listener."""
-        self.listener.start()
+    @property
+    def is_listening(self) -> bool:
+        return self.listener.is_alive()
 
-    def stop(self):
-        """Stops the keyboard listener."""
+    def start(self) -> None:
+        """Start listening for keys; a no-op while already listening."""
+        if not self.listener.is_alive():
+            self.listener.start()
+
+    def stop(self) -> None:
         self.listener.stop()
         if self.listener.is_alive():
             self.listener.join()
+        self._worker.shutdown(wait=False)

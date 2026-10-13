@@ -1,13 +1,14 @@
-def qualify_transcript(text: str) -> tuple[str | None, str | None]:
-    """Returns (cleaned_text_or_None, annotation_or_None).
+"""The transcript gate: decides whether recognised text is something a person said."""
 
-    Cleans and classifies raw ASR output before it reaches the LLM.
+from typing import Optional
+
+
+def qualify_transcript(text: str) -> Optional[str]:
+    """The transcript tidied up, or None when there is nothing in it to answer.
+
+    A recogniser returns bare punctuation, or nothing at all, for a cough or a
+    click.  Anything with a letter or a digit in it counts as speech: "42" is
+    as much an answer as "yes".
     """
-    t = (text or "").strip()
-    words = t.split()
-
-    # Noise / fragment — drop silently
-    if not words or not any(c.isalpha() for c in t):
-        return None, None
-
-    return t, None
+    cleaned = (text or "").strip()
+    return cleaned if any(character.isalnum() for character in cleaned) else None

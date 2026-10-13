@@ -1,6 +1,6 @@
 """Tool chaining, RAG integration, and conversation state tests."""
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from voxpipe.llm.tools import ToolCall, Tool, ToolResult
 
@@ -13,7 +13,7 @@ def _make_mock_llm(tokens_per_call, decoder=None):
     """
     from voxpipe.llm.decoders import GeneralDecoder
     from voxpipe.llm.model import LLM
-    from voxpipe.llm.context import DropOldestStrategy
+    from voxpipe.llm.context import MaxTurnsStrategy
     _decoder = decoder or GeneralDecoder()
 
     class MockLLM(LLM):
@@ -27,7 +27,7 @@ def _make_mock_llm(tokens_per_call, decoder=None):
             yield from tokens
 
         def create_context_strategy(self, max_turns=20):
-            return DropOldestStrategy(max_turns)
+            return MaxTurnsStrategy(max_turns)
 
         def count_tokens(self, text):
             return max(1, len(text) // 2)
@@ -296,18 +296,19 @@ class TestConversationState(unittest.TestCase):
         from voxpipe.llm.session import Session
         from voxpipe.llm.conversation import Conversation
 
+        from voxpipe.llm.context import MaxTurnsStrategy, MemoryHandler
+
         tokens = [["OK."]]
         llm = _make_mock_llm(tokens)
         conv = Conversation()
         conv.set_system_message("You are helpful.")
-        # Set max_turns low to test pruning
-        sess = Session(llm=llm, conversation=conv, max_turns=3)
+        handler = MemoryHandler(MaxTurnsStrategy(max_turns=3))
+        sess = Session(llm=llm, conversation=conv, context_handler=handler)
 
         for i in range(5):
-            conv.add_user_message(f"turn {i}")
-            list(sess())
+            list(sess(f"turn {i}"))
 
-        # Should have system + at most max_turns*2 + 1 visible messages
-        self.assertLessEqual(len(conv.messages), 7,
-                             f"too many messages: {len(conv.messages)}")
+        # System prompt, then at most three turns of question and answer.
+        self.assertLessEqual(len(conv.messages), 7, f"too many messages: {len(conv.messages)}")
+        self.assertEqual(conv.messages[1]["role"], "user", "the window must open on a user turn")
         sess.close()

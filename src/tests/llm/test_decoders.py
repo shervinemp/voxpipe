@@ -1,5 +1,126 @@
 import unittest
-from voxpipe.llm.tools import ToolCall
+from voxpipe.llm.tools import MalformedToolCall, ToolCall
+
+
+def tokenwise(text):
+    """Split text the way a tokenizer streams it: every symbol and word its own chunk."""
+    import re
+    return re.findall(r"\w+|\s+|[^\w\s]", text)
+
+
+class TestTokenSizedChunks(unittest.TestCase):
+    """Tags rarely arrive whole: every decoder must cope with them split at any point."""
+
+    def _run(self, decoder, text):
+        return list(decoder(iter(tokenwise(text))))
+
+    def _text(self, items):
+        return "".join(i for i in items if isinstance(i, str))
+
+    def test_json_call_split_into_tokens(self):
+        from voxpipe.llm.decoders import GeneralDecoder, LegacyXMLDecoder
+        body = '{"name": "get_time", "arguments": {"zone": "UTC"}}'
+        for decoder in (GeneralDecoder(), LegacyXMLDecoder()):
+            for open_tag, close_tag in (("<toolcall>", "</toolcall>"), ("<tool_call>", "</tool_call>")):
+                with self.subTest(decoder=type(decoder).__name__, tag=open_tag):
+                    items = self._run(decoder, f"Sure. {open_tag}{body}{close_tag}")
+                    self.assertEqual(self._text(items), "Sure. ")
+                    self.assertEqual(items[-1], ToolCall(name="get_time", arguments={"zone": "UTC"}))
+
+    def test_gemma_call_split_into_tokens(self):
+        from voxpipe.llm.decoders import GeneralDecoder, GemmaE2BDecoder
+        text = 'One moment. <|tool_call>call:note{text:<|"|>buy milk<|"|>,count:2}<tool_call|>'
+        for decoder in (GeneralDecoder(), GemmaE2BDecoder()):
+            with self.subTest(decoder=type(decoder).__name__):
+                items = self._run(decoder, text)
+                self.assertEqual(self._text(items), "One moment. ")
+                self.assertEqual(items[-1], ToolCall(name="note", arguments={"text": "buy milk", "count": 2}))
+
+    def test_every_split_point_of_a_call(self):
+        from voxpipe.llm.decoders import GeneralDecoder
+        text = 'Hi <toolcall>{"name": "t", "arguments": {}}</toolcall>'
+        for cut in range(1, len(text)):
+            with self.subTest(cut=cut):
+                items = list(GeneralDecoder()(iter([text[:cut], text[cut:]])))
+                self.assertEqual(self._text(items), "Hi ")
+                self.assertEqual(items[-1], ToolCall(name="t", arguments={}))
+
+    def test_thoughts_split_into_tokens_are_dropped(self):
+        from voxpipe.llm.decoders import GeneralDecoder, GemmaE2BDecoder, LegacyXMLDecoder
+        cases = [
+            (GeneralDecoder(), "A<|channel>thought\nsecret plan<channel|>B"),
+            (GemmaE2BDecoder(), "A<|channel>thought\nsecret plan<channel|>B"),
+            (GeneralDecoder(), "A<think>secret plan</think>B"),
+            (LegacyXMLDecoder(), "A<think>secret plan</think>B"),
+        ]
+        for decoder, text in cases:
+            with self.subTest(decoder=type(decoder).__name__, text=text):
+                self.assertEqual(self._text(self._run(decoder, text)), "AB")
+
+    def test_text_is_not_held_back_longer_than_a_possible_tag(self):
+        from voxpipe.llm.decoders import GeneralDecoder
+        stream = GeneralDecoder()(iter(["3 < 4 and ", "x<y", "<", "tool", "box> done"]))
+        self.assertEqual(list(stream), ["3 < 4 and ", "x<y", "<toolbox> done"])
+
+    def test_angle_bracket_at_end_of_stream_is_flushed(self):
+        from voxpipe.llm.decoders import GeneralDecoder
+        self.assertEqual("".join(GeneralDecoder()(iter(["a ", "<"]))), "a <")
+
+
+class TestMalformedCalls(unittest.TestCase):
+    def test_unterminated_call_is_reported(self):
+        from voxpipe.llm.decoders import GeneralDecoder
+        items = list(GeneralDecoder()(iter(["ok ", "<toolcall>", '{"name": "t"'])))
+        self.assertEqual(items, ["ok ", MalformedToolCall(raw='{"name": "t"')])
+
+    def test_calls_without_a_usable_name_or_arguments(self):
+        from voxpipe.llm.decoders import GeneralDecoder
+        bodies = ['{"arguments": {}}', '{"name": "", "arguments": {}}', '{"name": "t", "arguments": [1]}', '"just a string"']
+        for body in bodies:
+            with self.subTest(body=body):
+                items = list(GeneralDecoder()(iter([f"<toolcall>{body}</toolcall>"])))
+                self.assertEqual(items, [MalformedToolCall(raw=body)])
+
+    def test_gemma_body_without_call_prefix(self):
+        from voxpipe.llm.decoders import GemmaE2BDecoder
+        items = list(GemmaE2BDecoder()(iter(["<|tool_call>retrieve{}<tool_call|>"])))
+        self.assertEqual(items, [MalformedToolCall(raw="retrieve{}")])
+
+
+class TestGemmaArguments(unittest.TestCase):
+    def _args(self, body):
+        from voxpipe.llm.decoders import GemmaE2BDecoder
+        (call,) = GemmaE2BDecoder()(iter([f"<|tool_call>call:t{body}<tool_call|>"]))
+        return call.arguments
+
+    def test_string_values_may_look_like_keys(self):
+        self.assertEqual(self._args('{text:<|"|>buy milk, eggs: 12<|"|>}'), {"text": "buy milk, eggs: 12"})
+
+    def test_string_values_may_contain_quotes_and_newlines(self):
+        self.assertEqual(self._args('{text:<|"|>He said "hi"\nthen left<|"|>}'), {"text": 'He said "hi"\nthen left'})
+
+    def test_nested_objects_and_lists(self):
+        self.assertEqual(
+            self._args('{filter:{tags:[<|"|>a<|"|>,<|"|>b<|"|>],limit:3},strict:true}'),
+            {"filter": {"tags": ["a", "b"], "limit": 3}, "strict": True},
+        )
+
+    def test_plain_json_arguments(self):
+        self.assertEqual(self._args('{"query": "hello", "n": 2}'), {"query": "hello", "n": 2})
+
+    def test_no_arguments(self):
+        self.assertEqual(self._args(""), {})
+
+
+class TestDecoderRegistry(unittest.TestCase):
+    def test_get_decoder(self):
+        from voxpipe.core.exceptions import ProviderError
+        from voxpipe.llm.decoders import DECODERS, StreamDecoder, get_decoder
+        for name in ("native", "general", "gemma_e2b", "legacy_xml"):
+            self.assertIsInstance(get_decoder(name), StreamDecoder)
+            self.assertIsInstance(get_decoder(name), DECODERS[name])
+        with self.assertRaises(ProviderError):
+            get_decoder("nonsense")
 
 
 class TestDecoders(unittest.TestCase):
@@ -272,11 +393,8 @@ class TestStreamDecoders(unittest.TestCase):
     def test_ge_malformed_json(self):
         from voxpipe.llm.decoders import GemmaE2BDecoder
         d = GemmaE2BDecoder()
-        calls, text = self._collect(d, [
-            "<|tool_call>call:bad{invalid json!!!}<tool_call|>",
-        ])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], "_parse_error")
+        items = list(d(iter(["<|tool_call>call:bad{invalid json!!!}<tool_call|>"])))
+        self.assertEqual(items, [MalformedToolCall(raw="call:bad{invalid json!!!}")])
 
     def test_ge_quotes_in_args(self):
         from voxpipe.llm.decoders import GemmaE2BDecoder
@@ -316,23 +434,16 @@ class TestStreamDecoders(unittest.TestCase):
         from voxpipe.llm.decoders import LegacyXMLDecoder
         d = LegacyXMLDecoder()
         big_body = "{" + "x" * 10_001 + "}"
-        calls, text = self._collect(d, [
-            "<toolcall>",
-            big_body,
-            "</toolcall>",
-        ])
-        # Decoder discards the oversized buffer and yields _parse_error
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], "_parse_error")
+        items = list(d(iter(["<toolcall>", big_body, "</toolcall>"])))
+        # The decoder gives up on the oversized call instead of buffering without bound.
+        self.assertEqual(len(items), 1)
+        self.assertIsInstance(items[0], MalformedToolCall)
 
     def test_lxd_malformed_json(self):
         from voxpipe.llm.decoders import LegacyXMLDecoder
         d = LegacyXMLDecoder()
-        calls, text = self._collect(d, [
-            "<toolcall>{bad</toolcall>",
-        ])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], "_parse_error")
+        items = list(d(iter(["<toolcall>{bad</toolcall>"])))
+        self.assertEqual(items, [MalformedToolCall(raw="{bad")])
 
     def test_lxd_partial_tag_at_boundary(self):
         from voxpipe.llm.decoders import LegacyXMLDecoder
@@ -386,3 +497,47 @@ class TestStreamDecoders(unittest.TestCase):
         result = list(d(iter([tc])))
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].name, "direct")
+
+
+class TestArgumentVariants(unittest.TestCase):
+    """Shapes models actually write that differ from the format's letter."""
+
+    @staticmethod
+    def decode(decoder, text):
+        return list(decoder([text]))
+
+    def test_gemma_calls_with_ordinary_json_strings(self):
+        from voxpipe.llm.decoders import GemmaE2BDecoder
+
+        cases = {
+            '{"query": "weather, city: Oslo"}': {"query": "weather, city: Oslo"},
+            '{query:"remind me: milk, eggs: 12"}': {"query": "remind me: milk, eggs: 12"},
+            '{a:"x", b:{c:"y, z: 1"}}': {"a": "x", "b": {"c": "y, z: 1"}},
+            '{query:<|"|>plain, old: style<|"|>,n:2}': {"query": "plain, old: style", "n": 2},
+        }
+        for arguments, expected in cases.items():
+            with self.subTest(arguments):
+                items = self.decode(GemmaE2BDecoder(), f"<|tool_call>call:t{arguments}<tool_call|>")
+                self.assertEqual(items, [ToolCall(name="t", arguments=expected)])
+
+    def test_json_calls_with_parameters_stringified_or_null_arguments(self):
+        from voxpipe.llm.decoders import LegacyXMLDecoder
+
+        cases = {
+            '{"name": "t", "parameters": {"q": 1}}': {"q": 1},
+            '{"name": "t", "arguments": "{\\"q\\": 1}"}': {"q": 1},
+            '{"name": "t", "arguments": null}': {},
+            '{"name": "t"}': {},
+        }
+        for body, expected in cases.items():
+            with self.subTest(body):
+                items = self.decode(LegacyXMLDecoder(), f"<tool_call>{body}</tool_call>")
+                self.assertEqual(items, [ToolCall(name="t", arguments=expected)])
+
+    def test_arguments_that_are_not_an_object_stay_malformed(self):
+        from voxpipe.llm.decoders import LegacyXMLDecoder
+
+        for body in ('{"name": "t", "arguments": "not json"}', '{"name": "t", "arguments": [1]}'):
+            with self.subTest(body), self.assertLogs("voxpipe.llm.decoders", level="WARNING"):
+                items = self.decode(LegacyXMLDecoder(), f"<tool_call>{body}</tool_call>")
+                self.assertIsInstance(items[0], MalformedToolCall)

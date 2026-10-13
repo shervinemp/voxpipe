@@ -2,26 +2,23 @@ llm:
   backend: "local"
   model: "Gemma4_12B"
   max_tool_iterations: 1
+  max_turns: 10
+  tool_timeout: 10
 
   local:
-    Qwen3: &qwen
+    Qwen3:
       n_ctx: 40960
       max_tokens: 8192
       decoder: "legacy_xml"
 
-    _gemma4: &gemma4
+    Gemma4E2B: &gemma4
       n_ctx: 8192
       max_tokens: 2048
       type_k: "q4_0"
       type_v: "q4_0"
-
-    Gemma4E2B:
-      <<: *gemma4
       decoder: "gemma_e2b"
 
-    Gemma4E4B:
-      <<: *gemma4
-      decoder: "gemma_e2b"
+    Gemma4E4B: *gemma4
 
     Gemma4_12B:
       <<: *gemma4
@@ -46,10 +43,16 @@ tts:
 asr:
   provider: "ParakeetV2"
   weights_dir: "model_files/asr"
+  sound_device: null
   vad_threshold: 0.4
   trailing_silence_ms: 800
   leading_silence_ms: 1000
   max_segment_duration: 0
+  crisperwhisper:
+    model: "nyralabs/CrisperWhisper2.0_small"
+    backend: "auto"
+    mode: "verbatim"
+    language: "en"
 
 conversation_history:
   enabled: true

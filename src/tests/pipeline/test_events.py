@@ -36,7 +36,6 @@ class TestEventEmitter(unittest.TestCase):
         self.em.emit("nonexistent")
 
     def test_async_handler(self):
-        import time
         results = []
         def slow():
             time.sleep(0.02)
@@ -45,3 +44,31 @@ class TestEventEmitter(unittest.TestCase):
         self.em.emit("ev")
         time.sleep(0.05)
         self.assertIn("done", results)
+
+
+class TestRemovingHandlers(unittest.TestCase):
+    def test_off_removes_a_bound_method(self):
+        from voxpipe.pipeline.events import EventEmitter
+
+        class Meter:
+            def __init__(self):
+                self.levels = []
+
+            def on_level(self, level):
+                self.levels.append(level)
+
+        emitter, meter = EventEmitter(), Meter()
+        self.addCleanup(emitter.close)
+        emitter.on("vad:level", meter.on_level)
+        emitter.off("vad:level", meter.on_level)  # a new bound-method object, equal to the registered one
+        emitter.emit("vad:level", 0.5)
+        self.assertEqual(meter.levels, [])
+        self.assertEqual(emitter._handlers, {}, "no empty entry is left behind")
+
+    def test_off_for_an_unknown_event_is_harmless(self):
+        from voxpipe.pipeline.events import EventEmitter
+
+        emitter = EventEmitter()
+        self.addCleanup(emitter.close)
+        emitter.off("never:registered", print)
+        self.assertEqual(emitter._handlers, {})

@@ -5,8 +5,8 @@
 [![CI](https://github.com/shervinemp/voxpipe/actions/workflows/ci.yml/badge.svg)](https://github.com/shervinemp/voxpipe/actions/workflows/ci.yml)
 
 A modular voice-controlled pipeline. Speak, the LLM processes your intent
-with tool calling, and the system responds aloud — all streaming,
-interruptible, and configurable.
+with tool calling, and the system responds aloud — streaming, interruptible,
+and configurable.
 
 ```mermaid
 flowchart TB
@@ -16,24 +16,26 @@ flowchart TB
     ASR["ASR (ParakeetV2)"] -->|transcript| Gate
     Gate["Transcript Gate"] -->|text| LLM["LLM"]
 
-    Memory["Memory (SQLite)"] -.->|history| LLM
+    Memory["Memory (SQLite)"] -.->|recall| LLM
+    LLM -.->|evicted turns| Memory
     LLM -.->|tool call| Tools["Tools"]
     Tools -.->|result| LLM
 
     LLM -->|stream| Split["Splitter"]
     Split -->|sentences| TTS["TTS (Kokoro)"]
-    Split -.->|interrupt| ASR
+    ASR -.->|barge-in| LLM
+    ASR -.->|barge-in| TTS
     TTS --> Speaker["Speaker"]
 
     Local["GGUF"] -.->|model| LLM
-    Remote["Ollama / OpenAI"] -.->|model| LLM
+    Remote["Ollama / OpenAI / Gemini"] -.->|model| LLM
 ```
 
 ## Quick Start
 
 ```bash
-# 1. Install
-uv sync
+# 1. Install with the local-model stack
+uv sync --extra asr --extra tts --extra gguf
 
 # 2. Configure
 cp config.example.yaml config.yaml
@@ -42,23 +44,33 @@ cp config.example.yaml config.yaml
 uv run voxpipe
 ```
 
+`voxpipe --help` lists the options (`--config`, `--push-to-talk`,
+`--press-to-reset`, `--log-level`).
+
 ## Features
 
 | Layer | What |
 |---|---|
-| **ASR** | Speech-to-text (ParakeetV2) with VAD, push-to-talk, device auto-reconnect |
-| **LLM** | Local GGUF models or remote APIs (Ollama, OpenAI, Gemini) via LiteLLM |
-| **TTS** | Voice feedback (Kokoro) with interrupt on new input |
-| **Tools** | OpenAI-compatible tool calling with streaming decoders and chaining |
-| **Memory** | Conversation history with SQLite + FTS5, auto-injects relevant context |
+| **ASR** | Speech-to-text (ParakeetV2 or CrisperWhisper) with Silero VAD, push-to-talk, device auto-reconnect |
+| **LLM** | Local GGUF models, or OpenAI / Gemini / Ollama through LiteLLM |
+| **TTS** | Kokoro, spoken sentence by sentence as the reply is generated |
+| **Barge-in** | Talking over a reply cancels generation and cuts playback |
+| **Tools** | Tool calling with streaming decoders, chaining, async tools, and user-confirmed permissions |
+| **Memory** | Conversation history in SQLite + FTS5; relevant past turns are recalled into context |
 | **Hotkeys** | Push-to-talk and conversation reset |
 
 ## Configuration
+
+Settings are layered: packaged defaults, then `config.yaml` (or `--config` /
+`$VOXPIPE_CONFIG`), then environment variables named in `env:` blocks. Unknown
+keys are rejected at startup with the offending key named.
 
 ```yaml
 llm:
   backend: "local"       # "local" (GGUF) or "litellm" (remote APIs)
   model: "Gemma4_12B"
+  max_tool_iterations: 1
+  max_turns: 10          # turns (a question and its answer) kept in context
   local:
     Gemma4_12B:
       decoder: "legacy_xml"
@@ -66,6 +78,9 @@ llm:
     provider: "ollama"
     model: "qwen3:latest"
     api_base: "http://localhost:11434"
+
+asr:
+  sound_device: null     # index or name fragment; null = system default
 
 hotkeys:
   push_to_talk: "<ctrl_r>+<shift_r>"
@@ -84,74 +99,98 @@ conversation_history:
 ```
 src/
 └── voxpipe/
-    ├── core/            # Config (YAML + env vars), exceptions, utilities
-    ├── asr/             # Speech-to-text (ParakeetV2, Silero VAD)
-    ├── tts/             # Text-to-speech (Kokoro ONNX, audio player)
-    ├── llm/             # Session, tools, decoders, model loading
-    ├── pipeline/        # ASR → LLM → TTS orchestration
+    ├── core/            # Config (YAML + env vars), exceptions, model downloads
+    ├── asr/             # Microphone capture, Silero VAD, ParakeetV2 / CrisperWhisper
+    ├── tts/             # Kokoro ONNX, speech queue, interruptible audio player
+    ├── llm/             # Session, conversation, tools, decoders, providers, context handling
+    ├── pipeline/        # ASR → LLM → TTS orchestration, hotkeys, events
     ├── streaming/       # Sentence splitting
-    ├── storage/         # Retriever ABC, Memory, model downloads
-    └── data/            # Default config, model manifests
+    ├── storage/         # Storage protocols, RAM and SQLite backends, MemoryStore
+    └── data/            # Default config, model manifest
 ```
 
 ### Pipeline flow
 
-1. **ASR** captures audio, VAD segments speech, push-to-talk mutes when idle
-2. **Transcript gate** filters noise and adds annotations
-3. **Memory** injects relevant past conversation as `(Earlier: ...)` context
-4. **LLM** processes the augmented query with tool calling
-5. **Sentence splitter** streams the response, yielding one sentence at a time
-6. **TTS** speaks each sentence; new input interrupts playback (barge-in)
+1. **ASR** captures audio on its own thread; the VAD segments speech, and
+   push-to-talk mutes the microphone between presses
+2. **Transcript gate** drops noise before it reaches the LLM
+3. **Memory** attaches relevant past turns to the new message as
+   `(Earlier: ...)` context
+4. **LLM** answers, calling tools when it needs to
+5. **Sentence splitter** hands each sentence to TTS as soon as it is complete
+6. **TTS** speaks it; if you start talking, generation is cancelled and
+   playback stops (barge-in)
 
-### LLM Session
+In always-on mode with loudspeakers the microphone can hear the reply and
+interrupt it; use headphones or push-to-talk.
 
-The session manages tool iteration, conversation pruning, and per-turn dispatch.
+### Using the pieces directly
+
+The LLM and storage layers need no audio hardware:
 
 ```python
-from voxpipe.llm import Session, LLMProviders
+from voxpipe import MemoryHandler, MaxTurnsStrategy, Session, SQLiteStorage, Tool
+from voxpipe.llm import LLMProviders, permission
+
+def get_weather(city: str) -> dict:
+    """Look up the current weather.
+
+    Args:
+        city: City name.
+
+    Instruction:
+        Call get_weather when the user asks about the weather.
+    """
+    return {"city": city, "sky": "clear"}
+
+@permission                      # the user is asked before this runs
+def unlock_door(door: str) -> str:
+    """Unlock a door."""
+    return f"{door} unlocked"
 
 llm = LLMProviders.create("local", "Gemma4_12B")
-session = Session(llm=llm, max_tool_iterations=1)
-session.conversation.tools["my_tool"] = my_tool
+memory = SQLiteStorage("data/conversations.db")
 
-for chunk in session("hello"):
-    print(chunk)  # streamed LLM response
+with Session(
+    llm,
+    instructions="You are the voice of a smart home.",
+    rules=["Keep answers to a sentence or two."],
+    tools=[Tool.from_callable("get_weather", get_weather), Tool.from_callable("unlock_door", unlock_door)],
+    context_handler=MemoryHandler(MaxTurnsStrategy(10), memory),
+) as session:
+    for chunk in session("What's the weather in Oslo?"):
+        print(chunk, end="", flush=True)
 ```
 
-### Tools
+- **What the model is told.** The system prompt is the `instructions`, then
+  a list of rules: each tool's `Instruction:` and your own `rules`. All of
+  it, and `session.tools`, can be changed between turns
+  (`session.tools.add(tool)`) and survives `session.reset()`.
+- **Events and cancelling.** `session.events(...)` yields text, tool calls
+  and tool results as typed events; `session.cancel()` stops a turn from
+  another thread.
+- **Context and memory.** Once more than `max_turns` turns are held, the
+  oldest are archived to memory and dropped until 60% remain. Cutting in
+  batches keeps the start of the prompt unchanged for several turns, so a
+  model that caches its prompt prefix reads only what is new. Memory is
+  anything with `store` and `retrieve`; wrap a backend in
+  `MemoryStore(backend, session_id=...)` to keep one session's memories apart.
+- **One-off answers.** `llm.complete("Summarise: ...")` needs no session.
 
-Tools return `ToolResult` or `ToolChoice` (for multi-step confirmations).
+To embed the whole pipeline, build it from configuration or from your own
+components, and subscribe to its events:
 
 ```python
-from voxpipe.llm.tools import Tool, ToolChoice, ToolResult
+from voxpipe.pipeline.pipeline import Pipeline
 
-def save_game(slot: int | None = None):
-    if slot is None:
-        return ToolChoice(result={"slot": ["1","2","3","4","5"]})
-    return ToolResult(result={"status": "saved", "slot": slot})
-
-tool = Tool.from_callable("save_game", save_game)
+pipeline = Pipeline.from_config()
+pipeline.register_tools(Tool.from_callable("get_weather", get_weather))
+pipeline.register_command("stop listening", pipeline.stop)
+pipeline.events.on("tts:start", print)
+pipeline.run()                   # blocks until stop()
 ```
 
-If the return-type annotation includes `ToolChoice`, a `_confirm` tool is
-auto-registered. The LLM calls it with the user's selection to execute.
-
-### Memory
-
-Conversation history is stored in SQLite with FTS5 full-text search. The
-pipeline auto-injects relevant past turns before each LLM call.
-
-```python
-from voxpipe.storage.memory import Memory
-
-mem = Memory(db_path="history.db")
-mem.store("What is Elden Ring?", role="user")
-mem.store("Elden Ring is a game by FromSoftware.", role="assistant")
-results = mem.retrieve("Elden Ring", top_k=3)
-# [{"content": "...", "role": "assistant", "created_at": 12345.6}]
-```
-
-### LLM Backends
+### LLM backends
 
 **Local GGUF** — config-driven, no hardcoded model classes.
 
@@ -165,7 +204,11 @@ llm:
       model_path: "model_files/llm/my_model.gguf"
 ```
 
-**LiteLLM** — OpenAI, Gemini, Ollama, Anthropic, etc.
+`decoder` selects how tool calls are read from the model's text: `gemma_e2b`,
+`legacy_xml` (`<toolcall>` / `<tool_call>` JSON), `general` (all of these), or
+`native`.
+
+**LiteLLM** — OpenAI, Gemini, or Ollama.
 
 ```yaml
 llm:
@@ -173,19 +216,38 @@ llm:
   litellm:
     provider: "openai"
     model: "gpt-4o"
+    env:
+      api_key: OPENAI_API_KEY
 ```
 
-### LLM Session
+### ASR providers
 
-```bash
-uv sync --extra dev --extra tts --extra gguf --extra asr
-python -m pytest src/tests/ -v --tb=short
+**ParakeetV2** (default) — fast ONNX model, `uv sync --extra asr`.
+
+**CrisperWhisper** — verbatim ASR (fillers, stutters, vocal events) with
+word-level timings, via [`crisperwhisper`](https://huggingface.co/nyralabs/CrisperWhisper2.0_small).
+Install with `uv sync --extra crisperwhisper` (pure-PyTorch backend; the
+CTranslate2 backend is Linux-only).
+
+```yaml
+asr:
+  provider: "CrisperWhisper"
+  crisperwhisper:
+    model: "nyralabs/CrisperWhisper2.0_small"  # or _large/_medium/_turbo
+    mode: "verbatim"          # "verbatim" (default) or "intended"
+    language: "en"
 ```
 
-Memory benchmarks (requires a downloaded GGUF model):
+The weights are released under a non-commercial research license.
+
+## Development
 
 ```bash
-python -m pytest src/tests/storage/test_memory_benchmark.py -v
+uv sync --extra dev
+uv run pytest                    # unit tests: no models or audio devices needed
+uv run pytest -m integration     # needs downloaded weights
+uvx ruff check src
+uv run --with mypy mypy
 ```
 
 ## License

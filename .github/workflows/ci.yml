@@ -5,12 +5,29 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:  # run by hand on any branch from the Actions tab
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Ruff
+        run: uvx ruff check src
+      # Runs in the project environment so the dependencies' types are seen.
+      # Pinned: a new mypy release should not turn an unrelated change red.
+      - name: Mypy
+        run: uv run --locked --with "mypy==1.11.2" mypy
+
+  test:
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
@@ -20,11 +37,29 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install system libs (PortAudio for sounddevice)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq portaudio19-dev espeak-ng
+      - name: Install PortAudio (needed to import sounddevice)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libportaudio2
 
+      # The unit tests fake every model and audio device, so only the core
+      # dependencies are needed; the hotkey tests skip themselves when there
+      # is no display for pynput.
       - name: Install dependencies
-        run: uv sync --extra dev --extra tts --extra gguf --extra asr
+        run: uv sync --locked --extra dev
 
       - name: Run tests
-        run: uv run python -m pytest src/tests/ -v --tb=short
+        run: uv run python -m pytest -v --tb=short
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build wheel
+        run: uv build --wheel
+      - name: Wheel ships its data files
+        run: |
+          python -m zipfile -l dist/*.whl | tee wheel-contents.txt
+          grep -q "voxpipe/data/config.defaults.yaml" wheel-contents.txt
+          grep -q "voxpipe/data/manifest.yaml" wheel-contents.txt
+          grep -q "voxpipe/py.typed" wheel-contents.txt

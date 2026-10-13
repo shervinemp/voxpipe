@@ -1,128 +1,118 @@
-#!/usr/bin/env python3
-"""
-Module containing the TTSProcessor class.
-Part of the TTS components package.
-
-This module provides text-to-speech processing functionality using ONNX models.
-"""
+"""Text-to-speech providers."""
 
 import os
 import re
-import shutil
+from typing import Dict, List, Optional, Tuple, Type
+
 import numpy as np
 
-# Dynamically locate espeak-ng for phonemization
-_espeak_lib = os.environ.get("PHONEMIZER_ESPEAK_LIBRARY")
-if not _espeak_lib:
-    candidates = []
-    if os.name == "nt":
-        candidates = [
-            r"C:\Program Files\eSpeak NG\libespeak-ng.dll",
-            r"C:\Program Files (x86)\eSpeak NG\libespeak-ng.dll",
-        ]
-    espeak_exe = shutil.which("espeak-ng")
-    if espeak_exe:
-        candidates.append(espeak_exe)
-    candidates = [c for c in candidates if c is not None]
-    for path in candidates:
-        if os.path.exists(path):
-            _espeak_lib = path
-            os.environ.setdefault("PHONEMIZER_ESPEAK_LIBRARY", _espeak_lib)
-            if os.name == "nt":
-                parent = os.path.dirname(path)
-                os.environ.setdefault("PATH", "")
-                if parent not in os.environ["PATH"]:
-                    os.environ["PATH"] = parent + os.pathsep + os.environ["PATH"]
-            break
+from ..core.config import get_config
+from ..core.downloader import ensure_downloaded
+from ..core.exceptions import ProviderError
+from ..core.models import AppConfig, TTSConfig
+from .audio import AudioPlayer
+from .base import TTSBase
 
-from .audio import AudioPlayer  # noqa: E402
+_ESPEAK_ENV_VAR = "PHONEMIZER_ESPEAK_LIBRARY"
+_WINDOWS_ESPEAK_LIBRARIES = (
+    r"C:\Program Files\eSpeak NG\libespeak-ng.dll",
+    r"C:\Program Files (x86)\eSpeak NG\libespeak-ng.dll",
+)
 
-from ..core.utils import get_logger  # noqa: E402
+_MARKUP = re.compile(r"[*_~`´<>]")
+_SYMBOLS_AND_EMOJI = re.compile(r"[\U00002600-\U000027BF\U0001F300-\U0010FFFF]")
 
 
-from ..core.config import config  # noqa: E402
-from ..core.exceptions import TTSError  # noqa: E402
+def _locate_espeak() -> None:
+    """Point the phonemizer at eSpeak NG on Windows, where it is not on the library search path.
+
+    Elsewhere the phonemizer finds the shared library itself; an explicit
+    ``PHONEMIZER_ESPEAK_LIBRARY`` always wins.
+    """
+    if os.name != "nt" or os.environ.get(_ESPEAK_ENV_VAR):
+        return
+    for library in _WINDOWS_ESPEAK_LIBRARIES:
+        if os.path.exists(library):
+            os.environ[_ESPEAK_ENV_VAR] = library
+            directory = os.path.dirname(library)
+            if directory not in os.environ.get("PATH", "").split(os.pathsep):
+                os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
+            return
 
 
-class Kokoro:
+class Kokoro(TTSBase):
+    """Kokoro ONNX speech synthesis."""
+
     sample_rate: int = 24_000
 
-    def __init__(self):
-        self.logger = get_logger(__name__)
-
-        weights_dir = config.get("tts.weights_dir", "model_files/tts")
-        from ..storage.manager import ensure_downloaded
-        paths = ensure_downloaded("Kokoro", local_dir=weights_dir)
-
-        from kokoro_onnx import Kokoro as KokoroONNX
-        from kokoro_onnx.tokenizer import Tokenizer
-        self.kokoro = KokoroONNX(
-            model_path=paths["model"],
-            voices_path=paths["voices"],
-        )
-        self.tokenizer = Tokenizer()
-        self.audio_player = AudioPlayer()
-        from concurrent.futures import ThreadPoolExecutor
-        self._executor = ThreadPoolExecutor(max_workers=1)
-
-    @classmethod
-    def download(cls):
-        weights_dir = config.get("tts.weights_dir", "model_files/tts")
-        from ..storage.manager import ensure_downloaded
-        ensure_downloaded("Kokoro", local_dir=weights_dir)
-
-    def _synthesize(self, text: str, voice: str, language: str, speed: float, interrupt: bool):
-        try:
-            text = re.sub(r'[*_~`´<>]', '', text)
-            text = re.sub(r'[\U00002600-\U000027BF\U0001F300-\U0010FFFF]', '', text)
-            text = text.strip()
-            if not text:
-                return np.array([], dtype=np.float32), 0
-
-            phonemes = self.tokenizer.phonemize(text, lang=language)
-            if not phonemes.strip():
-                self.logger.warning("Empty phonemes. Skipping TTS.")
-                return np.array([], dtype=np.float32), 0
-
-            self.logger.debug("TTS synthesizing %d chars -> %d phonemes", len(text), len(phonemes))
-            samples, sample_rate = self.kokoro.create(phonemes, voice=voice, speed=speed, is_phonemes=True, trim=False)
-            self.logger.debug("TTS generated %d samples (%.1fs)", len(samples), len(samples) / sample_rate if sample_rate else 0)
-            self.audio_player(samples, sample_rate, interrupt)
-            return samples, sample_rate
-        except Exception as e:
-            self.logger.error(f"TTS synthesis failed: {e}", exc_info=True)
-            return np.array([], dtype=np.float32), 0
-
-    def __call__(
+    def __init__(
         self,
-        text: str,
+        weights_dir: str,
+        *,
         voice: str = "af_heart",
         language: str = "en-us",
         speed: float = 1.0,
-        interrupt: bool = False,
+        audio_player: Optional[AudioPlayer] = None,
     ):
-        self._executor.submit(self._synthesize, text, voice, language, speed, interrupt)
+        paths = ensure_downloaded("Kokoro", local_dir=weights_dir)
+        _locate_espeak()
+        from kokoro_onnx import Kokoro as KokoroONNX
+        from kokoro_onnx.tokenizer import Tokenizer
 
-    def start(self):
-        self.audio_player.start()
+        self.kokoro = KokoroONNX(model_path=paths["model"], voices_path=paths["voices"])
+        self.tokenizer = Tokenizer()
+        self.voice = voice
+        self.language = language
+        self.speed = speed
+        super().__init__(audio_player or AudioPlayer())
 
-    def stop(self):
-        if self._executor:
-            self._executor.shutdown(wait=False)
-        self.audio_player.stop()
+    @classmethod
+    def from_config(cls, config: TTSConfig) -> "Kokoro":
+        return cls(config.weights_dir)
 
-    def __enter__(self):
-        self.start()
+    @classmethod
+    def download(cls, config: TTSConfig) -> None:
+        """Fetch the model files into ``tts.weights_dir`` if they are not already there."""
+        ensure_downloaded("Kokoro", local_dir=config.weights_dir)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
+    def synthesize(
+        self, text: str, *, voice: Optional[str] = None, language: Optional[str] = None, speed: Optional[float] = None
+    ) -> Tuple[np.ndarray, int]:
+        silence = np.array([], dtype=np.float32), self.sample_rate
+        text = _SYMBOLS_AND_EMOJI.sub("", _MARKUP.sub("", text)).strip()
+        if not text:
+            return silence
+        phonemes = self.tokenizer.phonemize(text, lang=language or self.language)
+        if not phonemes.strip():
+            self.logger.warning("Empty phonemes. Skipping TTS.")
+            return silence
 
-
-# ----------------------------------------------------------------------
+        self.logger.debug("TTS synthesizing %d chars -> %d phonemes", len(text), len(phonemes))
+        samples, sample_rate = self.kokoro.create(
+            phonemes, voice=voice or self.voice, speed=speed or self.speed, is_phonemes=True, trim=False
+        )
+        self.logger.debug("TTS generated %d samples (%.1fs)", len(samples), len(samples) / sample_rate)
+        return samples, sample_rate
 
 
 class TTSProviders:
-    Kokoro: type = Kokoro
+    """Registry of text-to-speech providers, by the name used in ``tts.provider``."""
 
+    _registry: Dict[str, Type[TTSBase]] = {"Kokoro": Kokoro}
 
-# ----------------------------------------------------------------------
+    @classmethod
+    def names(cls) -> List[str]:
+        return sorted(cls._registry)
+
+    @classmethod
+    def get(cls, name: str) -> Type[TTSBase]:
+        try:
+            return cls._registry[name]
+        except KeyError:
+            raise ProviderError(f"Unknown TTS provider: {name!r}. Expected one of: {', '.join(cls.names())}.") from None
+
+    @classmethod
+    def create(cls, name: Optional[str] = None, config: Optional[AppConfig] = None) -> TTSBase:
+        """Build the provider ``name`` (default: the configured one) from the configuration."""
+        tts_config = (config or get_config()).tts
+        return cls.get(name or tts_config.provider).from_config(tts_config)

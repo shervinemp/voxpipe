@@ -1,138 +1,129 @@
-"""
-Configuration management for the Voice Control application.
+"""Configuration loading.
 
-This module provides a singleton `Config` class that handles loading
-default and user-provided configurations from YAML files, and validates
-them using Pydantic models.
+Settings come from three layers, later ones winning: the defaults packaged
+with voxpipe, an optional user YAML file, and environment variables named in
+``env:`` blocks.  Nothing is read at import time: call :func:`get_config` for
+the process-wide configuration, or :func:`load_config` to build one explicitly
+and pass it to the components that need it.
 """
 
 import os
+import threading
+from importlib import resources
+from typing import Any, Optional
+
 import yaml
-from typing import Any
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from pydantic import ValidationError
 
+from .exceptions import ConfigError
 from .models import AppConfig
-from ..core.exceptions import ConfigError
+
+CONFIG_ENV_VAR = "VOXPIPE_CONFIG"
+DEFAULT_USER_CONFIG = "config.yaml"
+
+_lock = threading.Lock()
+_config: Optional[AppConfig] = None
 
 
-class Config:
+def _parse_yaml(text: str, source: str) -> dict:
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Error parsing YAML from {source}: {e}") from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{source} must contain a mapping at the top level.")
+    return data
+
+
+def _load_defaults() -> dict:
+    resource = resources.files("voxpipe.data").joinpath("config.defaults.yaml")
+    try:
+        text = resource.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise ConfigError("Packaged default configuration is missing.") from e
+    return _parse_yaml(text, "the packaged defaults")
+
+
+def _resolve_user_path(user_config_path: Optional[str]) -> Optional[str]:
+    """Return the user config file to read, or None when there is none.
+
+    A path given explicitly (argument or environment variable) must exist;
+    only the conventional ``./config.yaml`` is optional.
     """
-    A singleton class to manage application configuration.
+    explicit = user_config_path or os.environ.get(CONFIG_ENV_VAR)
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise ConfigError(f"Configuration file not found: {explicit}")
+        return explicit
+    conventional = os.path.join(os.getcwd(), DEFAULT_USER_CONFIG)
+    return conventional if os.path.isfile(conventional) else None
 
-    It loads a default configuration, overrides with user settings,
-    and validates the final configuration against a Pydantic model.
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Return ``base`` with ``override`` merged in; nested mappings merge key by key."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_env(data: Any) -> Any:
+    """Replace ``env: {field: VAR_NAME}`` blocks with the variables' values.
+
+    A set variable wins over a literal value for the same field; an unset one
+    leaves the literal in place (or the field as None).
     """
-
-    _instance = None
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super(Config, cls).__new__(cls, *args, **kwargs)
-        return cls._instance
-
-    def __init__(self, default_config_path=None, user_config_path=None):
-        if hasattr(self, "_initialized") and self._initialized:
-            return
-
-        if default_config_path is None:
-            base_dir = os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__))
-            )
-            default_config_path = os.path.join(
-                base_dir, "data/config.defaults.yaml"
-            )
-
-        if user_config_path is None:
-            user_config_path = os.environ.get(
-                "VOXPIPE_CONFIG",
-                os.path.join(os.getcwd(), "config.yaml"),
-            )
-
-        # Load project-local secrets before resolving env-backed YAML fields.
-        load_dotenv()
-        config_data = self._load_config(default_config_path)
-
-        if os.path.exists(user_config_path):
-            user_config = self._load_config(user_config_path) or {}
-            self._deep_merge(config_data, user_config)
-
-        config_data = self._recursive_resolve_env_vars(config_data)
-
-        try:
-            self.config = AppConfig(**config_data)
-        except ValidationError as e:
-            raise ConfigError(f"Configuration validation error: {e}")
-
-        self._initialized = True
-
-    def _recursive_resolve_env_vars(self, data: Any) -> Any:
-        """
-        Recursively traverses a config structure to resolve environment variables.
-        """
-        if isinstance(data, dict):
-            if "env" in data and isinstance(data.get("env"), dict):
-                env_block = data.pop("env")
-                for key, env_var_name in env_block.items():
-                    data[key] = os.getenv(env_var_name)
-
-            for key, value in data.items():
-                data[key] = self._recursive_resolve_env_vars(value)
-
-        elif isinstance(data, list):
-            return [self._recursive_resolve_env_vars(item) for item in data]
-
+    if isinstance(data, list):
+        return [_resolve_env(item) for item in data]
+    if not isinstance(data, dict):
         return data
 
-    def _load_config(self, path: str) -> dict:
-        """Loads a YAML configuration file."""
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f)
-        except FileNotFoundError:
-            # It's okay if the user config doesn't exist, but not the default.
-            if "defaults" in path:
-                raise ConfigError(
-                    f"Default configuration file not found at {path}"
-                )
-            return {}
-        except yaml.YAMLError as e:
-            raise ConfigError(f"Error parsing YAML file at {path}: {e}")
-
-    def _deep_merge(self, source: dict, destination: dict) -> dict:
-        """
-        Deeply merges the destination dict into the source dict.
-        Overwrites values in source with values from destination.
-        """
-        for key, value in destination.items():
-            if (
-                isinstance(value, dict)
-                and key in source
-                and isinstance(source[key], dict)
-            ):
-                self._deep_merge(source[key], value)
-            else:
-                source[key] = value
-        return source
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """
-        Retrieves a configuration value using dot notation from the Pydantic model.
-
-        Args:
-            key: The key to retrieve, e.g., 'database.neo4j.uri'.
-            default: The value to return if the key is not found.
-
-        Returns:
-            The configuration value or the default.
-        """
-        value = self.config
-        try:
-            for k in key.split("."):
-                value = getattr(value, k)
-            return value
-        except AttributeError:
-            return default
+    resolved = {key: _resolve_env(value) for key, value in data.items() if key != "env"}
+    env_block = data.get("env")
+    if isinstance(env_block, dict):
+        for field, variable in env_block.items():
+            value = os.environ.get(str(variable))
+            if value is not None or field not in resolved:
+                resolved[field] = value
+    elif env_block is not None:
+        resolved["env"] = env_block
+    return resolved
 
 
-config = Config()
+def load_config(user_config_path: Optional[str] = None) -> AppConfig:
+    """Build a validated configuration from the defaults, the user file and the environment."""
+    # Secrets live in the working directory's .env, not next to the installed package.
+    load_dotenv(find_dotenv(usecwd=True))
+
+    data = _load_defaults()
+    user_path = _resolve_user_path(user_config_path)
+    if user_path:
+        with open(user_path, "r", encoding="utf-8") as f:
+            data = _deep_merge(data, _parse_yaml(f.read(), user_path))
+
+    try:
+        return AppConfig(**_resolve_env(data))
+    except ValidationError as e:
+        raise ConfigError(f"Configuration validation error: {e}") from e
+
+
+def get_config() -> AppConfig:
+    """Return the process-wide configuration, loading it on first use."""
+    global _config
+    with _lock:
+        if _config is None:
+            _config = load_config()
+        return _config
+
+
+def set_config(config: Optional[AppConfig]) -> None:
+    """Install a process-wide configuration; ``None`` discards it so the next use reloads."""
+    global _config
+    with _lock:
+        _config = config

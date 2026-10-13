@@ -45,16 +45,21 @@ __pycache__
 # Logs
 *.log
 
-# Databases
+# Databases and saved sessions (conversation history is personal data)
 *.sqlite3
+*.db
+*.db-shm
+*.db-wal
+/data/
+/voxpipe_data/
+
+# Local configuration
+/config.yaml
 
 model_files/
 
 # Environment variables
 .env
 
-# RAG facts proposed by models may contain sensitive user-derived content.
-data/pending_triplets.jsonl
-
-# Test audio artifacts (regenerated on each run)
-tests/*.wav
+# Test audio artifacts
+src/tests/*.wav

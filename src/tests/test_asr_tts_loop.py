@@ -4,17 +4,12 @@ Closed-loop tests: TTS → audio → ASR → text → compare to original.
 Uses Word Error Rate (WER) as primary metric, character edit distance
 as secondary.  Low WER means both TTS clarity and ASR accuracy are good.
 """
-import os
 import re
 import unittest
-from unittest.mock import patch, MagicMock
 
-import soundfile as sf
-import pytest
+from ._integration import KOKORO, PARAKEET, requires_model, transcribe, tts
 
-from voxpipe.asr.models import ParakeetV2
-from voxpipe.tts.model import TTSProviders
-from voxpipe.core.config import config
+pytestmark = requires_model("Kokoro", KOKORO + PARAKEET)
 
 
 # ---------------------------------------------------------------------------
@@ -98,42 +93,28 @@ ALL_SENTENCES = SIMPLE + COMPLEX
 class TestTTSASRLoop(unittest.TestCase):
     """Closed-loop: TTS → audio → ASR → text, measure WER and edit distance."""
 
-    @patch("voxpipe.tts.model.AudioPlayer")
-    def test_wer_simple(self, mock_audio_player):
+    def test_wer_simple(self):
         """Simple phrases should have low WER."""
-        self._run_sentences(SIMPLE, max_wer=0.4, label="simple")
+        self._run_sentences(SIMPLE, max_wer=0.4)
 
-    @patch("voxpipe.tts.model.AudioPlayer")
-    def test_wer_complex(self, mock_audio_player):
+    def test_wer_complex(self):
         """Longer sentences can tolerate higher WER."""
-        self._run_sentences(COMPLEX, max_wer=0.5, label="complex")
+        self._run_sentences(COMPLEX, max_wer=0.5)
 
-    @patch("voxpipe.tts.model.AudioPlayer")
-    def test_wer_overall_average(self, mock_audio_player):
+    def test_wer_overall_average(self):
         """Average WER across all sentences must be below threshold."""
-        wers = self._run_sentences(ALL_SENTENCES, max_wer=1.0, label="all")
+        wers = self._run_sentences(ALL_SENTENCES, max_wer=1.0)
         avg = sum(wers) / len(wers)
-        print(f"\n  Average WER: {avg:.2%}")
+        print(f"  Average WER: {avg:.2%}")
         self.assertLess(avg, 0.35, f"Average WER {avg:.2%} too high")
 
-    def _run_sentences(self, sentences, max_wer, label):
-        from voxpipe.asr.models.parakeetv2 import ParakeetV2
-        tts_cls = getattr(TTSProviders, config.get("tts.provider"))
-        tts_cls.download()
-        tts = tts_cls()
-        asr = ParakeetV2()
-
+    def _run_sentences(self, sentences, max_wer):
         wers = []
         for sentence in sentences:
             with self.subTest(sentence=sentence[:30]):
-                # TTS: text → audio
-                samples, sr = tts._synthesize(sentence, voice="af_heart", language="en-us", speed=1.0, interrupt=False)
-                # ASR: audio → text
-                transcript = asr._model.recognize(samples, sample_rate=sr)
-                transcript = transcript or ""
-
+                samples, sr = tts().synthesize(sentence)
                 orig_norm = _normalize(sentence)
-                trans_norm = _normalize(transcript)
+                trans_norm = _normalize(transcribe(samples, sr))
                 err, n, ratio = _wer(orig_norm, trans_norm)
                 char_dist = _levenshtein(orig_norm, trans_norm)
                 wers.append(ratio)
@@ -141,75 +122,44 @@ class TestTTSASRLoop(unittest.TestCase):
                 print(f"  orig: {orig_norm}")
                 print(f"  asr:  {trans_norm}")
                 print(f"  WER:  {err}/{n} = {ratio:.2%}  char_edit: {char_dist}")
-                self.assertLess(ratio, max_wer,
-                                f"WER {ratio:.2%} exceeds {max_wer:.0%} for '{sentence}'")
+                self.assertLess(ratio, max_wer, f"WER {ratio:.2%} exceeds {max_wer:.0%} for '{sentence}'")
         return wers
 
 
 class TestASRConsistency(unittest.TestCase):
     """Determinism and self-consistency checks."""
 
-    @patch("voxpipe.tts.model.AudioPlayer")
-    def test_asr_deterministic(self, mock_audio_player):
+    def test_asr_deterministic(self):
         """Same audio → same transcription (WER = 0 between runs)."""
-        from voxpipe.asr.models.parakeetv2 import ParakeetV2
-        from voxpipe.tts.model import TTSProviders
-
-        tts_cls = getattr(TTSProviders, config.get("tts.provider"))
-        tts_cls.download()
-        tts = tts_cls()
-
-        text = "the quick brown fox jumps over the lazy dog"
-        samples, sr = tts._synthesize(text, voice="af_heart", language="en-us", speed=1.0, interrupt=False)
-
-        asr = ParakeetV2()
-        t1 = _normalize(asr._model.recognize(samples, sample_rate=sr) or "")
-        t2 = _normalize(asr._model.recognize(samples, sample_rate=sr) or "")
-
+        samples, sr = tts().synthesize("the quick brown fox jumps over the lazy dog")
+        t1 = _normalize(transcribe(samples, sr))
+        t2 = _normalize(transcribe(samples, sr))
         err, _, _ = _wer(t1, t2)
         self.assertEqual(err, 0, f"ASR not deterministic: '{t1}' vs '{t2}'")
 
-    @patch("voxpipe.tts.model.AudioPlayer")
-    def test_asr_not_empty(self, mock_audio_player):
+    def test_asr_not_empty(self):
         """ASR should produce non-empty output for speech audio."""
-        from voxpipe.asr.models.parakeetv2 import ParakeetV2
-        from voxpipe.tts.model import TTSProviders
-
-        tts_cls = getattr(TTSProviders, config.get("tts.provider"))
-        tts_cls.download()
-        tts = tts_cls()
-
         for text in SIMPLE:
-            samples, sr = tts._synthesize(text, voice="af_heart", language="en-us", speed=1.0, interrupt=False)
-            asr = ParakeetV2()
-            result = asr._model.recognize(samples, sample_rate=sr)
-            self.assertIsNotNone(result, f"ASR returned None for '{text}'")
-            self.assertGreater(len(result.strip()), 0, f"ASR empty for '{text}'")
+            samples, sr = tts().synthesize(text)
+            self.assertGreater(len(transcribe(samples, sr).strip()), 0, f"ASR empty for '{text}'")
 
 
 class TestTTSAudioQuality(unittest.TestCase):
     """Basic audio quality heuristics."""
 
-    @patch("voxpipe.tts.model.AudioPlayer")
-    def test_duration_proportional_to_length(self, mock_audio_player):
+    def test_duration_proportional_to_length(self):
         """Longer text → proportionally longer audio."""
-        tts_cls = getattr(TTSProviders, config.get("tts.provider"))
-        tts_cls.download()
-        tts = tts_cls()
-
         short = "hello"
         long_ = "the quick brown fox jumps over the lazy dog near the riverbank"
 
-        s_short, sr = tts._synthesize(short, voice="af_heart", language="en-us", speed=1.0, interrupt=False)
-        s_long, _ = tts._synthesize(long_, voice="af_heart", language="en-us", speed=1.0, interrupt=False)
+        s_short, sr = tts().synthesize(short)
+        s_long, _ = tts().synthesize(long_)
 
         d_short = len(s_short) / sr
         d_long = len(s_long) / sr
 
         self.assertGreater(d_short, 0.1, f"Short audio too brief: {d_short:.2f}s")
-        self.assertGreater(d_long, d_short,
-                           f"Long ({d_long:.2f}s) should be longer than short ({d_short:.2f}s)")
-        print(f"  '{short}': {d_short:.2f}s, '{long_[:20]}...': {d_long:.2f}s")
+        self.assertGreater(d_long, d_short, f"Long ({d_long:.2f}s) should be longer than short ({d_short:.2f}s)")
 
 
 if __name__ == "__main__":

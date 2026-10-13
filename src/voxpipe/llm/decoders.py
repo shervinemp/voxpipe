@@ -1,269 +1,242 @@
-from abc import ABC, abstractmethod
+"""Stream decoders: turn a model's raw text stream into text chunks and tool calls."""
+
 import json
 import re
-from typing import Generator, Iterator
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Mapping, Optional, Tuple, Type, Union
 
+from ..core.exceptions import ProviderError
 from ..core.utils import get_logger
-from .tools import ToolCall
+from .tools import MalformedToolCall, ToolCall
 
 _log = get_logger(__name__)
+
+StreamItem = Union[str, ToolCall, MalformedToolCall]
+
+_GEMMA_STRING_DELIMITER = '<|"|>'
+_GEMMA_CALL_RE = re.compile(r"call:([A-Za-z0-9_]+)(.*)", re.DOTALL)
+_BARE_KEY_RE = re.compile(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)")
+_JSON_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
 class StreamDecoder(ABC):
     """Strategy interface for interpreting and intercepting LLM streams."""
+
     @abstractmethod
-    def __call__(self, stream: Iterator[str | dict | ToolCall]) -> Generator[str | dict | ToolCall, None, None]: ...
+    def __call__(self, stream: Iterable[StreamItem]) -> Iterator[StreamItem]: ...
 
 
 class NativeDecoder(StreamDecoder):
-    """Yields stream exactly as it arrives (used for OpenAI, Gemini, and native tools)."""
-    def __call__(self, stream: Iterator[str | dict | ToolCall]) -> Generator[str | dict | ToolCall, None, None]:
+    """Passes the stream through untouched, for providers that emit structured tool calls."""
+
+    def __call__(self, stream: Iterable[StreamItem]) -> Iterator[StreamItem]:
         yield from stream
 
 
-class LegacyXMLDecoder(StreamDecoder):
-    """Legacy parser for standard <toolcall>...</toolcall> used by Qwen/Nemotron."""
-    def __call__(self, stream: Iterator[str | dict | ToolCall]) -> Generator[str | dict | ToolCall, None, None]:
-        buffer, in_tool = "", False
-        for chunk in stream:
-            if isinstance(chunk, (dict, ToolCall)):
-                yield chunk
-                return
-            buffer += chunk
+@dataclass(frozen=True)
+class TagFormat:
+    """A delimited span in model output and how to interpret what lies inside it.
 
-            while buffer:
-                if in_tool:
-                    if "</toolcall>" in buffer:
-                        try:
-                            tool_body = buffer.split("</toolcall>")[0]
-                            tool_dict = json.loads(tool_body.strip())
-                            yield ToolCall(
-                                name=tool_dict.get("name") or tool_dict.get("function"),
-                                arguments=tool_dict.get("arguments", {})
-                            )
-                        except Exception:
-                            _log.warning(
-                                "Failed to parse toolcall: %s", tool_body[:200]
-                            )
-                            yield ToolCall(name="_parse_error", arguments={"raw": tool_body})
-                        return  # Halt stream to execute tool
-                    else:
-                        if len(buffer) > 10_000:
-                            _log.warning(
-                                "Toolcall buffer exceeded 10K chars, discarding"
-                            )
-                            yield buffer
-                            buffer = ""
-                        break  # Wait for more chunks
-                else:
-                    if "<toolcall>" in buffer:
-                        pre = buffer.split("<toolcall>")[0]
-                        if pre:
-                            yield pre
-                        in_tool = True
-                        buffer = buffer.split("<toolcall>", 1)[1]
-                        continue  # Re-evaluate buffer
-                    else:
-                        match = re.search(r'<t(?:o(?:o(?:l(?:c(?:a(?:l(?:l)?)?)?)?)?)?)?$', buffer)
-                        if match:
-                            safe_idx = match.start()
-                            if safe_idx > 0:
-                                yield buffer[:safe_idx]
-                                buffer = buffer[safe_idx:]
-                            break  # Wait for more chunks to complete the tag
-                        else:
-                            yield buffer
-                            buffer = ""
-                            break
+    ``parse`` is "json" for ``{"name": ..., "arguments": {...}}`` bodies,
+    "call:" for Gemma's ``call:name{key:<|"|>value<|"|>}`` syntax, or
+    "thought" for reasoning that is dropped from the output.
+    """
 
-        if buffer and not in_tool:
-            yield buffer
-
-
-class GemmaE2BDecoder(StreamDecoder):
-    """Clean, chunk-based sliding window parser for Gemma 4's unique custom syntax."""
-    def __call__(self, stream: Iterator[str | dict | ToolCall]) -> Generator[str | dict | ToolCall, None, None]:
-        buffer = ""
-        in_tool, in_thought = False, False
-
-        for chunk in stream:
-            if isinstance(chunk, (dict, ToolCall)):
-                yield chunk
-                return
-
-            buffer += chunk
-
-            while buffer:
-                # 1. Handle Tool Execution
-                if in_tool:
-                    if "<tool_call|>" in buffer:
-                        body = buffer.split("<tool_call|>")[0].replace("<|tool_call>", "").strip()
-                        if body.startswith("call:"):
-                            match = re.match(r"call:([a-zA-Z0-9_]+)(.*)", body, re.DOTALL)
-                            if match:
-                                name, args = match.group(1).strip(), match.group(2).strip()
-                                args = args.replace('<|"|>', '"')
-                                args = re.sub(r'([{,]\s*)([a-zA-Z0-9_]+)(\s*:)', r'\1"\2"\3', args)
-                                try:
-                                    yield ToolCall(name=name, arguments=json.loads(args))
-                                except json.JSONDecodeError:
-                                    _log.warning(
-                                        "Failed to parse gemma toolcall args: %s", args[:200]
-                                    )
-                                    yield ToolCall(name="_parse_error", arguments={"raw": args})
-                        return  # CRITICAL: Halt stream to allow RAG pipeline to trigger
-                    break  # Wait for more chunks
-
-                # 2. Filter Thoughts
-                if in_thought:
-                    if "<channel|>" in buffer:
-                        in_thought = False
-                        buffer = buffer.split("<channel|>", 1)[1]
-                        continue  # Re-evaluate buffer
-                    break  # Wait for more chunks
-
-                # 3. Detect Openers
-                if "<|tool_call>" in buffer:
-                    in_tool = True
-                    pre = buffer.split("<|tool_call>")[0]
-                    if pre:
-                        yield pre
-                    buffer = buffer.split("<|tool_call>", 1)[1]
-                    continue  # Re-evaluate buffer
-
-                if "<|channel>thought" in buffer:
-                    in_thought = True
-                    pre = buffer.split("<|channel>thought")[0]
-                    if pre:
-                        yield pre
-                    buffer = buffer.split("<|channel>thought", 1)[1]
-                    continue  # Re-evaluate buffer
-
-                # 4. Safe Yield (Wait for partial tags to resolve)
-                safe_idx = max(buffer.rfind("<"), buffer.rfind("&"))
-                if safe_idx != -1 and (len(buffer) - safe_idx) < 15:
-                    if safe_idx > 0:
-                        yield buffer[:safe_idx]
-                        buffer = buffer[safe_idx:]
-                    break  # Wait for more chunks
-                else:
-                    if buffer:
-                        yield buffer
-                    buffer = ""
-                    break  # Finished processing this chunk
-
-        if buffer and not in_tool and not in_thought:
-            yield buffer
+    open: str
+    close: str
+    parse: Literal["json", "call:", "thought"]
 
 
 class GeneralDecoder(StreamDecoder):
-    """Matches tag formats by opener priority — auto-sorted by length (longest first).
+    """Scans streamed text for tagged tool calls and thoughts in any of several formats.
 
-    Handles Gemma ``<|tool_call|>``, standard ``<toolcall>``, HTML-escaped
-    ``&lt;toolcall&gt;``, and thought ``<|channel>thought`` in one decoder.
-    Longer openers are checked first so ``<|tool_call|>`` beats ``<toolcall>``.
+    Text outside tags is yielded as it arrives, holding back only a trailing
+    fragment that could be the start of an opening tag.  Thoughts are dropped.
+    The first complete tool call is yielded and ends the stream, so the caller
+    can run it; a call that is unparseable, oversized or never closed is
+    reported as a MalformedToolCall.
     """
 
-    def __init__(self, formats: list[dict] | None = None):
-        raw = formats or [
-            {"open": "<|tool_call>", "close": "<tool_call|>", "parse": "call:"},
-            {"open": "<toolcall>", "close": "</toolcall>", "parse": "json"},
-            {"open": "&lt;toolcall&gt;", "close": "&lt;/toolcall&gt;", "parse": "json"},
-            {"open": "<|channel>thought", "close": "<channel|>", "parse": "thought"},
-        ]
-        self.formats = sorted(raw, key=lambda f: -len(f["open"]))
+    DEFAULT_FORMATS: Tuple[TagFormat, ...] = (
+        TagFormat("<|tool_call>", "<tool_call|>", "call:"),
+        TagFormat("<tool_call>", "</tool_call>", "json"),
+        TagFormat("<toolcall>", "</toolcall>", "json"),
+        TagFormat("&lt;toolcall&gt;", "&lt;/toolcall&gt;", "json"),
+        TagFormat("<|channel>thought", "<channel|>", "thought"),
+        TagFormat("<think>", "</think>", "thought"),
+    )
+    MAX_CALL_CHARS = 10_000
 
-    def __call__(self, stream: Iterator[str | dict | ToolCall]) -> Generator[str | dict | ToolCall, None, None]:
+    def __init__(self, formats: Optional[Iterable[Union[TagFormat, Mapping[str, Any]]]] = None):
+        chosen = self.DEFAULT_FORMATS if formats is None else formats
+        self.formats: List[TagFormat] = [f if isinstance(f, TagFormat) else TagFormat(**f) for f in chosen]
+
+    def __call__(self, stream: Iterable[StreamItem]) -> Iterator[StreamItem]:
         buffer = ""
-        active = None
-        body = ""
+        active: Optional[TagFormat] = None
 
         for chunk in stream:
-            if isinstance(chunk, (dict, ToolCall)):
+            if not isinstance(chunk, str):
+                # The provider already produced a structured call; nothing left to decode.
                 yield chunk
                 return
-
             buffer += chunk
 
-            while buffer:
-                # If we're inside a tag, look for the closing marker
-                if active is not None:
-                    if active["parse"] == "thought":
-                        idx = buffer.find(active["close"])
-                        if idx != -1:
-                            buffer = buffer[idx + len(active["close"]):]
-                            active = None
-                            continue
+            while True:
+                if active is None:
+                    active, start = self._find_opener(buffer)
+                    if active is None:
+                        held = self._partial_opener_length(buffer)
+                        if len(buffer) > held:
+                            yield buffer[: len(buffer) - held]
+                        buffer = buffer[len(buffer) - held :]
                         break
-
-                    idx = buffer.find(active["close"])
-                    if idx != -1:
-                        body += buffer[:idx]
-                        yield from self._emit(body.strip(), active["parse"])
-                        return
-                    # Body accumulates until close arrives
-                    body += buffer
-                    buffer = ""
-                    break
-
-                # Not in a tag — search for any opener (priority order)
-                matched = None
-                for fmt in self.formats:
-                    idx = buffer.find(fmt["open"])
-                    if idx != -1:
-                        matched = fmt
-                        pre = buffer[:idx]
-                        if pre:
-                            yield pre
-                        buffer = buffer[idx + len(fmt["open"]):]
-                        if fmt["parse"] == "thought":
-                            active = fmt  # enter thought, drop body
-                            body = ""
-                        else:
-                            active = fmt
-                            body = ""
-                        break
-
-                if matched:
+                    if start:
+                        yield buffer[:start]
+                    buffer = buffer[start + len(active.open) :]
                     continue
 
-                # Safety: hold back text ending with partial tag characters
-                safe = max(buffer.rfind("<"), buffer.rfind("&"))
-                if safe != -1 and len(buffer) - safe < 15:
-                    if safe > 0:
-                        yield buffer[:safe]
-                        buffer = buffer[safe:]
-                    break
+                end = buffer.find(active.close)
+                if active.parse == "thought":
+                    if end == -1:
+                        # Keep only what could still complete the closing tag.
+                        buffer = buffer[-(len(active.close) - 1) :] if len(active.close) > 1 else ""
+                        break
+                    buffer = buffer[end + len(active.close) :]
+                    active = None
+                    continue
+                if end != -1:
+                    yield _parse_call(active, buffer[:end].strip())
+                    return
+                if len(buffer) > self.MAX_CALL_CHARS:
+                    _log.warning("Tool call exceeded %d characters; discarding.", self.MAX_CALL_CHARS)
+                    yield MalformedToolCall(raw=buffer)
+                    return
+                break
+
+        if active is None:
+            if buffer:
                 yield buffer
-                buffer = ""
+        elif active.parse != "thought":
+            _log.warning("Stream ended inside an unterminated tool call.")
+            yield MalformedToolCall(raw=buffer)
 
-        if buffer and active is None:
-            yield buffer
+    def _find_opener(self, buffer: str) -> Tuple[Optional[TagFormat], int]:
+        """Earliest opening tag in the buffer; the longer tag wins when two start together."""
+        best: Tuple[Optional[TagFormat], int] = (None, -1)
+        for fmt in self.formats:
+            index = buffer.find(fmt.open)
+            if index == -1:
+                continue
+            current, at = best
+            if current is None or index < at or (index == at and len(fmt.open) > len(current.open)):
+                best = (fmt, index)
+        return best
 
-    def _emit(self, body: str, fmt: str):
-        if fmt == "call:":
-            if body.startswith("call:"):
-                m = re.match(r"call:([a-zA-Z0-9_]+)(.*)", body, re.DOTALL)
-                if m:
-                    name = m.group(1).strip()
-                    args = m.group(2).strip()
-                    args = args.replace('<|"|>', '"')
-                    args = re.sub(r'([{,]\s*)([a-zA-Z0-9_]+)(\s*:)', r'\1"\2"\3', args)
-                    try:
-                        yield ToolCall(name=name, arguments=json.loads(args))
-                        return
-                    except json.JSONDecodeError:
-                        _log.warning("Failed to parse call-format args: %s", args[:200])
-                yield ToolCall(name="_parse_error", arguments={"raw": body})
-            return
-        if fmt == "json":
-            try:
-                d = json.loads(body)
-                yield ToolCall(
-                    name=d.get("name") or d.get("function"),
-                    arguments=d.get("arguments", {}),
-                )
-            except Exception as e:
-                _log.warning("Failed to parse tool call: %s — %s", body[:200], e)
-                yield ToolCall(name="_parse_error", arguments={"raw": body})
-            return
+    def _partial_opener_length(self, buffer: str) -> int:
+        """Length of the longest buffer suffix that is a proper prefix of some opening tag."""
+        longest = max((len(f.open) for f in self.formats), default=1) - 1
+        for size in range(min(longest, len(buffer)), 0, -1):
+            tail = buffer[-size:]
+            if any(f.open.startswith(tail) for f in self.formats):
+                return size
+        return 0
+
+
+class GemmaE2BDecoder(GeneralDecoder):
+    """Gemma 4's ``<|tool_call>call:name{...}<tool_call|>`` syntax and thought channel."""
+
+    DEFAULT_FORMATS = (
+        TagFormat("<|tool_call>", "<tool_call|>", "call:"),
+        TagFormat("<|channel>thought", "<channel|>", "thought"),
+    )
+
+
+class LegacyXMLDecoder(GeneralDecoder):
+    """JSON tool calls in ``<toolcall>`` / ``<tool_call>`` tags, as used by Qwen and Nemotron."""
+
+    DEFAULT_FORMATS = (
+        TagFormat("<toolcall>", "</toolcall>", "json"),
+        TagFormat("<tool_call>", "</tool_call>", "json"),
+        TagFormat("<think>", "</think>", "thought"),
+    )
+
+
+def _parse_call(fmt: TagFormat, body: str) -> Union[ToolCall, MalformedToolCall]:
+    try:
+        if fmt.parse == "call:":
+            match = _GEMMA_CALL_RE.match(body)
+            if not match:
+                raise ValueError("expected call:<name>{...}")
+            name, arguments = match.group(1), _parse_gemma_arguments(match.group(2).strip())
+        else:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("tool call must be a JSON object")
+            name = payload.get("name") or payload.get("function")
+            # Some models write "parameters" where the format says "arguments".
+            arguments = payload.get("arguments", payload.get("parameters"))
+            if arguments is None:
+                arguments = {}
+            elif isinstance(arguments, str):  # the OpenAI habit of sending the arguments as a JSON string
+                arguments = json.loads(arguments)
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool call has no name")
+        if not isinstance(arguments, dict):
+            raise ValueError("tool arguments must be an object")
+    except ValueError as e:  # json.JSONDecodeError is a ValueError
+        _log.warning("Failed to parse tool call (%s): %s", e, body[:200])
+        return MalformedToolCall(raw=body)
+    return ToolCall(name=name, arguments=arguments)
+
+
+def _parse_gemma_arguments(text: str) -> dict:
+    """Parse Gemma's argument object: bare keys, strings delimited by ``<|"|>``."""
+    if not text:
+        return {}
+    segments = text.split(_GEMMA_STRING_DELIMITER)
+    if len(segments) % 2 == 0:
+        raise ValueError("unbalanced string delimiter")
+    # Even segments are structure, whose bare keys need quoting; odd ones are string literals.
+    rebuilt = "".join(
+        _json_string(segment) if index % 2 else _quote_bare_keys(segment) for index, segment in enumerate(segments)
+    )
+    return json.loads(rebuilt)
+
+
+def _quote_bare_keys(structure: str) -> str:
+    """Quote unquoted object keys, leaving the insides of ordinary JSON strings alone."""
+    parts: List[str] = []
+    position = 0
+    for string in _JSON_STRING_RE.finditer(structure):
+        parts.append(_BARE_KEY_RE.sub(r'\1"\2"\3', structure[position : string.start()]))
+        parts.append(string.group(0))
+        position = string.end()
+    parts.append(_BARE_KEY_RE.sub(r'\1"\2"\3', structure[position:]))
+    return "".join(parts)
+
+
+def _json_string(literal: str) -> str:
+    """Encode a model-written string literal, honouring JSON escapes when it uses them consistently."""
+    try:
+        value = json.loads(f'"{literal}"')
+    except json.JSONDecodeError:
+        value = literal
+    return json.dumps(value)
+
+
+DECODERS: Dict[str, Type[StreamDecoder]] = {
+    "native": NativeDecoder,
+    "general": GeneralDecoder,
+    "gemma_e2b": GemmaE2BDecoder,
+    "legacy_xml": LegacyXMLDecoder,
+}
+
+
+def get_decoder(name: str) -> StreamDecoder:
+    """Instantiate the decoder registered under ``name``."""
+    try:
+        return DECODERS[name]()
+    except KeyError:
+        raise ProviderError(f"Unknown decoder {name!r}. Expected one of: {', '.join(sorted(DECODERS))}.") from None

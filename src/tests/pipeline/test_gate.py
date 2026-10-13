@@ -1,33 +1,29 @@
-"""Tests for transcript gate filtering."""
+"""Tests for the transcript gate."""
 import unittest
+
+from voxpipe.pipeline.gate import qualify_transcript
 
 
 class TestTranscriptGate(unittest.TestCase):
-    from voxpipe.pipeline.gate import qualify_transcript
-    _gate = staticmethod(qualify_transcript)
+    def test_noise_is_dropped(self):
+        for transcript in ("", "   ", "...", "?!", None):
+            with self.subTest(transcript=transcript):
+                self.assertIsNone(qualify_transcript(transcript))
 
-    def test_returns_none_for_empty(self):
-        self.assertEqual(self._gate(""), (None, None))
+    def test_speech_passes_tidied_up(self):
+        for transcript, expected in [
+            ("hello world", "hello world"),
+            ("  yes ", "yes"),
+            ("I think that is correct.", "I think that is correct."),
+        ]:
+            with self.subTest(transcript=transcript):
+                self.assertEqual(qualify_transcript(transcript), expected)
 
-    def test_returns_none_for_noise(self):
-        self.assertEqual(self._gate("..."), (None, None))
-        self.assertEqual(self._gate("   "), (None, None))
+    def test_numbers_are_speech_too(self):
+        for transcript in ("42", "2024.", "9 1 1", "10:30", "$5"):
+            with self.subTest(transcript=transcript):
+                self.assertEqual(qualify_transcript(transcript), transcript)
 
-    def test_returns_text_for_valid(self):
-        text, ann = self._gate("hello world")
-        self.assertEqual(text, "hello world")
-        self.assertIsNone(ann)
 
-    def test_single_word_passes(self):
-        text, ann = self._gate("yes")
-        self.assertEqual(text, "yes")
-
-    def test_complete_sentence_passes(self):
-        text, ann = self._gate("I think that")
-        self.assertEqual(text, "I think that")
-        self.assertIsNone(ann)
-
-    def test_no_annotation_for_complete_sentence(self):
-        text, ann = self._gate("I think that is correct.")
-        self.assertEqual(text, "I think that is correct.")
-        self.assertIsNone(ann)
+if __name__ == "__main__":
+    unittest.main()
