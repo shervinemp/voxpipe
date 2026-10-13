@@ -45,9 +45,7 @@ class MessageList(list):
         else:
             raise NotImplementedError
 
-    def __getitem__(
-        self, key: int | slice
-    ) -> Dict[str, str] | List[Dict[str, str]]:
+    def __getitem__(self, key: int | slice) -> Dict[str, str] | List[Dict[str, str]]:
         if isinstance(key, slice):
             return MessageList(super().__getitem__(key))
         else:
@@ -56,16 +54,11 @@ class MessageList(list):
     def __setitem__(self, key: int | slice, value: Any):
         if isinstance(key, slice):
             converted = [
-                v if isinstance(v, Message) else Message.from_dict(v)
-                for v in value
+                v if isinstance(v, Message) else Message.from_dict(v) for v in value
             ]
             super().__setitem__(key, converted)
         else:
-            v = (
-                value
-                if isinstance(value, Message)
-                else Message.from_dict(value)
-            )
+            v = value if isinstance(value, Message) else Message.from_dict(value)
             super().__setitem__(key, v)
 
     def __iter__(self) -> Iterable[Dict[str, str]]:
@@ -170,7 +163,11 @@ class Conversation:
                     for uid, (call, choice) in v.items():
                         s_pending[uid] = (
                             {"name": call.name, "arguments": call.arguments},
-                            {"result": choice.raw_result, "speech": choice.speech, "uid": choice.uid},
+                            {
+                                "result": choice.raw_result,
+                                "speech": choice.speech,
+                                "uid": choice.uid,
+                            },
                         )
                     s_meta["pending"] = s_pending
                 else:
@@ -201,8 +198,15 @@ class Conversation:
                 if k == "pending" and isinstance(v, dict):
                     r_pending = {}
                     for uid, (call_dict, choice_dict) in v.items():
-                        call_obj = ToolCall(name=call_dict["name"], arguments=call_dict.get("arguments", {}))
-                        choice_obj = ToolChoice(result=choice_dict["result"], speech=choice_dict.get("speech"), uid=choice_dict.get("uid"))
+                        call_obj = ToolCall(
+                            name=call_dict["name"],
+                            arguments=call_dict.get("arguments", {}),
+                        )
+                        choice_obj = ToolChoice(
+                            result=choice_dict["result"],
+                            speech=choice_dict.get("speech"),
+                            uid=choice_dict.get("uid"),
+                        )
                         r_pending[uid] = (call_obj, choice_obj)
                     r_meta["pending"] = r_pending
                 else:
@@ -248,38 +252,3 @@ class Conversation:
 
     def set_token_count(self, idx: int, count: int):
         self._token_counts[idx] = count
-
-    def trim_oldest(self, excess: int, max_turns: int = 20, llm: Optional[Any] = None) -> int:
-        """Advance cutoff forward by *excess* messages. O(1) -- never deletes.
-
-        A rare :meth:`compact` pass recreates the list when hidden messages
-        exceed ``max_turns * 4``, allowing the GC to free the old storage.
-        """
-        visible = len(self._messages) - self._cutoff_idx
-        excess = min(excess, visible)
-        if excess <= 0:
-            return 0
-        total_cut = 0
-        for i in range(self._cutoff_idx, self._cutoff_idx + excess):
-            if self._token_counts[i] == 0:
-                raw = self.get_message_content(i)
-                if llm and hasattr(llm, "count_tokens"):
-                    self._token_counts[i] = llm.count_tokens(raw) + 4
-                else:
-                    self._token_counts[i] = len(raw) // 4 + 4
-            total_cut += self._token_counts[i]
-
-        self._cutoff_idx += excess
-
-        if self._cutoff_idx > max_turns * 4:
-            self.compact()
-
-        return total_cut
-
-    def compact(self):
-        """Create new message list from visible portion. Old list to GC."""
-        if self._cutoff_idx <= 0:
-            return
-        self._messages = MessageList(self._messages[self._cutoff_idx:])
-        self._token_counts = self._token_counts[self._cutoff_idx:]
-        self._cutoff_idx = 0

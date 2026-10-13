@@ -6,7 +6,7 @@ import json
 import os
 from queue import Queue
 import threading
-from typing import Any, Dict, Generator, Optional, Tuple
+from typing import Dict, Generator, Optional, Tuple
 
 from ..core.utils import get_logger
 from ..core.exceptions import LLMError, ToolError
@@ -385,7 +385,7 @@ class ToolCaller:
             tool_call = ToolCall(name=tool.name, arguments=tool_args)
         tool_callable = partial(tool.__call__, **tool_args)
 
-        if asyncio.iscoroutinefunction(tool.callback) or inspect.iscoroutinefunction(
+        if inspect.iscoroutinefunction(tool.callback) or inspect.iscoroutinefunction(
             getattr(tool_callable, "func", None)
         ):
             future = asyncio.run_coroutine_threadsafe(tool_callable(), self._loop)

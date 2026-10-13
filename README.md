@@ -85,7 +85,7 @@ conversation_history:
 src/
 └── voxpipe/
     ├── core/            # Config (YAML + env vars), exceptions, utilities
-    ├── asr/             # Speech-to-text (ParakeetV2, Silero VAD)
+    ├── asr/             # Speech-to-text (ParakeetV2, CrisperWhisper, Silero VAD)
     ├── tts/             # Text-to-speech (Kokoro ONNX, audio player)
     ├── llm/             # Session, tools, decoders, model loading
     ├── pipeline/        # ASR → LLM → TTS orchestration
@@ -126,6 +126,26 @@ llm:
     provider: "openai"
     model: "gpt-4o"
 ```
+
+### ASR Providers
+
+**ParakeetV2** (default) — fast ONNX model, `uv sync --extra asr`.
+
+**CrisperWhisper** — verbatim ASR (fillers, stutters, vocal events) with
+word-level timings, via [`crisperwhisper`](https://huggingface.co/nyralabs/CrisperWhisper2.0_small).
+Install with `uv sync --extra crisperwhisper` (pure-PyTorch backend; the
+CTranslate2 backend is Linux-only).
+
+```yaml
+asr:
+  provider: "CrisperWhisper"
+  crisperwhisper:
+    model: "nyralabs/CrisperWhisper2.0_small"  # or _large/_medium/_turbo
+    mode: "verbatim"          # "verbatim" (default) or "intended"
+    language: "en"
+```
+
+The weights are released under a non-commercial research license.
 
 ## License
 

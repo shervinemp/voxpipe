@@ -38,6 +38,13 @@ class HotkeyConfig(BaseModel):
     press_to_reset: Optional[str] = None
 
 
+class CrisperWhisperConfig(BaseModel):
+    model: str = "nyralabs/CrisperWhisper2.0_small"
+    backend: str = "auto"
+    mode: str = "verbatim"
+    language: str = "en"
+
+
 class ASRConfig(BaseModel):
     provider: str
     weights_dir: str
@@ -45,6 +52,7 @@ class ASRConfig(BaseModel):
     trailing_silence_ms: int = Field(default=800, ge=100, le=10_000)
     leading_silence_ms: int = Field(default=1000, ge=0, le=10_000)
     max_segment_duration: float = Field(default=0.0, ge=0.0, le=300.0)
+    crisperwhisper: CrisperWhisperConfig = Field(default_factory=CrisperWhisperConfig)
 
 
 class AppConfig(BaseModel):

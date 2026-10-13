@@ -50,6 +50,11 @@ asr:
   trailing_silence_ms: 800
   leading_silence_ms: 1000
   max_segment_duration: 0
+  crisperwhisper:
+    model: "nyralabs/CrisperWhisper2.0_small"
+    backend: "auto"
+    mode: "verbatim"
+    language: "en"
 
 conversation_history:
   enabled: true
