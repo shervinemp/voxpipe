@@ -17,9 +17,9 @@ from voxpipe.llm.model import GGUFLLM
 from voxpipe.llm.session import Session
 from voxpipe.llm.tools import Tool, ToolCall
 
-from ._integration import requires_model
+from ._integration import LLAMA, requires_model
 
-pytestmark = requires_model("Gemma4E4B")
+pytestmark = requires_model("Gemma4E4B", LLAMA)
 
 
 class TestModelBehavior(unittest.TestCase):

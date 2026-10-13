@@ -4,9 +4,9 @@ import unittest
 
 import soundfile as sf
 
-from ._integration import requires_model, tts
+from ._integration import KOKORO, requires_model, tts
 
-pytestmark = requires_model("Kokoro")
+pytestmark = requires_model("Kokoro", KOKORO)
 
 
 class TestTTS(unittest.TestCase):

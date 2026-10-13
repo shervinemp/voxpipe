@@ -17,9 +17,9 @@ from voxpipe.llm.session import Session
 from voxpipe.llm.tools import Tool
 from voxpipe.pipeline.pipeline import Pipeline
 
-from .._integration import requires_model
+from .._integration import LLAMA, requires_model
 
-pytestmark = requires_model("Gemma4E4B")
+pytestmark = requires_model("Gemma4E4B", LLAMA)
 
 SYSTEM_PROMPT = (
     "You are a voice-controlled game assistant. "

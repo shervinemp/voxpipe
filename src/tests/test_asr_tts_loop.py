@@ -7,9 +7,9 @@ as secondary.  Low WER means both TTS clarity and ASR accuracy are good.
 import re
 import unittest
 
-from ._integration import requires_model, transcribe, tts
+from ._integration import KOKORO, PARAKEET, requires_model, transcribe, tts
 
-pytestmark = requires_model("Kokoro")
+pytestmark = requires_model("Kokoro", KOKORO + PARAKEET)
 
 
 # ---------------------------------------------------------------------------
