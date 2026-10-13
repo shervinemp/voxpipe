@@ -6,7 +6,7 @@ import sys
 from typing import List, Optional
 
 from .core.config import load_config, set_config
-from .core.exceptions import VoxpipeError
+from .core.exceptions import ToolError, VoxpipeError
 from .core.utils import get_logger, load_specs, setup_logging
 from .llm.tools import Tool
 
@@ -34,12 +34,12 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         "--push-to-talk",
         default=None,
         help="Listen only while this key combination is held, e.g. 'a', '<ctrl>+k', '<ctrl_r>+<shift_r>'. "
-        "Omit for always-on listening.",
+        "Overrides the configuration; without either, listening is always on.",
     )
     parser.add_argument(
         "--press-to-reset",
         default=None,
-        help="Key combination that clears the conversation, e.g. '<ctrl_l>+<ctrl_r>'.",
+        help="Key combination that clears the conversation, e.g. '<ctrl_l>+<ctrl_r>'. Overrides the configuration.",
     )
     return parser.parse_args(argv)
 
@@ -49,6 +49,8 @@ def _load_tools(specs_path: str) -> List[Tool]:
     spec = load_specs(specs_path)
     if isinstance(spec, dict):
         spec = spec.get("tools", [spec])
+    if not isinstance(spec, list):
+        raise ToolError(f"{specs_path} must hold a tool definition, a list of them, or an object with a 'tools' list.")
     return [Tool.from_dict(item) for item in spec]
 
 

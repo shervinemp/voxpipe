@@ -53,7 +53,9 @@ class TestHotkeyDispatcher(unittest.TestCase):
         self.assertEqual(len(self.d._hotkeys), 1)
 
     def test_invalid_hotkey_raises(self):
-        with self.assertRaises(ValueError):
+        from voxpipe.core.exceptions import VoxpipeError
+
+        with self.assertRaisesRegex(VoxpipeError, "Invalid hotkey 'totally\\+invalid!!!'"):
             self.d.register("totally+invalid!!!", self._trigger())
 
     def test_character_key(self):
@@ -149,6 +151,40 @@ class TestHotkeyDispatcher(unittest.TestCase):
         self._press(None)
         self._release(None)
         self.assertEqual(self.fired, [])
+
+
+class TestDispatcherState(TestHotkeyDispatcher):
+    def test_unregistering_a_held_combination_releases_its_hold_action(self):
+        log = []
+
+        @contextmanager
+        def hold():
+            log.append("enter")
+            try:
+                yield
+            finally:
+                log.append("exit")
+
+        self.d.register("<f8>", hold)
+        self._press(Key.f8)
+        self.d.unregister("<f8>")
+        self._settle()
+        self.assertEqual(log, ["enter", "exit"])
+        self.assertEqual(self.d._held, {})
+
+    def test_a_key_is_the_same_key_whatever_modifiers_were_held_when_it_went_down(self):
+        """Some platforms report a different key code with Shift; the release must still match the press."""
+        self.d.register("<ctrl>+k", self._trigger())
+        self._press(Key.shift, KeyCode(vk=0x4B, char="K"))
+        self._release(Key.shift, KeyCode(vk=0x6B, char="k"))
+        self.assertEqual(self.d._down, {}, "nothing is left 'held down'")
+        self._press(Key.ctrl_l)
+        self.assertEqual(self.fired, [], "Ctrl alone must not complete <ctrl>+k")
+
+    def test_is_registered(self):
+        self.d.register("<ctrl>+k", self._trigger())
+        self.assertTrue(self.d.is_registered("<ctrl>+k"))
+        self.assertFalse(self.d.is_registered("<f8>"))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from typing import Any, Callable, Deque, Iterator, List, Optional, Protocol
 
 import numpy as np
 
+from ..core.exceptions import ASRError
 from ..core.models import ASRConfig
 from ..core.utils import get_logger
 
@@ -29,7 +30,10 @@ class Silero:
 
     Audio is pushed in with :meth:`feed` from any thread (it never blocks) and
     segments are pulled out by iterating, on the one thread that runs the VAD
-    model.  A segment opens after ``MIN_SPEECH_CHUNKS`` consecutive speech
+    model.  The model is recurrent: each chunk is judged with the audio context
+    and internal state left by the chunks before it, which is what lets it hear
+    quiet speech and speech over noise.  A segment opens after
+    ``MIN_SPEECH_CHUNKS`` consecutive speech
     chunks, carries up to ``leading_silence_duration`` of audio from before
     that, and closes after ``trailing_silence_duration`` of silence, on
     :meth:`flush`, or once it exceeds ``max_segment_duration``.
@@ -54,9 +58,13 @@ class Silero:
 
             model = load_vad("silero")
         self._model = model
+        # onnx-asr only offers whole-file inference, which starts from a blank state on every call.
+        # Streaming needs the state carried from chunk to chunk, so the ONNX session is driven directly.
+        self._session: Any = getattr(model, "_model", None)
+        if self._session is None:
+            raise ASRError("This onnx-asr version does not expose Silero's ONNX session; voxpipe needs onnx-asr 0.6.")
 
         self.vad_threshold = vad_threshold
-        self.max_segment_duration = max_segment_duration
         self.on_speech_onset = on_speech_onset
         self.on_audio_level: Optional[Callable[[float, float], None]] = None
 
@@ -69,7 +77,9 @@ class Silero:
         self._gate_open = False
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._dropped = 0
-        self._context = np.zeros(self._model.CONTEXT_SIZE, dtype=np.float32)
+        self._context: np.ndarray = np.zeros(0, dtype=np.float32)
+        self._state: np.ndarray = np.zeros(0, dtype=np.float32)
+        self._forget()
 
     @classmethod
     def from_config(cls, config: ASRConfig, **kwargs) -> "Silero":
@@ -138,6 +148,7 @@ class Silero:
                     yield self._close_segment(speech)
                 leading.clear()
                 speech, in_speech, speech_run = [], False, 0
+                self._forget()  # what follows is not a continuation of what came before
                 continue
 
             try:
@@ -157,8 +168,7 @@ class Silero:
                     speech = list(leading)
                     leading.clear()
                     self.logger.debug("VAD speech onset (prob=%.3f)", probability)
-                    if self.on_speech_onset:
-                        self.on_speech_onset()
+                    self._announce_onset()
                 continue
 
             speech.append(chunk)
@@ -166,19 +176,37 @@ class Silero:
             too_long = self._max_segment_chunks and len(speech) >= self._max_segment_chunks
             if silence_run >= self._trailing_chunks or too_long:
                 self.logger.debug("VAD speech offset after %d chunks", len(speech))
-                yield self._close_segment(speech)
+                # A segment cut for length is the same utterance carrying on: an audio gate stays open.
+                yield self._close_segment(speech, utterance_over=silence_run >= self._trailing_chunks)
                 speech, in_speech, speech_run = [], False, 0
 
-    def _close_segment(self, speech: List[np.ndarray]) -> np.ndarray:
-        self._gate_open = False
+    def _close_segment(self, speech: List[np.ndarray], *, utterance_over: bool = True) -> np.ndarray:
+        if utterance_over:
+            self._gate_open = False
         return np.concatenate(speech, dtype=np.float32)
 
+    def _announce_onset(self) -> None:
+        if self.on_speech_onset is None:
+            return
+        try:
+            self.on_speech_onset()
+        except Exception:  # noqa: BLE001 - a listener must never end recognition
+            self.logger.error("Speech-onset callback failed.", exc_info=True)
+
+    def _forget(self) -> None:
+        """Start the model from a blank slate: no audio context, no recurrent state."""
+        self._context = np.zeros(self._model.CONTEXT_SIZE, dtype=np.float32)
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+
     def _speech_probability(self, chunk: np.ndarray) -> float:
-        """Run the model on one chunk, carrying over the context window it needs."""
-        frame: np.ndarray = np.concatenate([self._context, chunk])
-        self._context = frame[-self._model.CONTEXT_SIZE :]
-        probability, *_ = self._model._encode(frame[np.newaxis, :])
-        return float(probability[0])
+        """Run the model on one chunk, carrying over the audio context and recurrent state it needs."""
+        samples: np.ndarray = np.concatenate([self._context, chunk])
+        self._context = samples[-self._model.CONTEXT_SIZE :]
+        output, self._state = self._session.run(
+            ["output", "stateN"],
+            {"input": samples[np.newaxis, :], "state": self._state, "sr": [self.sample_rate]},
+        )
+        return float(output[0, 0])
 
     def _report_level(self, chunk: np.ndarray, probability: float) -> None:
         if self.on_audio_level is None:

@@ -1,6 +1,7 @@
 """Queued audio playback that can be cut off mid-clip."""
 
 import threading
+import time
 from queue import Empty, Full, Queue
 from typing import Optional
 
@@ -8,6 +9,8 @@ import numpy as np
 import sounddevice as sd
 
 from ..core.utils import get_logger
+
+_FULL_QUEUE_POLL_SECONDS = 0.05
 
 
 class AudioPlayer:
@@ -28,7 +31,6 @@ class AudioPlayer:
         self._queue: Queue = Queue(maxsize=max_queued)
         self._lock = threading.Lock()  # orders "start a clip" against "stop playback"
         self._generation = 0
-        self._playing = threading.Event()
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -40,25 +42,32 @@ class AudioPlayer:
     @property
     def is_playing(self) -> bool:
         """Whether a clip is audible or waiting its turn."""
-        return self._playing.is_set() or not self._queue.empty()
+        # Counts every clip from the moment it is queued until it has finished (or been dropped),
+        # so there is no instant between "taken off the queue" and "playing" that reads as silence.
+        return self._queue.unfinished_tasks > 0
 
     def enqueue(self, audio_data: np.ndarray, sample_rate: int, generation: Optional[int] = None) -> bool:
         """Queue a clip for ``generation`` (the current one by default).
 
-        Returns False when the clip was dropped: it belongs to a run of speech
-        that has since been stopped, or the queue is full.
+        Waits while the queue is full, so speech that is produced faster than
+        it can be played is slowed down rather than losing sentences.  Returns
+        False when the clip was dropped: its run of speech has since been
+        stopped, or the queue is full and the player is not running.
         """
-        with self._lock:
-            if generation is None:
-                generation = self._generation
-            elif generation != self._generation:
-                return False
-            try:
-                self._queue.put_nowait((audio_data, sample_rate, generation))
-            except Full:
-                self.logger.warning("Audio queue full, dropping a clip to stay responsive.")
-                return False
-        return True
+        while True:
+            with self._lock:
+                if generation is None:
+                    generation = self._generation
+                elif generation != self._generation:
+                    return False
+                try:
+                    self._queue.put_nowait((audio_data, sample_rate, generation))
+                    return True
+                except Full:
+                    if not self._running:
+                        self.logger.warning("Audio queue is full and the player is not running; dropping a clip.")
+                        return False
+            time.sleep(_FULL_QUEUE_POLL_SECONDS)
 
     def stop_playback(self) -> None:
         """Silence the current clip and discard everything queued behind it."""
@@ -73,6 +82,7 @@ class AudioPlayer:
                 self._queue.get_nowait()
             except Empty:
                 return
+            self._queue.task_done()
 
     def _run(self) -> None:
         while self._running:
@@ -80,24 +90,24 @@ class AudioPlayer:
                 audio_data, sample_rate, generation = self._queue.get(timeout=0.2)
             except Empty:
                 continue
-            with self._lock:
-                # Checked under the lock: a stop either precedes this (and the clip is
-                # skipped) or follows it (and cuts the clip off). It cannot slip between.
-                if generation != self._generation:
-                    continue
-                self._playing.set()
-                try:
-                    sd.play(audio_data, samplerate=sample_rate, device=self.output_device)
-                except Exception:  # noqa: BLE001 - PortAudio failures must not end the player thread
-                    self.logger.error("Audio playback failed.", exc_info=True)
-                    self._playing.clear()
-                    continue
             try:
-                sd.wait()
+                self._play(audio_data, sample_rate, generation)
+            except Exception:  # noqa: BLE001 - PortAudio failures must not end the player thread
+                self.logger.error("Audio playback failed.", exc_info=True)
             finally:
-                self._playing.clear()
+                self._queue.task_done()
+
+    def _play(self, audio_data: np.ndarray, sample_rate: int, generation: int) -> None:
+        with self._lock:
+            # Checked under the lock: a stop either precedes this (and the clip is
+            # skipped) or follows it (and cuts the clip off). It cannot slip between.
+            if generation != self._generation:
+                return
+            sd.play(audio_data, samplerate=sample_rate, device=self.output_device)
+        sd.wait()
 
     def start(self) -> None:
+        """Start the player thread; a no-op while it is running."""
         if self._running:
             return
         self._running = True
@@ -105,7 +115,7 @@ class AudioPlayer:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop playback and end the player thread."""
+        """Stop playback and end the player thread. :meth:`start` brings it back."""
         if not self._running:
             return
         self._running = False

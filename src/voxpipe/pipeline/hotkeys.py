@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from typing import Any, Callable, Dict, FrozenSet, Hashable, Optional, Set, Union
 
+from ..core.exceptions import VoxpipeError
 from ..core.utils import get_logger
 
 # Called when a combination is pressed.  Returning a context manager makes it a hold
@@ -15,7 +16,8 @@ class HotkeyDispatcher:
     """Listens for key combinations system-wide and runs the actions registered for them.
 
     Combinations use pynput's syntax, e.g. ``"<ctrl>+k"`` or ``"<ctrl_r>+<shift_r>"``.
-    A generic modifier (``<ctrl>``) matches either side; a sided one only its own.
+    A generic modifier (``<ctrl>``) matches either side; a sided one only its
+    own, where the platform tells the two apart.
     Actions run on a worker thread, in order, never on the OS keyboard hook: a
     slow action cannot stall the keyboard or get the hook removed.
     """
@@ -42,12 +44,24 @@ class HotkeyDispatcher:
         self._hotkeys[self._parse(hotkey_string)] = action
 
     def unregister(self, hotkey_string: str) -> None:
+        """Remove a combination; if it is being held, its hold action is released first."""
         combination = self._parse(hotkey_string)
         self._hotkeys.pop(combination, None)
-        self._engaged.discard(combination)
+        if combination in self._engaged:
+            self._engaged.discard(combination)
+            self._worker.submit(self._disengage, combination)
+
+    def is_registered(self, hotkey_string: str) -> bool:
+        return self._parse(hotkey_string) in self._hotkeys
 
     def _parse(self, hotkey_string: str) -> FrozenSet[Hashable]:
-        return frozenset(self._token(key) for key in self._keyboard.HotKey.parse(hotkey_string))
+        try:
+            keys = self._keyboard.HotKey.parse(hotkey_string)
+        except ValueError as e:
+            raise VoxpipeError(
+                f"Invalid hotkey {hotkey_string!r}: write it like '<ctrl>+k', '<f8>' or '<ctrl_r>+<shift_r>'."
+            ) from e
+        return frozenset(self._token(key) for key in keys)
 
     # --- key identity ----------------------------------------------------
 
@@ -74,9 +88,18 @@ class HotkeyDispatcher:
         return frozenset(tokens)
 
     def _physical(self, key: Any) -> Hashable:
-        """Identity of the physical key, stable between its press and its release."""
+        """Identity of the physical key, stable between its press and its release.
+
+        The character a key types, and on some platforms its key code too,
+        changes with the modifiers held, and a modifier may be released before
+        the key.  The canonical character does not change.
+        """
         if isinstance(key, self._keyboard.Key):
             return key
+        canonical = self._canonical(key)
+        character = getattr(canonical, "char", None)
+        if character:
+            return ("char", character.lower())
         return ("vk", key.vk) if key.vk is not None else ("char", (key.char or "").lower())
 
     # --- listener callbacks (OS hook thread: must return immediately) -----
@@ -123,8 +146,14 @@ class HotkeyDispatcher:
 
     # --- lifecycle -------------------------------------------------------
 
+    @property
+    def is_listening(self) -> bool:
+        return self.listener.is_alive()
+
     def start(self) -> None:
-        self.listener.start()
+        """Start listening for keys; a no-op while already listening."""
+        if not self.listener.is_alive():
+            self.listener.start()
 
     def stop(self) -> None:
         self.listener.stop()

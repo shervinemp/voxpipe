@@ -20,14 +20,21 @@ from ..llm._fakes import ScriptedLLM
 
 
 class FakeTTS:
+    """Records what it is asked to say; like the real one, it refuses text from a run of speech that was cut."""
+
     def __init__(self):
         self.spoken = []
+        self.refused = []
         self.interrupts = 0
         self.is_speaking = False
         self.started = self.stopped = False
 
-    def __call__(self, text, **options):
-        self.spoken.append(text)
+    @property
+    def generation(self):
+        return self.interrupts
+
+    def __call__(self, text, *, generation=None, **options):
+        (self.spoken if generation in (None, self.generation) else self.refused).append(text)
 
     def interrupt(self):
         self.interrupts += 1
@@ -79,6 +86,9 @@ class FakeHotkeys:
 
     def unregister(self, hotkey):
         self.actions.pop(hotkey, None)
+
+    def is_registered(self, hotkey):
+        return hotkey in self.actions
 
     def start(self):
         self.started = True
@@ -541,10 +551,15 @@ class TestFromConfig(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.dirname(history.db_path)))
 
     def test_hotkeys_can_be_disabled_or_overridden(self):
-        disabled = self.config.hotkeys.model_copy(update={"enable": False})
-        pipe = self.build(self.config.model_copy(update={"hotkeys": disabled}), push_to_talk="<f1>")
-        self.assertIsNone(pipe.push_to_talk)
+        disabled = self.config.model_copy(update={"hotkeys": self.config.hotkeys.model_copy(update={"enable": False})})
+        pipe = self.build(disabled)
+        self.assertIsNone(pipe.push_to_talk, "the configured hotkey is switched off")
         self.assertFalse(self.asr.is_muted)
+
+        self.asr = FakeASR()
+        explicit = self.build(disabled, push_to_talk="<f1>")
+        self.assertEqual(explicit.push_to_talk, "<f1>", "an argument wins even over 'enable: false'")
+        self.assertTrue(self.asr.is_muted)
 
         self.asr = FakeASR()
         overridden = self.build(push_to_talk="<f1>", press_to_reset="<f2>")
@@ -570,6 +585,282 @@ class TestFromConfig(unittest.TestCase):
         self.assertIs(pipe.session, session)
         self.assertIsNone(pipe.memory)
         self.assertIsNone(session.context_handler, "a supplied session keeps its own context handling")
+
+
+class TestTakingTheFloor(PipelineCase):
+    """Moments at which the user starts speaking, or the reply is stopped, around the start of a reply."""
+
+    def test_a_sentence_arriving_after_the_barge_in_is_not_spoken(self):
+        pipe = self.make(["First sentence. ", "Second sentence. ", "Third."])
+        # The user barges in while the first sentence is being announced: after the pipeline's own
+        # interruption check, before the sentence is handed to the synthesiser.
+        pipe.events.on("tts:start", lambda sentence: self.asr.vad.on_speech_onset())
+        pipe.handle_transcript("tell me a story")
+        self.assertEqual(self.tts.spoken, [], "a run of speech that was cut takes no more sentences")
+        self.assertEqual(self.tts.refused, ["First sentence."])
+
+    def test_an_interrupt_before_the_turn_exists_stops_it_before_the_model_is_asked(self):
+        ran = []
+        pipe = self.make([ToolCall("unlock", {})], ["The door is unlocked."])
+        pipe.register_tools(Tool.from_callable("unlock", lambda: ran.append("unlocked")))
+        pipe.events.on("pipeline:state", lambda state: state == "think" and pipe.interrupt())
+
+        pipe.handle_transcript("unlock the door")
+
+        self.assertEqual((self.llm.calls, ran, self.tts.spoken), ([], [], []))
+
+    def test_an_interrupt_during_the_first_pass_stops_before_any_tool_runs(self):
+        ran = []
+
+        def script(conversation):
+            pipe.interrupt()
+            yield ToolCall("unlock", {})
+
+        pipe = self.make(script, ["The door is unlocked."])
+        pipe.register_tools(Tool.from_callable("unlock", lambda: ran.append("unlocked")))
+        pipe.handle_transcript("unlock the door")
+        self.assertEqual((ran, self.tts.spoken), ([], []))
+        self.assertEqual(len(self.llm.calls), 1)
+
+    def test_an_utterance_the_user_has_already_talked_past_waits_for_what_follows(self):
+        pipe = self.make(["Lights and fan are on."])
+        heard_at = pipe._onsets
+        self.asr.vad.on_speech_onset()  # the user is speaking again before this one is answered
+
+        pipe._handle("turn on the lights", heard_at)
+        self.assertEqual((self.llm.calls, self.tts.spoken), ([], []), "answering now would talk over them")
+
+        pipe._handle("and the fan", pipe._onsets)
+        self.assertEqual(self.last_prompt(), "turn on the lights\nand the fan")
+        self.assertEqual(self.tts.spoken, ["Lights and fan are on."])
+
+    def test_a_held_utterance_is_answered_when_what_followed_was_only_noise(self):
+        pipe = self.make(["Lights are on."])
+        heard_at = pipe._onsets
+        self.asr.vad.on_speech_onset()
+        pipe._handle("turn on the lights", heard_at)
+
+        pipe._handle("...", pipe._onsets)  # the "speech" was a cough
+        self.assertEqual(self.last_prompt(), "turn on the lights")
+        self.assertEqual(self.tts.spoken, ["Lights are on."])
+
+    def test_reset_forgets_the_interruption_and_anything_waiting(self):
+        def script(conversation):
+            yield "Please keep it secret. "
+            self.asr.vad.on_speech_onset()
+            yield "Never tell."
+
+        pipe = self.make(script, ["Hi!"])
+        pipe.handle_transcript("tell me a secret")
+        heard_at = pipe._onsets
+        self.asr.vad.on_speech_onset()
+        pipe._handle("something half said", heard_at)
+
+        pipe.reset()
+        pipe.handle_transcript("hello there")
+        self.assertEqual(self.last_prompt(), "hello there", "nothing of the forgotten conversation is carried over")
+
+    def test_a_raising_onset_race_does_not_touch_a_replaced_list(self):
+        pipe = self.make(["ok"])
+        pipe._responding = True
+        pipe._response_parts = []
+        self.asr.vad.on_speech_onset()  # an empty list of parts is simply no hint
+        self.assertIsNone(pipe._interrupted_at)
+
+
+class TestCommandMatching(PipelineCase):
+    def test_patterns_are_normalised_like_utterances(self):
+        ran = []
+        pipe = self.make(["never asked"])
+        pipe.register_command("Stop listening.", lambda: ran.append("exact"))
+        pipe.register_command("Volume ", lambda: ran.append("prefix"), mode="prefix")
+        pipe.register_command(r"Set timer (\d+)", lambda: ran.append("regex"), mode="regex")
+
+        for utterance in ("stop listening", "volume up!", "set timer 5"):
+            pipe.handle_transcript(utterance)
+
+        self.assertEqual(ran, ["exact", "prefix", "regex"])
+        self.assertEqual(self.llm.calls, [])
+
+    def test_an_utterance_listener_needs_only_one_argument(self):
+        heard = []
+        pipe = self.make(["ok"])
+        pipe.events.on("asr:utterance", heard.append)
+        with self.assertNoLogs("voxpipe.pipeline.events", level="ERROR"):
+            pipe.handle_transcript("hello")
+        self.assertEqual(heard, ["hello"])
+
+
+class TestHotkeyAssignment(PipelineCase):
+    class StrictHotkeys(FakeHotkeys):
+        """Like the real dispatcher, refuses a combination it cannot parse."""
+
+        @staticmethod
+        def _check(hotkey):
+            from voxpipe.core.exceptions import VoxpipeError
+
+            if "<" not in hotkey and len(hotkey) > 1:
+                raise VoxpipeError(f"Invalid hotkey {hotkey!r}")
+
+        def register(self, hotkey, action):
+            self._check(hotkey)
+            super().register(hotkey, action)
+
+        def unregister(self, hotkey):
+            self._check(hotkey)
+            super().unregister(hotkey)
+
+        def is_registered(self, hotkey):
+            self._check(hotkey)
+            return super().is_registered(hotkey)
+
+    def test_a_combination_that_cannot_be_used_changes_nothing(self):
+        from voxpipe.core.exceptions import VoxpipeError
+
+        hotkeys = self.StrictHotkeys()
+        pipe = self.make([], hotkeys=hotkeys, push_to_talk="<f8>")
+        with self.assertRaises(VoxpipeError):
+            pipe.push_to_talk = "ctrl+k"  # a typo for "<ctrl>+k"
+
+        self.assertEqual(pipe.push_to_talk, "<f8>")
+        self.assertEqual(list(hotkeys.actions), ["<f8>"])
+        pipe.push_to_talk = None  # and the pipeline is not stuck with the bad value
+        self.assertFalse(self.asr.is_muted)
+
+    def test_a_bad_first_assignment_leaves_the_microphone_open(self):
+        from voxpipe.core.exceptions import VoxpipeError
+
+        pipe = self.make([], hotkeys=self.StrictHotkeys())
+        with self.assertRaises(VoxpipeError):
+            pipe.push_to_talk = "ctrl+k"
+        self.assertIsNone(pipe.push_to_talk)
+        self.assertFalse(self.asr.is_muted)
+
+    def test_two_actions_cannot_share_a_combination(self):
+        from voxpipe.core.exceptions import VoxpipeError
+
+        hotkeys = FakeHotkeys()
+        pipe = self.make([], hotkeys=hotkeys, push_to_talk="<f8>")
+        with self.assertRaisesRegex(VoxpipeError, "already in use"):
+            pipe.press_to_reset = "<f8>"
+        self.assertIsNone(pipe.press_to_reset)
+        with hotkeys.actions["<f8>"]():
+            self.assertFalse(self.asr.is_muted, "push-to-talk still owns the key")
+
+    def test_reassigning_the_same_combination_is_allowed(self):
+        hotkeys = FakeHotkeys()
+        pipe = self.make([], hotkeys=hotkeys, push_to_talk="<f8>")
+        pipe.push_to_talk = "<f8>"
+        self.assertEqual(list(hotkeys.actions), ["<f8>"])
+
+    def test_a_dispatcher_created_while_running_is_started(self):
+        created = []
+
+        class LateHotkeys(FakeHotkeys):
+            def __init__(self):
+                super().__init__()
+                created.append(self)
+
+        pipe = self.make(["ok"])
+        runner = threading.Thread(target=pipe.run, daemon=True)
+        runner.start()
+        self.assertTrue(wait_until(lambda: pipe._running))
+        with patch("voxpipe.pipeline.hotkeys.HotkeyDispatcher", new=LateHotkeys):
+            pipe.push_to_talk = "<f8>"
+        self.assertTrue(created and created[0].started, "or the key could never unmute the microphone")
+        pipe.stop()
+        runner.join(timeout=3)
+
+
+class TestStoppingAndFailing(PipelineCase):
+    def test_stop_leaves_waiting_utterances_unanswered(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow(conversation):
+            yield "Thinking about it. "
+            release.wait(timeout=3)
+            yield "Done."
+
+        pipe = self.make(slow, ["Should never be said."])
+        runner = threading.Thread(target=pipe.run, daemon=True)
+        runner.start()
+        self.asr.hear("first question")
+        self.assertTrue(wait_until(lambda: self.tts.spoken == ["Thinking about it."]))
+        self.asr.hear("second question")
+        self.asr.hear("third question")
+        self.assertTrue(wait_until(lambda: pipe._transcripts.qsize() >= 2))
+
+        pipe.stop()
+        release.set()
+        runner.join(timeout=3)
+
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(len(self.llm.calls), 1, "the backlog is not worked through on the way out")
+
+    def test_run_reports_a_recogniser_that_failed(self):
+        class BrokenASR(FakeASR):
+            def __iter__(self):
+                yield "hello"
+                raise RuntimeError("microphone unplugged")
+
+        pipe = self.make(["Hi."])
+        pipe.asr = self.asr = BrokenASR()
+        with self.assertLogs("voxpipe.pipeline.pipeline", level="ERROR"), self.assertRaisesRegex(
+            ASRError, "microphone unplugged"
+        ):
+            pipe.run()
+        self.assertEqual(self.tts.spoken, ["Hi."], "what was heard before the failure is still answered")
+
+    def test_text_can_be_submitted_while_running(self):
+        pipe = self.make(["Typed reply."])
+        runner = threading.Thread(target=pipe.run, daemon=True)
+        runner.start()
+        pipe.submit("typed question")
+        self.assertTrue(wait_until(lambda: self.tts.spoken == ["Typed reply."]))
+        self.assertEqual(self.last_prompt(), "typed question")
+        pipe.stop()
+        runner.join(timeout=3)
+
+    def test_a_failing_release_does_not_hide_why_start_up_failed(self):
+        asr, tts = FakeASR(), FakeTTS()
+        asr.stop = MagicMock(side_effect=RuntimeError("stream already gone"))
+        config = load_config()
+        with patch("voxpipe.asr.model.ASRProviders.create", return_value=asr), patch(
+            "voxpipe.tts.model.TTSProviders.create", return_value=tts
+        ), patch("voxpipe.pipeline.pipeline.LLMProviders.create", side_effect=ProviderError("model file missing")):
+            with self.assertLogs("voxpipe.pipeline.pipeline", level="WARNING"), self.assertRaisesRegex(
+                ProviderError, "model file missing"
+            ):
+                Pipeline.from_config(config)
+        self.assertTrue(tts.stopped, "the components after the failing one are still released")
+
+
+class TestCommandLine(unittest.TestCase):
+    def _specs(self, content):
+        import json
+
+        handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+        self.addCleanup(os.unlink, handle.name)
+        with handle:
+            json.dump(content, handle)
+        return handle.name
+
+    def test_tool_files_hold_one_tool_a_list_or_a_tools_object(self):
+        from voxpipe.__main__ import _load_tools
+
+        tool = {"name": "lights", "description": "Switch the lights."}
+        for content in (tool, [tool], {"tools": [tool]}):
+            with self.subTest(content=content):
+                self.assertEqual([t.name for t in _load_tools(self._specs(content))], ["lights"])
+
+    def test_a_malformed_tool_file_is_a_tool_error(self):
+        from voxpipe.__main__ import _load_tools
+        from voxpipe.core.exceptions import ToolError
+
+        for content in (42, {"tools": None}, "lights"):
+            with self.subTest(content=content), self.assertRaises(ToolError):
+                _load_tools(self._specs(content))
 
 
 if __name__ == "__main__":

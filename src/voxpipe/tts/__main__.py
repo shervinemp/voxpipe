@@ -1,5 +1,7 @@
 """Speak lines typed at the prompt with the configured TTS provider: ``python -m voxpipe.tts``."""
 
+import time
+
 from ..core.utils import get_logger, setup_logging
 from .model import TTSProviders
 
@@ -13,7 +15,14 @@ def main() -> None:
         try:
             while (line := input("> ")).strip().lower() != "exit":
                 tts(line)
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            pass
+        except KeyboardInterrupt:
+            return
+        try:
+            while tts.is_speaking:  # leaving the block stops playback at once
+                time.sleep(0.1)
+        except KeyboardInterrupt:
             pass
 
 

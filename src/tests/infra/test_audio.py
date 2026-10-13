@@ -108,12 +108,76 @@ class TestAudioPlayer(unittest.TestCase):
         self.assertTrue(self.player.enqueue("fresh", 24_000, self.player.generation))
         self.assertTrue(self.player.is_playing, "a queued clip counts as playing")
 
-    def test_full_queue_drops_instead_of_blocking(self):
+    def test_a_full_queue_makes_the_producer_wait_rather_than_lose_a_clip(self):
+        player = AudioPlayer(max_queued=1)
+        self.addCleanup(player.stop)
+        player.start()
+        player.enqueue("a", 1)
+        self.assertTrue(self.sd.wait_for_clip(1))
+        player.enqueue("b", 1)  # fills the queue while "a" plays
+
+        queued = []
+        producer = threading.Thread(target=lambda: queued.append(player.enqueue("c", 1)), daemon=True)
+        producer.start()
+        producer.join(timeout=0.2)
+        self.assertTrue(producer.is_alive(), "the third clip waits for room")
+
+        for count in (2, 3):
+            self.sd.finish_clip()
+            self.assertTrue(self.sd.wait_for_clip(count))
+        producer.join(timeout=2)
+        self.assertEqual(queued, [True])
+        self.assertEqual(self.sd.played, ["a", "b", "c"])
+
+    def test_an_interruption_releases_a_waiting_producer(self):
+        player = AudioPlayer(max_queued=1)
+        self.addCleanup(player.stop)
+        player.start()
+        player.enqueue("a", 1)
+        self.assertTrue(self.sd.wait_for_clip(1))
+        player.enqueue("b", 1)
+        stale = player.generation
+
+        queued = []
+        producer = threading.Thread(target=lambda: queued.append(player.enqueue("c", 1, stale)), daemon=True)
+        producer.start()
+        player.stop_playback()
+        producer.join(timeout=2)
+        self.assertEqual(queued, [False])
+
+    def test_a_full_queue_with_no_player_running_drops_the_clip(self):
         player = AudioPlayer(max_queued=2)
         self.assertTrue(player.enqueue("a", 1))
         self.assertTrue(player.enqueue("b", 1))
         with self.assertLogs("voxpipe.tts.audio", level="WARNING"):
-            self.assertFalse(player.enqueue("c", 1))
+            self.assertFalse(player.enqueue("c", 1), "waiting would never end")
+
+    def test_is_playing_holds_from_queueing_until_the_clip_has_finished(self):
+        seen = []
+        original_play = self.sd.play
+
+        def play(audio, **kwargs):
+            seen.append(self.player.is_playing)  # the clip has left the queue but is not audible yet
+            original_play(audio, **kwargs)
+
+        self.sd.play = play
+        self.player.start()
+        self.player.enqueue("a", 24_000)
+        self.assertTrue(self.sd.wait_for_clip(1))
+        self.assertEqual(seen, [True])
+        self.assertTrue(self.player.is_playing)
+        self.sd.finish_clip()
+        self.assertTrue(wait_until(lambda: not self.player.is_playing))
+
+    def test_a_failure_while_waiting_for_a_clip_does_not_end_the_player(self):
+        self.player.start()
+        with patch.object(self.sd, "wait", side_effect=RuntimeError("device vanished")):
+            with self.assertLogs("voxpipe.tts.audio", level="ERROR"):
+                self.player.enqueue("a", 24_000)
+                self.assertTrue(wait_until(lambda: not self.player.is_playing))
+        self.assertTrue(self.player._thread.is_alive())
+        self.player.enqueue("b", 24_000)
+        self.assertTrue(self.sd.wait_for_clip(2))
 
     def test_playback_error_does_not_end_the_player(self):
         self.player.start()
@@ -269,6 +333,53 @@ class TestKokoroTextCleaning(unittest.TestCase):
 
         cleaned = _SYMBOLS_AND_EMOJI.sub("", _MARKUP.sub("", "**Sure** _thing_ `now` \U0001F600"))
         self.assertEqual(cleaned.strip(), "Sure thing now")
+
+
+class TestTTSLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.player = FakePlayer()
+        self.tts = RecordingTTS(self.player)
+        self.addCleanup(self.tts.stop)
+
+    def _settle(self):
+        self.assertTrue(wait_until(lambda: not self.tts.is_speaking))
+
+    def test_speaking_starts_the_threads_on_first_use(self):
+        self.assertFalse(self.player.started)
+        self.tts("hello")
+        self._settle()
+        self.assertTrue(self.player.started, "text in, speech out must work without an explicit start()")
+        self.assertEqual(self.player.clips, [["hello"]])
+
+    def test_it_can_be_stopped_and_used_again(self):
+        self.tts("one")
+        self._settle()
+        self.tts.stop()
+        self.tts("two")
+        self._settle()
+        self.assertEqual(self.player.clips, [["one"], ["two"]])
+
+    def test_stop_forgets_sentences_that_were_never_synthesised(self):
+        self.tts.hold.clear()
+        for sentence in ("one", "two", "three"):
+            self.tts(sentence)
+        self.assertTrue(self.tts.synthesising.wait(timeout=2))
+        self.tts.stop()
+        self.assertFalse(self.tts.is_speaking, "cancelled sentences must not count as speech for ever")
+        self.tts.hold.set()
+        time.sleep(0.05)  # the sentence that was mid-synthesis finishes; it belongs to the old run
+        self.assertFalse(self.tts.is_speaking)
+        self.assertGreaterEqual(self.tts._pending, 0)
+
+    def test_text_tied_to_an_interrupted_run_of_speech_is_dropped(self):
+        run = self.tts.generation
+        self.tts("before", generation=run)
+        self._settle()
+        self.tts.interrupt()
+        self.tts("late", generation=run)
+        self.tts("fresh")
+        self._settle()
+        self.assertEqual(self.player.clips, [["before"], ["fresh"]])
 
 
 if __name__ == "__main__":

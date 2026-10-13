@@ -2,11 +2,10 @@
 
 import queue
 import re
-import sqlite3
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, Iterator, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
 
 from ..core.config import get_config
 from ..core.exceptions import ASRError, LLMError, StorageError, VoxpipeError
@@ -34,11 +33,31 @@ _RULES = (
     "Do not describe your actions or announce tool usage.",
     "Respond naturally, as if you already know the answer.",
 )
-# How a command's pattern is turned into a test on the (normalised) utterance.
+
+
+def _normalise(text: str) -> str:
+    """The form utterances and command patterns are compared in: lower case, no trailing punctuation."""
+    return text.strip().lower().rstrip(".!?,")
+
+
+def _exact(pattern: str) -> Callable[[str], Any]:
+    return _normalise(pattern).__eq__
+
+
+def _prefix(pattern: str) -> Callable[[str], Any]:
+    prefix = _normalise(pattern)
+    return lambda text: text.startswith(prefix)
+
+
+def _regex(pattern: str) -> Callable[[str], Any]:
+    return re.compile(pattern, re.IGNORECASE).match
+
+
+# How a command's pattern is turned into a test on the normalised utterance.
 _COMMAND_MATCHERS: Dict[str, Callable[[str], Callable[[str], Any]]] = {
-    "exact": lambda pattern: pattern.__eq__,
-    "prefix": lambda pattern: lambda text: text.startswith(pattern),
-    "regex": lambda pattern: re.compile(pattern).match,
+    "exact": _exact,
+    "prefix": _prefix,
+    "regex": _regex,
 }
 
 
@@ -54,7 +73,10 @@ class Pipeline:
     Events (``pipeline.events.on(name, handler)``): ``asr:transcript``,
     ``asr:utterance``, ``pipeline:state`` ("think" / "speak" / "idle"),
     ``tts:start``, ``tts:utterance``, ``tool:call``, ``tool:result``,
-    ``session:reset``, ``vad:level`` and ``pipeline:error``.
+    ``session:reset``, ``vad:level`` and ``pipeline:error``.  The ``tts:``
+    events mark a sentence being handed to the synthesiser and queued, and
+    ``pipeline:state`` follows generation: speech may still be playing after
+    "idle" (:attr:`status` tells).
     """
 
     def __init__(
@@ -82,9 +104,16 @@ class Pipeline:
         self._commands: Dict[str, Tuple[Callable[[str], Any], Callable[[], None]]] = {}
         self._transcripts: "queue.Queue[Any]" = queue.Queue()
         self._interrupt = threading.Event()
+        self._stopping = threading.Event()
+        self._running = False
+        self._listen_error: Optional[BaseException] = None
         self._responding = False
         self._response_parts: list[str] = []
         self._interrupted_at: Optional[str] = None
+        self._onsets = 0  # times the user has started speaking; only the ASR thread writes it
+        self._baseline = 0  # the onset count the reply in progress belongs to
+        self._speech_run = 0  # the TTS generation the reply in progress speaks in
+        self._held: List[Tuple[str, Optional[str]]] = []  # utterances (with context) waiting for an answer
         self._closed = False
 
         if asr is not None:
@@ -145,20 +174,20 @@ class Pipeline:
                 session,
                 asr=asr,
                 tts=tts,
-                push_to_talk=(push_to_talk or hotkeys.push_to_talk) if hotkeys.enable else None,
-                press_to_reset=(press_to_reset or hotkeys.press_to_reset) if hotkeys.enable else None,
+                # An argument always wins; ``hotkeys.enable: false`` only switches the configured ones off.
+                push_to_talk=push_to_talk or (hotkeys.push_to_talk if hotkeys.enable else None),
+                press_to_reset=press_to_reset or (hotkeys.press_to_reset if hotkeys.enable else None),
                 memory=memory,
             )
         except BaseException:
             # Don't leave a microphone stream or worker threads behind a pipeline that never came to be.
-            if asr is not None:
-                asr.stop()
-            if tts is not None:
-                tts.stop()
-            if own_session is not None:
-                own_session.close()
-            if memory is not None:
-                memory.close()
+            for component, release in ((asr, "stop"), (tts, "stop"), (own_session, "close"), (memory, "close")):
+                if component is None:
+                    continue
+                try:
+                    getattr(component, release)()
+                except Exception:  # noqa: BLE001 - keep releasing the rest; the original error is what matters
+                    logger.warning("Error while releasing %s after a failed start.", component, exc_info=True)
             raise
 
     @staticmethod
@@ -176,7 +205,7 @@ class Pipeline:
             return None
         try:
             return SQLiteStorage(history.db_path, max_entries=history.max_entries, ttl_days=history.ttl_days)
-        except (StorageError, OSError, sqlite3.Error) as e:
+        except (StorageError, OSError) as e:
             get_logger(__name__).warning("Conversation memory unavailable: %s", e)
             return None
 
@@ -202,8 +231,9 @@ class Pipeline:
     def register_command(self, pattern: str, handler: Callable[[], None], mode: str = "exact") -> None:
         """Run ``handler`` instead of the LLM when an utterance matches.
 
-        Utterances are compared lowercased and without trailing punctuation.
-        ``mode`` is "exact", "prefix", or "regex" (matched from the start).
+        Case and trailing punctuation are ignored, in the utterance and in the
+        pattern alike.  ``mode`` is "exact", "prefix", or "regex" (matched from
+        the start of the utterance).
         """
         try:
             matcher = _COMMAND_MATCHERS[mode](pattern)
@@ -215,7 +245,7 @@ class Pipeline:
         self._commands.pop(pattern, None)
 
     def _run_command(self, text: str) -> bool:
-        cleaned = text.strip().lower().rstrip(".!?,")
+        cleaned = _normalise(text)
         for matches, handler in list(self._commands.values()):
             if matches(cleaned):
                 handler()
@@ -234,7 +264,22 @@ class Pipeline:
                 self._hotkeys = HotkeyDispatcher()
             except ImportError as e:
                 raise VoxpipeError(f"Hotkeys are configured but keyboard access is unavailable: {e}") from e
+            if self._running:
+                self._hotkeys.start()  # run() could only start a dispatcher that existed when it began
         return self._hotkeys
+
+    def _rebind(self, old: Optional[str], new: Optional[str], action: Callable[[], Any]) -> None:
+        """Move ``action`` from the combination ``old`` to ``new``, changing nothing unless ``new`` is usable."""
+        if new:
+            self.hotkeys.is_registered(new)  # raises here, before anything changes, if it cannot be parsed
+        if old:
+            self.hotkeys.unregister(old)
+        if new:
+            if self.hotkeys.is_registered(new):  # still bound with ours gone: it belongs to something else
+                if old:
+                    self.hotkeys.register(old, action)
+                raise VoxpipeError(f"Hotkey {new!r} is already in use.")
+            self.hotkeys.register(new, action)
 
     @property
     def push_to_talk(self) -> Optional[str]:
@@ -243,16 +288,14 @@ class Pipeline:
     @push_to_talk.setter
     def push_to_talk(self, hotkey: Optional[str]) -> None:
         """Listen only while ``hotkey`` is held; None returns to always-on listening."""
-        if self._push_to_talk:
-            self.hotkeys.unregister(self._push_to_talk)
-        self._push_to_talk = hotkey or None
-        if self.asr is None:
-            return
-        if self._push_to_talk:
-            self.asr.mute()
-            self.hotkeys.register(self._push_to_talk, self._hold_to_talk)
-        else:
-            self.asr.unmute()
+        hotkey = hotkey or None
+        if self.asr is not None:
+            self._rebind(self._push_to_talk, hotkey, self._hold_to_talk)
+            if hotkey:
+                self.asr.mute()
+            else:
+                self.asr.unmute()
+        self._push_to_talk = hotkey
 
     @contextmanager
     def _hold_to_talk(self) -> Iterator[None]:
@@ -268,11 +311,9 @@ class Pipeline:
 
     @press_to_reset.setter
     def press_to_reset(self, hotkey: Optional[str]) -> None:
-        if self._press_to_reset:
-            self.hotkeys.unregister(self._press_to_reset)
-        self._press_to_reset = hotkey or None
-        if self._press_to_reset:
-            self.hotkeys.register(self._press_to_reset, self.reset)
+        hotkey = hotkey or None
+        self._rebind(self._press_to_reset, hotkey, self.reset)
+        self._press_to_reset = hotkey
 
     # --- control ---------------------------------------------------------
 
@@ -299,26 +340,44 @@ class Pipeline:
         """Forget the conversation so far, stopping any reply in progress. Safe from any thread."""
         self.events.emit("session:reset")
         self.interrupt()
+        # Nothing of the forgotten conversation may leak into the next one.
+        self._interrupted_at = None
+        self._response_parts = []
+        self._held.clear()
         self.session.reset()
 
     def stop(self) -> None:
-        """Ask :meth:`run` to return. Safe from any thread."""
+        """Ask :meth:`run` to return, leaving unanswered whatever was still waiting. Safe from any thread."""
+        self._stopping.set()
         self._transcripts.put(_STOP)
         self.interrupt()
 
+    def submit(self, text: str) -> None:
+        """Queue text to be handled as if it had been spoken, in turn with what the recogniser hears.
+
+        Safe from any thread while :meth:`run` is active.  Without ``run``,
+        call :meth:`handle_transcript` instead.
+        """
+        self._transcripts.put((text, None))
+
     def _on_speech_onset(self) -> None:
         """The user started talking (called on the ASR thread). If we are mid-reply, yield the floor."""
+        self._onsets += 1  # a reply that has not started yet learns from this that it must wait
         speaking = self._responding or (self.tts is not None and self.tts.is_speaking)
         if not speaking:
             return
-        if self._response_parts:
-            self._interrupted_at = self._response_parts[-1]
+        parts = self._response_parts  # read once: the conversation loop replaces this list
+        if parts:
+            self._interrupted_at = parts[-1]
         self.interrupt()
 
     # --- the conversation loop -------------------------------------------
 
     def run(self) -> None:
-        """Listen and respond until :meth:`stop` is called or the microphone gives out. Blocks."""
+        """Listen and respond until :meth:`stop` is called or the recogniser ends. Blocks.
+
+        Raises ASRError if speech recognition failed rather than being stopped.
+        """
         if self.asr is None:
             raise ASRError("Cannot run the pipeline without a speech recogniser.")
         try:
@@ -327,29 +386,37 @@ class Pipeline:
                 self.tts.start()
             if self._hotkeys is not None:
                 self._hotkeys.start()
+            self._running = True
             threading.Thread(target=self._listen, name="voxpipe-asr", daemon=True).start()
 
-            while True:
+            while not self._stopping.is_set():
                 try:
-                    transcript = self._transcripts.get(timeout=_POLL_SECONDS)
+                    item = self._transcripts.get(timeout=_POLL_SECONDS)
                 except queue.Empty:
                     continue
-                if transcript is _STOP:
-                    return
+                if item is _STOP:
+                    break
+                transcript, heard_at = item
                 try:
-                    self.handle_transcript(transcript)
+                    self._handle(transcript, heard_at)
                 except Exception as e:  # noqa: BLE001 - one bad turn must not end the conversation
                     self.events.emit("pipeline:error", e)
                     self.logger.error("Error handling %r: %s", transcript, e, exc_info=not isinstance(e, VoxpipeError))
+            if self._listen_error is not None:
+                raise ASRError(f"Speech recognition stopped: {self._listen_error}") from self._listen_error
         finally:
+            self._running = False
             self.close()
 
     def _listen(self) -> None:
         """ASR thread: recognise utterances and queue their transcripts for the conversation loop."""
         try:
             for transcript in self.asr:
-                self._transcripts.put(transcript)
+                # Stamped with the number of speech onsets so far: if the user has started speaking
+                # again by the time this is answered, the count will have moved on.
+                self._transcripts.put((transcript, self._onsets))
         except Exception as e:  # noqa: BLE001 - report and shut the pipeline down cleanly
+            self._listen_error = e
             self.events.emit("pipeline:error", e)
             self.logger.error("Speech recognition stopped: %s", e, exc_info=True)
         finally:
@@ -357,33 +424,60 @@ class Pipeline:
 
     def handle_transcript(self, transcription: str) -> None:
         """Process one recognised utterance: run a matching command, or have the LLM answer aloud."""
+        self._handle(transcription, heard_at=None)
+
+    def _handle(self, transcription: str, heard_at: Optional[int]) -> None:
+        """``heard_at`` is the onset count when the utterance was recognised; None for text handed in directly."""
         self.events.emit("asr:transcript", transcription)
-        text, annotation = qualify_transcript(transcription)
+        text = qualify_transcript(transcription)
         if text is None:
+            # Noise.  If it is what kept an earlier utterance waiting, that one can be answered now.
+            if self._held:
+                self._respond(None, None, baseline=self._onsets)
             return
-        self.events.emit("asr:utterance", text, annotation=annotation)
+        self.events.emit("asr:utterance", text)
 
         interrupted_at, self._interrupted_at = self._interrupted_at, None
         if self._run_command(text):
             return
+        context = f'(User interrupted after: "{interrupted_at}". Continue naturally.)' if interrupted_at else None
+        self._respond(text, context, baseline=self._onsets if heard_at is None else heard_at)
 
-        notes = [annotation] if annotation else []
-        if interrupted_at:
-            notes.append(f'(User interrupted after: "{interrupted_at}". Continue naturally.)')
-        self._respond(text, "\n".join(notes) or None)
+    def _respond(self, text: Optional[str], context: Optional[str], baseline: int) -> None:
+        """Answer ``text`` (and anything held back before it) aloud, unless the user is speaking again.
 
-    def _respond(self, text: str, context: Optional[str]) -> None:
-        self._response_parts = []
+        ``baseline`` is the onset count the reply belongs to: any onset beyond
+        it, before or during the reply, means the user has taken the floor.
+        """
+        if text is not None:
+            self._held.append((text, context))
         self._interrupt.clear()
-        self._responding = True
+        self._baseline = baseline
+        self._responding = True  # from here on a speech onset interrupts; before, it only moved the count
+        try:
+            if self._onsets != baseline:
+                # The user was already talking again before this reply could start.  Answering now would
+                # talk over them, so what they said waits and is answered together with what follows.
+                return
+            texts, contexts = zip(*self._held)
+            self._held.clear()
+            self._speak_reply("\n".join(texts), "\n".join(c for c in contexts if c) or None)
+        finally:
+            self._responding = False
+
+    def _speak_reply(self, text: str, context: Optional[str]) -> None:
+        self._response_parts = []
         self.events.emit("pipeline:state", "think")
         if self.tts is not None:
             self.tts.interrupt()  # a new reply never queues behind the tail of the previous one
+            # Everything this reply says belongs to the run of speech starting here: once the user
+            # barges in, the run is over and a sentence that arrives late is refused, not played.
+            self._speech_run = self.tts.generation
 
         sentences = stream_splitter(self._reply(text, context), min_len=8)
         try:
             for sentence in sentences:
-                if self._interrupt.is_set():
+                if self._cut_short():
                     break
                 self._say(sentence)
         except LLMError as e:
@@ -392,14 +486,21 @@ class Pipeline:
             self._say(_APOLOGY)
         finally:
             sentences.close()  # ends the turn in the session as well
-            self._responding = False
             self.events.emit("pipeline:state", "idle")
+
+    def _cut_short(self) -> bool:
+        """Whether the reply in progress has been interrupted, by a call or by the user speaking."""
+        return self._interrupt.is_set() or self._onsets != self._baseline
 
     def _reply(self, text: str, context: Optional[str]) -> Generator[str, None, None]:
         """The reply's text as it is generated; tool activity is re-emitted as pipeline events."""
+        if self._interrupt.is_set():
+            return  # interrupted or reset before the turn began: the model is not asked at all
         events = self.session.events(text, context=context)
         try:
             for event in events:
+                if self._cut_short():
+                    return  # checked on every event; the first arrives before any tool is started
                 if isinstance(event, TextDelta):
                     yield event.text
                 elif isinstance(event, ToolCallEvent):
@@ -417,7 +518,7 @@ class Pipeline:
         self.events.emit("pipeline:state", "speak")
         self.events.emit("tts:start", sentence)
         if self.tts is not None:
-            self.tts(sentence)
+            self.tts(sentence, generation=self._speech_run)
         else:
             self.logger.info("[TTS unavailable] %s", sentence)
         self.events.emit("tts:utterance", sentence)

@@ -33,7 +33,12 @@ class EventEmitter:
             if handler is None:
                 self._handlers.pop(event, None)
             else:
-                self._handlers[event] = [(h, a) for h, a in self._handlers.get(event, []) if h is not handler]
+                # Compared by equality: ``obj.method`` is a new object every time it is looked up.
+                remaining = [(h, a) for h, a in self._handlers.get(event, []) if h != handler]
+                if remaining:
+                    self._handlers[event] = remaining
+                else:
+                    self._handlers.pop(event, None)
 
     def emit(self, event: str, *args: Any, **kwargs: Any) -> None:
         with self._lock:

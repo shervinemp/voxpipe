@@ -207,5 +207,64 @@ class TestSilero(unittest.TestCase):
         self.assertEqual((vad.sample_rate, vad.hop_size), (16_000, HOP))
 
 
+class TestStreamingModel(unittest.TestCase):
+    """The model is recurrent: it must be fed its own state back, chunk after chunk."""
+
+    def make(self, **kwargs):
+        kwargs.setdefault("leading_silence_duration", 0.0)
+        kwargs.setdefault("trailing_silence_duration", 0.3)
+        return Silero(model=FakeVadModel(), **kwargs)
+
+    @staticmethod
+    def run_through(vad, *groups):
+        for group in groups:
+            for item in group:
+                vad.feed(item) if item is not None else vad.flush()
+        vad.close()
+        return list(vad)
+
+    def test_state_and_context_are_carried_from_chunk_to_chunk(self):
+        vad = self.make()
+        self.run_through(vad, loud(8), quiet(12))  # the fake fails any call that brings the wrong state
+        session = vad._model._model
+        self.assertEqual(len(session.frames), 20, "one model run per chunk")
+        self.assertEqual(session.fresh_starts, 1, "only the very first chunk starts from a blank state")
+
+    def test_a_flush_starts_the_model_afresh(self):
+        vad = self.make()
+        self.run_through(vad, loud(8), [None], loud(8))
+        session = vad._model._model
+        self.assertEqual(session.fresh_starts, 2)
+        self.assertFalse(session.frames[8][0, :64].any(), "no audio context is carried across the flush")
+
+    def test_a_model_without_a_session_is_refused(self):
+        from voxpipe.core.exceptions import ASRError
+
+        class NoSession:
+            SAMPLE_RATE, HOP_SIZE, CONTEXT_SIZE = 16_000, HOP, 64
+
+        with self.assertRaises(ASRError):
+            Silero(model=NoSession())
+
+    def test_a_failing_onset_listener_does_not_end_recognition(self):
+        def listener():
+            raise RuntimeError("output device unplugged")
+
+        vad = self.make(on_speech_onset=listener)
+        with self.assertLogs("voxpipe.asr.vad", level="ERROR"):
+            segments = self.run_through(vad, loud(8), quiet(12))
+        self.assertEqual(len(segments), 1)
+
+    def test_a_segment_cut_for_length_keeps_the_gate_open(self):
+        class OpensOnce:
+            def process(self, chunk):
+                return "active"
+
+        vad = self.make(max_segment_duration=0.64, audio_gate=OpensOnce())  # 20 chunks per segment
+        segments = self.run_through(vad, loud(1), loud(70), quiet(12))
+        self.assertEqual([len(s) // HOP for s in segments][:3], [20, 20, 20], "one utterance, cut three times")
+        self.assertGreater(len(segments), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

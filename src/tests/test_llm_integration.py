@@ -216,8 +216,8 @@ class TestMultiTurn(unittest.TestCase):
         """Many turns should not exceed max_turns."""
         for i in range(15):
             list(self.sess(f"Message {i}."))
-        # System prompt, the 10 messages the strategy keeps, and the reply to the last of them.
-        self.assertLessEqual(len(self.conv.messages), 12, "messages should be bounded")
+        # System prompt, then at most ten turns of question and answer.
+        self.assertLessEqual(len(self.conv.messages), 21, "messages should be bounded")
 
 
 if __name__ == "__main__":

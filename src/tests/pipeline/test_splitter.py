@@ -94,5 +94,39 @@ class TestStreamSplitter(unittest.TestCase):
         self.assertEqual(closed, [True])
 
 
+class TestBoundaries(unittest.TestCase):
+    @staticmethod
+    def split(text):
+        from voxpipe.streaming.splitter import stream_splitter
+
+        return list(stream_splitter([text]))
+
+    def test_an_initial_does_not_split_a_name(self):
+        self.assertEqual(
+            self.split("Samuel L. Jackson is an actor. He is famous."),
+            ["Samuel L. Jackson is an actor.", "He is famous."],
+        )
+
+    def test_a_number_or_a_domain_can_end_a_sentence(self):
+        self.assertEqual(self.split("That comes to 3.50. Shall I order it?"), ["That comes to 3.50.", "Shall I order it?"])
+        self.assertEqual(self.split("Try example.com. It is free."), ["Try example.com.", "It is free."])
+
+    def test_names_that_look_like_abbreviations_end_a_sentence(self):
+        self.assertEqual(self.split("My dog is called Max. He is five."), ["My dog is called Max.", "He is five."])
+        self.assertEqual(self.split("Her name is Jan. She is here."), ["Her name is Jan.", "She is here."])
+
+    def test_the_words_i_and_a_can_end_a_sentence(self):
+        self.assertEqual(self.split("So do I. Shall we go?"), ["So do I.", "Shall we go?"])
+
+    def test_list_items_separated_by_line_breaks_are_spoken_one_by_one(self):
+        self.assertEqual(
+            self.split("Here are three options:\n- Paris\n- Rome\n- Oslo"),
+            ["Here are three options:", "- Paris", "- Rome", "- Oslo"],
+        )
+
+    def test_a_numbered_list_keeps_each_number_with_its_item(self):
+        self.assertEqual(self.split("1. Paris\n2. Rome\n"), ["1. Paris", "2. Rome"])
+
+
 if __name__ == "__main__":
     unittest.main()

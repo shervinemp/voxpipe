@@ -18,8 +18,9 @@ SoundDevice = Union[int, str, None]
 class ModelBase(ABC):
     """A speech recogniser fed by a microphone.
 
-    Iterating yields one transcript per utterance the VAD detects, blocking
-    between utterances, until :meth:`stop`.  Recognition runs on the iterating
+    Iterating yields one transcript per utterance the VAD detects (an empty
+    one when recognition failed), blocking between utterances, until
+    :meth:`stop`.  Recognition runs on the iterating
     thread, so the consumer decides which thread pays for it.  Subclasses supply
     the model through :meth:`_transcribe`.
     """
@@ -41,7 +42,11 @@ class ModelBase(ABC):
         self._muted = threading.Event()
         self._stopped = threading.Event()
         self._last_chunk_time: Optional[float] = None
-        self._input_stream = self._open_stream(self._device)
+        self._stream_lock = threading.Lock()  # stop() and a reconnect both replace or close the stream
+        try:
+            self._input_stream = self._open_stream(self._device)
+        except (sd.PortAudioError, ValueError) as e:
+            raise ASRError(f"Could not open audio input '{self._device_name}': {e}") from e
         self._watchdog: Optional[threading.Thread] = None
 
     @property
@@ -79,7 +84,7 @@ class ModelBase(ABC):
         if status:
             self.logger.warning("Audio status: %s", status)
         self._last_chunk_time = time.monotonic()
-        if not self._muted.is_set():
+        if not self._muted.is_set() and not self._stopped.is_set():
             self._vad.feed(in_data.copy())
 
     def _watch_device(self) -> None:
@@ -111,7 +116,11 @@ class ModelBase(ABC):
                 except sd.PortAudioError as e:
                     self.logger.debug("Reconnect attempt %d failed: %s", attempt, e)
                 else:
-                    self._input_stream = stream
+                    with self._stream_lock:
+                        if self._stopped.is_set():  # stop() ran while this stream was being opened
+                            self._close(stream)
+                            return True
+                        self._input_stream = stream
                     self._last_chunk_time = time.monotonic()
                     self.logger.info("Audio device reconnected after %.1fs.", time.monotonic() - lost_at)
                     return True
@@ -134,6 +143,8 @@ class ModelBase(ABC):
 
     def start(self) -> None:
         self._input_stream.start()
+        # Counted from now: a stream that never delivers its first chunk is as lost as one that stops.
+        self._last_chunk_time = time.monotonic()
         if self._watchdog is None:
             self._watchdog = threading.Thread(target=self._watch_device, name="voxpipe-mic-watchdog", daemon=True)
             self._watchdog.start()
@@ -141,14 +152,18 @@ class ModelBase(ABC):
     def stop(self) -> None:
         """Stop capturing and end iteration."""
         self._stopped.set()
-        try:
-            self._input_stream.stop()
-            self._input_stream.close()
-        except sd.PortAudioError as e:
-            self.logger.debug("Closing the input stream failed: %s", e)
+        with self._stream_lock:
+            self._close(self._input_stream)
         self._vad.close()
         if self._watchdog is not None and self._watchdog is not threading.current_thread():
             self._watchdog.join(timeout=2 * self.RECONNECT_INTERVAL)
+
+    def _close(self, stream: sd.InputStream) -> None:
+        try:
+            stream.stop()
+            stream.close()
+        except sd.PortAudioError as e:
+            self.logger.debug("Closing the input stream failed: %s", e)
 
     def __enter__(self) -> "ModelBase":
         self.start()
@@ -165,7 +180,7 @@ class ModelBase(ABC):
                 text = self._transcribe(segment)
             except Exception:  # noqa: BLE001 - model backends raise assorted types; lose one utterance, not the mic
                 self.logger.error("Speech recognition failed for an utterance.", exc_info=True)
-                continue
+                text = ""  # the consumer still has to learn that the user stopped speaking
             self.logger.debug("ASR returned %r", text[:40] if text else text)
             yield text
 

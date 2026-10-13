@@ -141,7 +141,7 @@ class TestModelBase(unittest.TestCase):
         asr.stop()
         self.assertEqual(list(asr), ["12 chunks", "7 chunks"])
 
-    def test_failed_transcription_loses_one_utterance_only(self):
+    def test_failed_transcription_yields_an_empty_transcript_and_recognition_goes_on(self):
         asr = self.make()
         asr.broken = True
         stream = self.sd.streams[0]
@@ -154,7 +154,7 @@ class TestModelBase(unittest.TestCase):
         asr.mute()
         asr.stop()
         with self.assertLogs(level="ERROR"):
-            self.assertEqual(list(asr), ["6 chunks"])
+            self.assertEqual(list(asr), ["", "6 chunks"], "the consumer still learns that an utterance ended")
 
     def test_stop_unblocks_a_waiting_consumer(self):
         asr = self.make()
@@ -227,6 +227,60 @@ class TestProviders(unittest.TestCase):
         self.assertIs(TTSProviders.get("Kokoro"), Kokoro)
         with self.assertRaises(ProviderError):
             TTSProviders.get("Robot")
+
+
+class TestStreamLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.sd = FakeSoundDevice()
+        patcher = patch("voxpipe.asr.models.base.sd", self.sd)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make(self, **kwargs):
+        vad = Silero(model=FakeVadModel(), leading_silence_duration=0.0, trailing_silence_duration=0.3)
+        return Echo(vad, **kwargs)
+
+    def test_a_stream_that_cannot_be_opened_is_an_asr_error(self):
+        self.sd.fail_open = 1
+        with self.assertRaisesRegex(ASRError, "Could not open audio input"):
+            self.make()
+
+    def test_stop_during_a_reconnect_leaves_no_stream_running(self):
+        asr = self.make()
+        asr._stopped.set()  # stop() got in while the watchdog was opening the replacement
+        original = self.sd.streams[0]
+
+        real_open = asr._open_stream
+        asr._stopped.clear()
+
+        def open_then_stop(device):
+            stream = real_open(device)
+            asr._stopped.set()
+            return stream
+
+        asr._open_stream = open_then_stop
+        self.assertTrue(asr._reconnect())
+
+        replacement = self.sd.streams[-1]
+        self.assertIsNot(replacement, original)
+        self.assertTrue(replacement.stopped and replacement.closed, "the stream opened too late is closed, not kept")
+        self.assertIs(asr._input_stream, original)
+
+    def test_audio_delivered_after_stop_is_ignored(self):
+        asr = self.make()
+        stream = self.sd.streams[0]
+        asr.stop()
+        for chunk in loud(10):
+            stream.deliver(chunk)
+        self.assertEqual(list(asr), [])
+
+    def test_the_watchdog_counts_from_start_when_no_audio_ever_arrives(self):
+        asr = self.make()
+        self.assertIsNone(asr._last_chunk_time)
+        with patch.object(asr, "_watch_device"):
+            asr.start()
+        self.addCleanup(asr.stop)
+        self.assertIsNotNone(asr._last_chunk_time, "a stream that never delivers must still be noticed as lost")
 
 
 if __name__ == "__main__":
