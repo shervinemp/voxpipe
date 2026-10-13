@@ -2,8 +2,11 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
+from unittest.mock import patch
 
+from voxpipe.core.exceptions import StorageError
 from voxpipe.storage import SQLiteStorage
 
 
@@ -254,6 +257,20 @@ class TestSQLiteEviction(_SQLiteCase):
         self.assertNotIn("TTL old entry.", contents)
         self.assertEqual(len(contents), 5)
 
+    def test_expired_rows_are_not_recalled_even_before_they_are_deleted(self):
+        """Rows are only deleted on the next store(); a recall in between must not see them."""
+        mem = self._make(ttl_days=1)
+        mem.store("the cat is called Miso")
+        self.assertEqual(len(mem.retrieve("cat")), 1)
+        with patch("voxpipe.storage.sqlite.time.time", return_value=time.time() + 2 * 86400):
+            self.assertEqual(mem.retrieve("cat"), [])
+        self.assertEqual(self._contents(mem), ["the cat is called Miso"], "nothing was stored, so nothing was deleted")
+
+    def test_max_entries_must_be_positive(self):
+        for max_entries in (0, -1):
+            with self.subTest(max_entries=max_entries), self.assertRaises(ValueError):
+                SQLiteStorage(self._path(), max_entries=max_entries)
+
     def test_zero_ttl_keeps_entries(self):
         for ttl in (0, None):
             with self.subTest(ttl=ttl):
@@ -263,6 +280,32 @@ class TestSQLiteEviction(_SQLiteCase):
                     mem._conn.execute("UPDATE records SET created_at = 0")
                 mem.store("recent entry", role="user")
                 self.assertEqual(len(mem.retrieve("entry", top_k=5)), 2)
+
+
+class TestSQLiteErrors(_SQLiteCase):
+    def test_a_file_that_is_not_a_database_is_a_storage_error_and_is_not_left_locked(self):
+        path = self._path()
+        with open(path, "wb") as f:
+            f.write(b"definitely not a sqlite database " * 64)
+        with self.assertRaisesRegex(StorageError, "not a database"):
+            SQLiteStorage(path)
+        os.remove(path)  # fails on Windows if the connection was left open
+
+    def test_an_unopenable_path_is_a_storage_error(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, directory)
+        with self.assertRaises(StorageError):
+            SQLiteStorage(directory)
+
+    def test_use_after_close_is_a_storage_error(self):
+        mem = self._make()
+        mem.store("something to remember")
+        mem.close()
+        with self.assertRaisesRegex(StorageError, "closed"):
+            mem.store("too late")
+        with self.assertRaises(StorageError):
+            mem.retrieve("something")
+        mem.close()  # closing twice is harmless
 
 
 class TestSQLiteConcurrency(_SQLiteCase):

@@ -10,6 +10,14 @@ class TestMemoryStore(unittest.TestCase):
         mem = MemoryStore()
         self.assertIsInstance(mem.storage, RAMStorage)
 
+    def test_keeps_a_backend_that_happens_to_be_falsy(self):
+        class Sized(RAMStorage):
+            def __len__(self):
+                return len(self._entries)
+
+        backend = Sized()
+        self.assertIs(MemoryStore(backend).storage, backend, "an empty backend must not be swapped for a default")
+
     def test_ram_storage_backend(self):
         mem = MemoryStore(storage=RAMStorage())
         mem.store("User prefers dark mode UI.")

@@ -23,7 +23,8 @@ class MemoryStore:
         session_id: Optional[str] = None,
         include_global: bool = True,
     ):
-        self.storage: Storage = storage or RAMStorage()
+        # Not `storage or ...`: an empty backend that defines __len__ is falsy but perfectly usable.
+        self.storage: Storage = storage if storage is not None else RAMStorage()
         self.session_id = session_id
         self.include_global = include_global
 

@@ -113,6 +113,7 @@ class TestConfig(unittest.TestCase):
             "out of range": "asr:\n  vad_threshold: 3\n",
             "wrong type": "llm:\n  max_turns: many\n",
             "unknown backend": "llm:\n  backend: cloud\n",
+            "reply longer than the context": "llm:\n  local:\n    Mine:\n      n_ctx: 1024\n      max_tokens: 1024\n",
             "not a mapping": "- just\n- a list\n",
             "bad yaml": "llm: [unclosed\n",
         }

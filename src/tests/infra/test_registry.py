@@ -73,8 +73,18 @@ class TestVerification(unittest.TestCase):
     def test_corrupt_files_are_rejected(self):
         with patch.object(downloader, "load_manifest", return_value=self._manifest(sha256="0" * 64)):
             self.assertFalse(is_downloaded("Tiny", local_dir=self.tmp.name))
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ModelError, "delete it to download a fresh copy"):
                 ensure_downloaded("Tiny", local_dir=self.tmp.name)
+        self.assertTrue(os.path.exists(self.path), "a file that fails the check is never removed for the user")
+
+    def test_a_failed_download_is_a_model_error(self):
+        os.unlink(self.path)
+        for failure in (OSError("network unreachable"), ValueError("Download exceeds the configured size limit.")):
+            with self.subTest(failure=failure), patch.object(
+                downloader, "load_manifest", return_value=self._manifest()
+            ), patch.object(downloader, "download_file", side_effect=failure):
+                with self.assertRaisesRegex(ModelError, "Could not download 'Tiny'"):
+                    ensure_downloaded("Tiny", local_dir=self.tmp.name)
 
     def test_missing_files_are_fetched(self):
         os.unlink(self.path)

@@ -6,7 +6,7 @@ startup with the offending key named, instead of being silently ignored.
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _Section(BaseModel):
@@ -28,6 +28,12 @@ class LocalModelEntry(_Section):
     decoder: str = "general"
     type_k: Optional[str] = None
     type_v: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _reply_fits_the_context(self) -> "LocalModelEntry":
+        if self.max_tokens >= self.n_ctx:
+            raise ValueError("max_tokens must be smaller than n_ctx, or no room is left for the prompt")
+        return self
 
 
 class LiteLLMConfig(_Section):

@@ -5,7 +5,8 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 from ..core.exceptions import StorageError
 from ..core.utils import get_logger
@@ -42,6 +43,8 @@ class SQLiteStorage:
 
     def __init__(self, db_path: str, max_entries: int = 1000, ttl_days: Optional[float] = 30):
         """``ttl_days`` of None or 0 keeps entries until ``max_entries`` pushes them out."""
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1.")
         self.logger = get_logger(__name__)
         self.db_path = db_path
         self.max_entries = max_entries
@@ -49,14 +52,18 @@ class SQLiteStorage:
         self._lock = threading.Lock()
 
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        try:
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        except sqlite3.Error as e:
+            raise StorageError(f"Could not open {db_path}: {e}") from e
         try:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
             self._migrate_legacy_tables()
-        except sqlite3.OperationalError as e:
-            self._conn.close()
-            raise StorageError(f"Could not initialise {db_path} (FTS5 support is required): {e}") from e
+        except sqlite3.Error as e:
+            self._conn.close()  # or the file stays locked on Windows
+            hint = " (this SQLite build lacks FTS5, which voxpipe needs)" if "fts5" in str(e).lower() else ""
+            raise StorageError(f"Could not initialise {db_path}: {e}{hint}") from e
 
     def _migrate_legacy_tables(self) -> None:
         """Carry rows over from the pre-0.2 ``conversations`` table, then drop it."""
@@ -84,16 +91,17 @@ class SQLiteStorage:
         meta: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
     ) -> Record:
+        """Store ``content`` as text; a dict is saved as JSON and is recalled as that JSON string."""
         bank = store_bank(bank, session_id)
         text = json.dumps(content) if isinstance(content, dict) else str(content)
         now = time.time()
 
-        with self._lock, self._conn:
+        with self._lock, self._translating_errors("store to"), self._conn:
             self._conn.execute(
                 "INSERT INTO records (bank, role, content, meta, created_at) VALUES (?, ?, ?, ?, ?)",
                 (bank, role, text, json.dumps(meta or {}), now),
             )
-            self._evict()
+            self._evict(now)
 
         return Record(
             content=content,
@@ -129,10 +137,14 @@ class SQLiteStorage:
         if role:
             sql += " AND r.role = ?"
             params.append(role)
+        if self.ttl_seconds is not None:
+            # Expired rows are only deleted on the next store(); until then they must not be recalled.
+            sql += " AND r.created_at >= ?"
+            params.append(time.time() - self.ttl_seconds)
         sql += " ORDER BY rank, r.id DESC LIMIT ?"
         params.append(top_k * _OVERFETCH)
 
-        with self._lock:
+        with self._lock, self._translating_errors("search"):
             rows = self._conn.execute(sql, params).fetchall()
 
         records: Dict[str, Record] = {}
@@ -153,15 +165,23 @@ class SQLiteStorage:
                 break
         return list(records.values())
 
-    def _evict(self) -> None:
+    def _evict(self, now: float) -> None:
         """Drop expired rows, then the oldest rows beyond ``max_entries``. Caller holds the lock."""
         if self.ttl_seconds is not None:
-            self._conn.execute("DELETE FROM records WHERE created_at < ?", (time.time() - self.ttl_seconds,))
+            self._conn.execute("DELETE FROM records WHERE created_at < ?", (now - self.ttl_seconds,))
         surplus = self._conn.execute("SELECT COUNT(*) FROM records").fetchone()[0] - self.max_entries
         if surplus > 0:
             self._conn.execute(
                 "DELETE FROM records WHERE id IN (SELECT id FROM records ORDER BY id ASC LIMIT ?)", (surplus,)
             )
+
+    @contextmanager
+    def _translating_errors(self, action: str) -> Iterator[None]:
+        """Report SQLite failures (a closed or locked database, a full disk) as StorageError."""
+        try:
+            yield
+        except sqlite3.Error as e:
+            raise StorageError(f"Could not {action} {self.db_path}: {e}") from e
 
     def close(self) -> None:
         with self._lock:

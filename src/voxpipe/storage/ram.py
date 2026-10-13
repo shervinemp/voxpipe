@@ -17,6 +17,8 @@ class RAMStorage:
     """
 
     def __init__(self, max_entries: int = 1000):
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1.")
         self.max_entries = max_entries
         self._entries: Deque[Tuple[str, Record]] = deque(maxlen=max_entries)
         self._lock = threading.Lock()

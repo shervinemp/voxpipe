@@ -60,6 +60,11 @@ class TestRAMStorage(unittest.TestCase):
         self.assertEqual(ram.retrieve("alpha"), [])
         self.assertEqual(len(ram.retrieve("codeword", top_k=5)), 2)
 
+    def test_max_entries_must_be_positive(self):
+        for max_entries in (0, -1):
+            with self.subTest(max_entries=max_entries), self.assertRaises(ValueError):
+                RAMStorage(max_entries=max_entries)
+
     def test_query_top_k_overrides_argument(self):
         ram = RAMStorage()
         for i in range(5):

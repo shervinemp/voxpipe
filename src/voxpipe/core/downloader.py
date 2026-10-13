@@ -186,13 +186,26 @@ def _artifacts(name: str, local_dir: Optional[str]) -> List[_Artifact]:
 
 
 def ensure_downloaded(name: str, local_dir: Optional[str] = None) -> Dict[str, str]:
-    """Download a model's missing files and verify the rest. Returns {logical key: local path}."""
+    """Download a model's missing files and verify the rest. Returns {logical key: local path}.
+
+    Raises ModelError if a file already on disk fails its integrity check (it
+    is left in place, never replaced silently) or a download fails.
+    """
     paths = {}
     for artifact in _artifacts(name, local_dir):
         if os.path.exists(artifact.path):
-            verify_file_sha256(artifact.path, artifact.sha256)
+            try:
+                verify_file_sha256(artifact.path, artifact.sha256)
+            except ValueError as e:
+                raise ModelError(
+                    f"{artifact.path} is not the file the manifest expects for {name!r}; "
+                    "delete it to download a fresh copy."
+                ) from e
         else:
-            artifact.fetch()
+            try:
+                artifact.fetch()
+            except (ValueError, OSError) as e:
+                raise ModelError(f"Could not download {name!r}: {e}") from e
         paths[artifact.key] = artifact.path
     return paths
 
