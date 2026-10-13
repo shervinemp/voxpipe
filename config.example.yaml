@@ -1,23 +1,39 @@
 # voxpipe — minimal configuration example
-# Copy to config.yaml and edit.
+# Copy to config.yaml and edit. Unknown keys are rejected at startup.
 # Full defaults in src/voxpipe/data/config.defaults.yaml
 
 llm:
   backend: "local"       # "local" (GGUF) or "litellm" (remote APIs)
-  model: "Gemma4_12B"
-  max_tool_iterations: 1
+  model: "Gemma4_12B"    # key under `local`
+  max_tool_iterations: 1 # tool passes per turn before the model must answer; 0 disables tools
+  max_turns: 20          # messages kept in the model's context window
 
-  # Local GGUF models — each key matches manifest.yaml
+  # Local GGUF models — keys without a model_path are downloaded per manifest.yaml
   local:
     Gemma4_12B:
       decoder: "legacy_xml"
+    # MyModel:
+    #   model_path: "model_files/llm/my_model.gguf"
+    #   n_ctx: 8192
+    #   decoder: "general"
 
-  # LiteLLM remote backends
+  # LiteLLM remote backends (provider: openai, gemini or ollama)
   # litellm:
   #   provider: "ollama"
   #   model: "qwen3:latest"
   #   api_base: "http://localhost:11434"
+  #   env:
+  #     api_key: OPENAI_API_KEY   # read the key from this environment variable
+
+asr:
+  sound_device: null     # input device index or name fragment; null = system default
 
 hotkeys:
-  push_to_talk: null
-  press_to_reset: null
+  push_to_talk: null     # e.g. "<ctrl_r>+<shift_r>"; null = always-on listening
+  press_to_reset: null   # e.g. "<ctrl_l>+<ctrl_r>"
+
+conversation_history:
+  enabled: true
+  db_path: "data/conversations.db"
+  top_k: 2               # memories recalled per turn; 0 disables recall
+  ttl_days: 30           # 0 keeps entries forever
