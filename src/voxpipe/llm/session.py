@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Tuple, Union
 
 from ..core.exceptions import LLMError, ToolError
 from ..core.utils import get_logger
@@ -15,7 +15,7 @@ from .context import ContextHandler
 from .conversation import Conversation, Message
 from .model import LLM
 from .state import SessionState
-from .tools import PERMISSION_KEYS, MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult
+from .tools import PERMISSION_KEYS, MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult, ToolSet
 
 CONFIRM_TOOL = "_confirm"
 
@@ -81,21 +81,35 @@ class Session:
     reply.  Turns run one at a time; a second caller waits for the first to
     finish.  :meth:`cancel` and :meth:`reset` never wait: they stop the turn in
     flight at its next chunk.
+
+    What the model is told and may do is set here: :attr:`instructions` open
+    the system prompt, the tools' own instructions and the :attr:`rules` are
+    listed after them, and :attr:`tools` holds the tools.  All three survive
+    :meth:`reset`.
     """
 
     def __init__(
         self,
         llm: LLM,
         conversation: Optional[Conversation] = None,
+        *,
+        instructions: Optional[str] = None,
+        rules: Optional[Iterable[str]] = None,
+        tools: Optional[Iterable[Tool]] = None,
         max_tool_iterations: int = 1,
         context_handler: Optional[ContextHandler] = None,
-        session_id: str = "default",
         tool_timeout: float = 10.0,
     ):
+        """``instructions`` replace, and ``rules`` and ``tools`` add to, what ``conversation`` already carries."""
         self.logger = get_logger(__name__)
         self.llm = llm
-        self.session_id = session_id
         self.conversation = conversation if conversation is not None else Conversation()
+        if instructions is not None:
+            self.instructions = instructions
+        if rules is not None:
+            self.rules.extend(rules)
+        if tools is not None:
+            self.tools.add(*tools)
         self.max_tool_iterations = max_tool_iterations
         self.context_handler = context_handler
         self.tool_timeout = tool_timeout
@@ -108,6 +122,40 @@ class Session:
         self.tool_caller = ToolCaller()
         self.tool_caller.start()
 
+    # --- what the model is told and may do -------------------------------
+
+    @property
+    def instructions(self) -> str:
+        """The opening text of the system prompt."""
+        return self.conversation.system_message
+
+    @instructions.setter
+    def instructions(self, text: str) -> None:
+        self.conversation.set_system_message(text)
+
+    @property
+    def rules(self) -> List[str]:
+        """Standing rules, listed in the system prompt after the tools' own instructions."""
+        return self.conversation.rules
+
+    @rules.setter
+    def rules(self, rules: Iterable[str]) -> None:
+        self.conversation.rules = list(rules)
+
+    @property
+    def tools(self) -> ToolSet:
+        """The tools the model may call; add more with ``session.tools.add(tool)``."""
+        return self.conversation.tools
+
+    @tools.setter
+    def tools(self, tools: Mapping[str, Tool] | Iterable[Tool]) -> None:
+        self.conversation.tools = ToolSet(tools)
+
+    @property
+    def system_prompt(self) -> str:
+        """The system prompt as the model receives it: instructions, then tool instructions and rules."""
+        return self.conversation.system_prompt
+
     # --- lifecycle -------------------------------------------------------
 
     def cancel(self) -> None:
@@ -119,18 +167,15 @@ class Session:
     def reset(self, conversation: Optional[Conversation] = None) -> None:
         """Start over, cancelling any turn in flight and clearing session state.
 
-        Without an argument the system prompt and tools carry over to a fresh
-        conversation; pass a Conversation to replace them too.
+        Without an argument the instructions, rules and tools carry over to a
+        fresh conversation; pass a Conversation to replace them too.
         """
         self.cancel()
         previous = self.conversation
         if self.context_handler:
             self.context_handler.finalize(previous)
-        if conversation is None:
-            conversation = Conversation()
-            conversation.set_system_message(previous.system_message)
-            conversation.tools = previous.tools
-        self.conversation = conversation
+        # A new object rather than a cleared one: a cancelled turn may still be writing to the old.
+        self.conversation = conversation if conversation is not None else previous.blank_copy()
         self.state.clear()
 
     def close(self) -> None:
@@ -146,17 +191,17 @@ class Session:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def save(self, path: str, *, save_kv_cache: bool = False) -> None:
+    def save(self, path: str) -> None:
         """Save the conversation and session state into a directory."""
         os.makedirs(path, exist_ok=True)
         self.conversation.save(os.path.join(path, "conversation.json"))
-        self.state.save(path, save_binary=save_kv_cache)
+        self.state.save(path)
 
     @classmethod
     def load(cls, path: str, llm: LLM, **kwargs) -> "Session":
         """Restore a saved session around ``llm``; keyword arguments go to the constructor.
 
-        Tool callbacks are not persisted: register the tools again before the next turn.
+        Tools are not persisted: pass ``tools=`` again.
         """
         conv_path = os.path.join(path, "conversation.json")
         conversation = Conversation.load(conv_path) if os.path.exists(conv_path) else Conversation()
@@ -165,24 +210,6 @@ class Session:
         return session
 
     # --- running turns ---------------------------------------------------
-
-    def complete_once(self, query: str, *, system: str | None = None, **kwargs) -> str:
-        """Run an isolated completion that neither reads nor changes the conversation."""
-        if not isinstance(query, str) or not query.strip():
-            raise LLMError("One-shot queries must be non-empty strings.")
-
-        conversation = Conversation()
-        if system:
-            conversation.set_system_message(system)
-        conversation.add_user_message(query)
-
-        chunks = []
-        for chunk in self.llm(conversation, session_state=None, tool_choice="none", **kwargs):
-            if isinstance(chunk, str):
-                chunks.append(chunk)
-            else:
-                self.logger.warning("Ignored an unexpected tool call during one-shot inference.")
-        return "".join(chunks).strip()
 
     def __call__(
         self, query: str | None = None, *, context: str | None = None, **kwargs
@@ -430,8 +457,6 @@ class Session:
                 required=["uid", "choice"],
             ),
             callback=self._on_confirm,
-            instruction="When the user answers a pending ToolChoice prompt, "
-            "call _confirm with its uid and choice payload.",
         )
 
     async def _on_confirm(self, uid: str, choice: Union[dict, str]) -> ToolResult:

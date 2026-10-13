@@ -48,7 +48,9 @@ class LLMConfig(_Section):
     max_tool_iterations: int = Field(
         default=1, ge=0, description="0 = tools disabled, N = up to N tool passes plus a final answer pass"
     )
-    max_turns: int = Field(default=20, ge=1, description="Messages kept in the model's context window.")
+    max_turns: int = Field(
+        default=10, ge=1, description="Turns (a user message and its answer) kept in the model's context."
+    )
     tool_timeout: float = Field(default=10.0, gt=0, description="Seconds allowed for one pass of tool calls.")
     local: dict[str, LocalModelEntry] = Field(default_factory=dict)
     litellm: Optional[LiteLLMConfig] = None

@@ -13,6 +13,8 @@ from voxpipe.llm.model import GGUFLLM, LiteLLMProvider, LLMProviders
 from voxpipe.llm.state import SessionState
 from voxpipe.llm.tools import MalformedToolCall, Tool, ToolCall
 
+from ._fakes import ScriptedLLM
+
 
 def text_chunk(content):
     return {"choices": [{"delta": {"content": content}}]}
@@ -50,6 +52,31 @@ class FakeLlama:
 
     def reset(self):
         self.log.append("reset")
+
+
+class TestComplete(unittest.TestCase):
+    """LLM.complete: a one-off answer with no session behind it."""
+
+    def test_returns_the_reply_as_one_string(self):
+        llm = ScriptedLLM(["hello ", "world "])
+        self.assertEqual(llm.complete("test", system="sys", temperature=0.1), "hello world")
+        call = llm.calls[0]
+        self.assertEqual(call.messages, [{"role": "system", "content": "sys"}, {"role": "user", "content": "test"}])
+        self.assertEqual(call.tool_choice, "none")
+        self.assertIsNone(call.state)
+        self.assertEqual(call.kwargs, {"temperature": 0.1})
+
+    def test_rejects_empty_queries(self):
+        llm = ScriptedLLM(["unused"])
+        for query in ("", "   ", None):
+            with self.subTest(query=query), self.assertRaises(LLMError):
+                llm.complete(query)
+        self.assertEqual(llm.calls, [])
+
+    def test_ignores_tool_calls(self):
+        llm = ScriptedLLM(["answer", ToolCall("lookup", {})])
+        with self.assertLogs("voxpipe.llm.model", level="WARNING"):
+            self.assertEqual(llm.complete("question"), "answer")
 
 
 class TestGGUFLLM(unittest.TestCase):

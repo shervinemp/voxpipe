@@ -1,4 +1,4 @@
-"""Tests for the exception hierarchy and configuration loading."""
+"""Tests for the exception hierarchy, configuration loading and small helpers."""
 import os
 import subprocess
 import sys
@@ -20,6 +20,23 @@ from voxpipe.core.exceptions import (
     VoxpipeError,
 )
 from voxpipe.core.models import AppConfig
+from voxpipe.core.utils import safe_json_loads
+
+
+class TestSafeJsonLoads(unittest.TestCase):
+    def test_plain_json(self):
+        self.assertEqual(safe_json_loads('{"a": 1}', fallback={}), {"a": 1})
+        self.assertEqual(safe_json_loads("[1, 2]"), [1, 2])
+
+    def test_json_wrapped_in_prose_or_a_code_fence(self):
+        reply = 'Sure! Here it is:\n```json\n{"a": [1, 2]}\n```\nDone.'
+        self.assertEqual(safe_json_loads(reply), {"a": [1, 2]})
+
+    def test_unparseable_text_gives_the_fallback(self):
+        self.assertEqual(safe_json_loads("{bad}", fallback=[1]), [1])
+        self.assertEqual(safe_json_loads("", fallback="x"), "x")
+        self.assertEqual(safe_json_loads(None, fallback={}), {})
+        self.assertEqual(safe_json_loads("no json here"), [], "the default fallback is an empty list")
 
 
 class TestExceptions(unittest.TestCase):
@@ -108,7 +125,7 @@ class TestConfig(unittest.TestCase):
             load_config(self._write("asr:\n  vad_treshold: 0.5\n"))
 
     def test_empty_user_file_is_fine(self):
-        self.assertEqual(load_config(self._write("")).llm.max_turns, 20)
+        self.assertEqual(load_config(self._write("")).llm.max_turns, 10)
 
     def test_env_blocks(self):
         path = self._write(
@@ -131,7 +148,7 @@ class TestConfig(unittest.TestCase):
         self.assertIs(get_config(), custom)
 
         set_config(None)
-        self.assertEqual(get_config().llm.max_turns, 20)
+        self.assertEqual(get_config().llm.max_turns, 10)
 
 class TestImportSideEffects(unittest.TestCase):
     def test_importing_voxpipe_reads_no_configuration(self):

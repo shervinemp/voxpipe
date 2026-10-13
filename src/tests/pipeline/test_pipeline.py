@@ -14,7 +14,7 @@ from voxpipe.llm.context import MemoryHandler
 from voxpipe.llm.session import Session
 from voxpipe.llm.tools import Tool, ToolCall
 from voxpipe.pipeline.pipeline import Pipeline
-from voxpipe.storage import MemoryStore, RAMStorage, SQLiteStorage
+from voxpipe.storage import RAMStorage, SQLiteStorage
 
 from ..llm._fakes import ScriptedLLM
 
@@ -168,7 +168,7 @@ class TestResponding(PipelineCase):
         self.assertEqual(self.states()[-1], "idle")
         self.assertEqual(pipe.status["llm"], "idle")
         self.assertTrue(any(event[0] == "pipeline:error" for event in self.events))
-        self.assertEqual(self.session.conversation.visible_count(), 0, "the failed turn left no trace")
+        self.assertEqual(self.session.conversation.history, [], "the failed turn left no trace")
 
         pipe.handle_transcript("hello again")
         self.assertEqual(self.tts.spoken[-1], "Back again.")
@@ -205,7 +205,7 @@ class TestBargeIn(PipelineCase):
         self.assertEqual(
             self.last_prompt(), '(User interrupted after: "First sentence.". Continue naturally.)\nwait, stop'
         )
-        self.assertEqual(self.session.conversation.all_messages[-2].content, "wait, stop")
+        self.assertEqual(self.session.conversation.history[-2].content, "wait, stop")
 
     def test_speech_onset_while_audio_is_still_playing_interrupts_it(self):
         pipe = self.make(["A long answer."], ["Sure."])
@@ -282,22 +282,34 @@ class TestToolsAndSystemPrompt(PipelineCase):
         pipe.register_tools(first)
         pipe.register_tools([second])
 
-        prompt = self.session.conversation.system_message
-        self.assertIn("- Call lights when asked.", prompt)
-        self.assertIn("- Call weather for forecasts.", prompt, "the prompt is rebuilt as tools are added")
-        self.assertIn("voice-controlled assistant", prompt)
-        self.assertEqual(set(self.session.conversation.tools), {"lights", "weather"})
+        self.assertEqual(
+            self.session.system_prompt,
+            "You are a voice-controlled assistant. Respond conversationally.\n"
+            "\n"
+            "Rules:\n"
+            "- Call lights when asked.\n"
+            "- Call weather for forecasts.\n"
+            "- If the user's message seems incomplete or cut off, ask what they meant.\n"
+            "- Do not describe your actions or announce tool usage.\n"
+            "- Respond naturally, as if you already know the answer.",
+        )
+        self.assertEqual(set(self.session.tools), {"lights", "weather"})
 
-    def test_a_custom_system_prompt_is_left_alone(self):
-        self.make([])  # builds self.session
-        session = Session(llm=ScriptedLLM([]))
+    def test_a_session_with_its_own_instructions_gets_no_default_ones(self):
+        session = Session(llm=ScriptedLLM([]), instructions="You are a pirate.")
         self.addCleanup(session.close)
-        session.conversation.set_system_message("You are a pirate.")
         pipe = Pipeline(session)
         tool = Tool.from_callable("lights", lambda: None)
         tool.instruction = "Call lights."
         pipe.register_tools(tool)
-        self.assertEqual(session.conversation.system_message, "You are a pirate.")
+        self.assertEqual((session.instructions, session.rules), ("You are a pirate.", []))
+        self.assertEqual(session.system_prompt, "You are a pirate.\n\nRules:\n- Call lights.")
+
+    def test_a_session_with_only_rules_of_its_own_gets_no_default_ones(self):
+        session = Session(llm=ScriptedLLM([]), rules=["Speak like a pirate."])
+        self.addCleanup(session.close)
+        Pipeline(session)
+        self.assertEqual(session.system_prompt, "Rules:\n- Speak like a pirate.")
 
     def test_tools_without_a_callback_are_flagged(self):
         pipe = self.make([])
@@ -307,13 +319,13 @@ class TestToolsAndSystemPrompt(PipelineCase):
     def test_reset_keeps_tools_and_prompt(self):
         pipe = self.make(["Hi."])
         pipe.register_tools(Tool.from_callable("lights", lambda: None))
-        prompt = self.session.conversation.system_message
+        prompt = self.session.system_prompt
         pipe.handle_transcript("hello")
 
         pipe.reset()
 
         self.assertEqual(self.session.conversation.messages, [{"role": "system", "content": prompt}])
-        self.assertIn("lights", self.session.conversation.tools)
+        self.assertIn("lights", self.session.tools)
         self.assertIn(("session:reset",), self.events)
 
 
@@ -343,7 +355,7 @@ class TestHotkeys(PipelineCase):
         pipe = self.make(["Hi."], hotkeys=hotkeys, press_to_reset="<ctrl_l>+<ctrl_r>")
         pipe.handle_transcript("hello")
         hotkeys.actions["<ctrl_l>+<ctrl_r>"]()
-        self.assertEqual(self.session.conversation.visible_count(), 0)
+        self.assertEqual(self.session.conversation.history, [])
 
         pipe.press_to_reset = "<f9>"
         self.assertEqual(list(hotkeys.actions), ["<f9>"])
@@ -438,7 +450,7 @@ class TestMemory(PipelineCase):
     def test_recalled_memories_and_annotations_do_not_pollute_memory(self):
         storage = RAMStorage()
         storage.store("the user's cat is called Miso", role="user")
-        handler = MemoryHandler(strategy=lambda conversation: 0, memory_store=MemoryStore(storage))
+        handler = MemoryHandler(strategy=lambda conversation: 0, memory=storage)
 
         def script(conversation):
             yield "Miso, of course. "
@@ -503,7 +515,7 @@ class TestFromConfig(unittest.TestCase):
         handler = pipe.session.context_handler
         self.assertIsInstance(handler, MemoryHandler)
         self.assertIsInstance(pipe.memory, SQLiteStorage)
-        self.assertIs(handler.memory_store.storage, pipe.memory)
+        self.assertIs(handler.memory, pipe.memory)
         self.assertEqual(handler.recall_top_k, 5)
         self.assertEqual(pipe.push_to_talk, "<f8>")
         self.assertTrue(self.asr.is_muted)
@@ -525,7 +537,7 @@ class TestFromConfig(unittest.TestCase):
         history = self.config.conversation_history.model_copy(update={"enabled": False})
         pipe = self.build(self.config.model_copy(update={"conversation_history": history}))
         self.assertIsNone(pipe.memory)
-        self.assertIsNone(pipe.session.context_handler.memory_store)
+        self.assertIsNone(pipe.session.context_handler.memory)
         self.assertFalse(os.path.exists(os.path.dirname(history.db_path)))
 
     def test_hotkeys_can_be_disabled_or_overridden(self):

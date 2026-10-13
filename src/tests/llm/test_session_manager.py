@@ -42,7 +42,6 @@ class TestSessionManager(unittest.TestCase):
         loaded = self._load("sess_001", max_tool_iterations=4)
         self.assertEqual(loaded.conversation.messages[-1]["content"], "Hello from test!")
         self.assertTrue(loaded.state.tools.get_permission("search"))
-        self.assertEqual(loaded.session_id, "sess_001")
         self.assertEqual(loaded.max_tool_iterations, 4)
 
     def test_manifest(self):
@@ -123,7 +122,7 @@ class TestSessionManager(unittest.TestCase):
     def test_import_defaults_to_the_archive_name_and_replaces_existing(self):
         stale = self._session()
         stale.conversation.add_user_message("stale")
-        self.manager.save_session(stale, "trip", save_kv_cache=True)
+        self.manager.save_session(stale, "trip")
 
         fresh = self._session()
         fresh.conversation.add_user_message("fresh")

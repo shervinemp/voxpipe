@@ -3,10 +3,10 @@ import tempfile
 import unittest
 
 from voxpipe.llm.conversation import Conversation, Message
-from voxpipe.llm.tools import Tool, ToolCall
+from voxpipe.llm.tools import Tool, ToolCall, ToolSet
 
 
-def exchange(conv, question, answer):
+def turn(conv, question, answer):
     conv.add_user_message(question)
     conv.add_assistant_message(answer)
 
@@ -39,27 +39,47 @@ class TestConversation(unittest.TestCase):
         self.assertIs(conv.last_message, message)
         self.assertEqual(message.role, Message.Role.user)
 
-    def test_clear_resets_messages_and_window(self):
+    def test_clear_forgets_messages_only(self):
         conv = Conversation()
         conv.set_system_message("sys")
+        conv.rules = ["Be brief."]
+        conv.tools = [Tool(name="t1", description="")]
         for i in range(6):
             conv.add_user_message(f"m{i}")
-        conv.cutoff_idx = 4
         conv.clear()
         conv.add_user_message("fresh question")
-        self.assertEqual(conv.visible_count(), 1)
-        self.assertEqual(conv.messages[-1], {"role": "user", "content": "fresh question"})
-        self.assertEqual(conv.system_message, "sys")
+        self.assertEqual([m.content for m in conv.history], ["fresh question"])
+        self.assertEqual((conv.system_message, conv.rules, list(conv.tools)), ("sys", ["Be brief."], ["t1"]))
 
-    def test_discard_removes_by_identity_and_keeps_the_window(self):
+    def test_blank_copy_keeps_prompt_rules_and_tools_but_shares_nothing(self):
+        conv = Conversation()
+        conv.set_system_message("sys")
+        conv.rules = ["Be brief."]
+        conv.tools = [Tool(name="t1", description="")]
+        conv.add_user_message("hello")
+
+        copy = conv.blank_copy()
+        self.assertEqual(copy.history, [])
+        self.assertEqual((copy.system_message, copy.rules, list(copy.tools)), ("sys", ["Be brief."], ["t1"]))
+
+        copy.rules.append("Be kind.")
+        copy.tools.add(Tool(name="t2", description=""))
+        self.assertEqual((conv.rules, list(conv.tools)), (["Be brief."], ["t1"]))
+
+    def test_discard_removes_by_identity(self):
         conv = Conversation()
         first = conv.add_user_message("same text")
         conv.add_assistant_message("reply")
         second = conv.add_user_message("same text")
-        conv.cutoff_idx = 2
         conv.discard([first])
-        self.assertEqual([m.content for m in conv.all_messages], ["reply", "same text"])
-        self.assertEqual(conv.visible, [second])
+        self.assertEqual([m.content for m in conv.history], ["reply", "same text"])
+        self.assertIs(conv.history[-1], second)
+
+    def test_history_is_a_copy(self):
+        conv = Conversation()
+        conv.add_user_message("hello")
+        conv.history.clear()
+        self.assertEqual(len(conv.history), 1)
 
     def test_tools_setter_from_iterable(self):
         conv = Conversation()
@@ -73,6 +93,16 @@ class TestConversation(unittest.TestCase):
         conv.tools["t2"] = Tool(name="t2", description="")
         self.assertNotIn("t2", source)
 
+    def test_tools_add_keys_by_name_and_replaces(self):
+        conv = Conversation()
+        first, other = Tool(name="t1", description="old"), Tool(name="t2", description="")
+        conv.tools.add(first, other)
+        replacement = Tool(name="t1", description="new")
+        conv.tools.add(replacement)
+        self.assertIsInstance(conv.tools, ToolSet)
+        self.assertEqual(list(conv.tools), ["t1", "t2"])
+        self.assertIs(conv.tools["t1"], replacement)
+
     def test_to_dict_round_trip(self):
         conv = Conversation()
         conv.set_system_message("sys")
@@ -82,18 +112,23 @@ class TestConversation(unittest.TestCase):
         conv.add_tool_message('{"a": 1}', tool_call=call)
         conv.add_tool_message("a note")
         conv.add_assistant_message("done").archived = True
-        conv.cutoff_idx = 1
+        conv.rules = ["Be brief."]
 
         restored = Conversation.from_dict(conv.to_dict())
 
         self.assertEqual(restored.to_dict(), conv.to_dict())
-        self.assertEqual(restored.all_messages, conv.all_messages)
-        self.assertEqual(restored.all_messages[1].tool_calls[0].id, call.id)
-        self.assertEqual(restored.cutoff_idx, 1)
+        self.assertEqual(restored.history, conv.history)
+        self.assertEqual(restored.history[1].tool_calls[0].id, call.id)
+        self.assertEqual(restored.rules, ["Be brief."])
 
     def test_from_dict_accepts_plain_role_content_messages(self):
         conv = Conversation.from_dict({"messages": [{"role": "user", "content": "hi"}], "_meta": {"x": {}}})
         self.assertEqual(conv.messages, [{"role": "user", "content": "hi"}])
+
+    def test_from_dict_keeps_messages_an_older_version_had_hidden(self):
+        saved = {"messages": [{"role": "user", "content": f"m{i}"} for i in range(3)], "cutoff_idx": 2}
+        conv = Conversation.from_dict(saved)
+        self.assertEqual([m.content for m in conv.history], ["m0", "m1", "m2"])
 
     def test_save_load_json(self):
         conv = Conversation()
@@ -166,68 +201,84 @@ class TestWireFormats(unittest.TestCase):
         )
 
 
-class TestContextWindow(unittest.TestCase):
-    def test_cutoff_idx_excludes_old_messages(self):
+class TestSystemPrompt(unittest.TestCase):
+    def test_is_the_system_message_when_there_are_no_rules(self):
         conv = Conversation()
-        conv.add_user_message("a")
-        conv.add_assistant_message("b")
-        conv.add_user_message("c")
-        conv.cutoff_idx = 2
-        self.assertEqual(conv.messages, [{"role": "user", "content": "c"}])
-        self.assertEqual(conv.visible_count(), 1)
-        self.assertEqual(len(conv.all_messages), 3)
+        self.assertEqual(conv.system_prompt, "")
+        conv.set_system_message("You are a bot.")
+        conv.tools = [Tool(name="plain", description="no instruction")]
+        self.assertEqual(conv.system_prompt, "You are a bot.")
 
-    def test_cutoff_idx_is_clamped(self):
+    def test_lists_tool_instructions_then_standing_rules(self):
         conv = Conversation()
-        conv.add_user_message("a")
-        conv.cutoff_idx = 99
-        self.assertEqual(conv.cutoff_idx, 1)
-        conv.cutoff_idx = -5
-        self.assertEqual(conv.cutoff_idx, 0)
+        conv.set_system_message("You are a bot.")
+        conv.rules = ["Be brief."]
+        conv.tools = [
+            Tool(name="lights", description="", instruction="Call  'lights' to\n   change the lighting."),
+            Tool(name="plain", description=""),
+        ]
+        self.assertEqual(
+            conv.system_prompt,
+            "You are a bot.\n\nRules:\n- Call 'lights' to change the lighting.\n- Be brief.",
+        )
+        self.assertEqual(conv.system_message, "You are a bot.", "the message as set is left alone")
 
-    def test_hide_oldest_on_a_turn_boundary(self):
+    def test_rules_stand_alone_without_a_system_message(self):
         conv = Conversation()
-        exchange(conv, "q1", "a1")
-        exchange(conv, "q2", "a2")
-        self.assertEqual(conv.hide_oldest(2), 2)
-        self.assertEqual([m.content for m in conv.visible], ["q2", "a2"])
-        self.assertEqual(len(conv.all_messages), 4, "hidden messages stay in the history")
+        conv.rules = ["Be brief."]
+        self.assertEqual(conv.system_prompt, "Rules:\n- Be brief.")
 
-    def test_hide_oldest_rounds_forward_to_the_next_user_turn(self):
+    def test_follows_the_tools_as_they_change(self):
         conv = Conversation()
-        exchange(conv, "q1", "a1")
-        exchange(conv, "q2", "a2")
-        self.assertEqual(conv.hide_oldest(1), 2)
-        self.assertEqual(conv.visible[0].content, "q2")
+        conv.tools.add(Tool(name="lights", description="", instruction="Use lights."))
+        self.assertIn("- Use lights.", conv.system_prompt)
+        del conv.tools["lights"]
+        self.assertEqual(conv.system_prompt, "")
 
-    def test_hide_oldest_never_strands_the_current_exchange(self):
+    def test_both_wire_formats_send_it(self):
         conv = Conversation()
-        exchange(conv, "q1", "a1")
+        conv.set_system_message("You are a bot.")
+        conv.rules = ["Be brief."]
+        conv.add_user_message("hi")
+        expected = {"role": "system", "content": "You are a bot.\n\nRules:\n- Be brief."}
+        self.assertEqual(conv.messages[0], expected)
+        self.assertEqual(conv.to_openai_messages()[0], expected)
+
+
+class TestEviction(unittest.TestCase):
+    def test_evicts_on_a_turn_boundary(self):
+        conv = Conversation()
+        turn(conv, "q1", "a1")
+        turn(conv, "q2", "a2")
+        evicted = conv.evict_oldest(2)
+        self.assertEqual([m.content for m in evicted], ["q1", "a1"])
+        self.assertEqual([m.content for m in conv.history], ["q2", "a2"])
+        self.assertEqual(conv.messages[0], {"role": "user", "content": "q2"})
+
+    def test_rounds_forward_to_the_next_user_message(self):
+        conv = Conversation()
+        turn(conv, "q1", "a1")
+        turn(conv, "q2", "a2")
+        self.assertEqual(len(conv.evict_oldest(1)), 2)
+        self.assertEqual(conv.history[0].content, "q2")
+
+    def test_never_strands_the_current_turn(self):
+        conv = Conversation()
+        turn(conv, "q1", "a1")
         conv.add_user_message("q2")
         call = ToolCall(name="t")
         conv.add_assistant_message("", tool_calls=[call])
         conv.add_tool_message("{}", tool_call=call)
-        self.assertEqual(conv.hide_oldest(4), 2)
-        self.assertEqual(conv.visible[0].content, "q2", "tool results keep the call they answer")
+        self.assertEqual(len(conv.evict_oldest(4)), 2)
+        self.assertEqual(conv.history[0].content, "q2", "tool results keep the call they answer")
 
-    def test_hide_oldest_clamps_and_ignores_non_positive_counts(self):
+    def test_clamps_and_ignores_non_positive_counts(self):
         conv = Conversation()
         conv.add_user_message("only")
-        self.assertEqual(conv.hide_oldest(0), 0)
-        self.assertEqual(conv.hide_oldest(-3), 0)
-        self.assertEqual(conv.hide_oldest(100), 0, "the last user turn is never hidden")
-        self.assertEqual(conv.visible_count(), 1)
-
-    def test_drop_hidden(self):
-        conv = Conversation()
-        exchange(conv, "q1", "a1")
-        exchange(conv, "q2", "a2")
-        conv.hide_oldest(2)
-        dropped = conv.drop_hidden()
-        self.assertEqual([m.content for m in dropped], ["q1", "a1"])
-        self.assertEqual([m.content for m in conv.all_messages], ["q2", "a2"])
-        self.assertEqual(conv.cutoff_idx, 0)
-        self.assertEqual(conv.drop_hidden(), [])
+        self.assertEqual(conv.evict_oldest(0), [])
+        self.assertEqual(conv.evict_oldest(-3), [])
+        self.assertEqual(conv.evict_oldest(100), [], "the last user message is never evicted")
+        self.assertEqual(len(conv.history), 1)
 
 
 if __name__ == "__main__":

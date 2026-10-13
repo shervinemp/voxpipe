@@ -28,8 +28,7 @@ class SessionCase(unittest.TestCase):
     def make(self, *scripts, tools=(), decoder=None, **session_kwargs):
         """A session over a scripted LLM; pass a decoder when the scripts hold tagged tool-call text."""
         llm = ScriptedLLM(*scripts, decoder=decoder)
-        session = Session(llm=llm, **session_kwargs)
-        session.conversation.tools = list(tools)
+        session = Session(llm=llm, tools=tools, **session_kwargs)
         self.addCleanup(session.close)
         return session, llm
 
@@ -72,7 +71,7 @@ class TestSessionTurns(SessionCase):
         session, llm = self.make(["ok"])
         list(session("stop", context="(User interrupted you.)"))
         self.assertEqual(llm.calls[0].messages[0]["content"], "(User interrupted you.)\nstop")
-        self.assertEqual(session.conversation.all_messages[0].content, "stop")
+        self.assertEqual(session.conversation.history[0].content, "stop")
 
     def test_generation_parameters_reach_the_llm(self):
         session, llm = self.make(["ok"])
@@ -326,36 +325,81 @@ class TestSessionConcurrency(SessionCase):
         self.assertEqual(session.conversation.messages, [{"role": "system", "content": "You are helpful."}])
 
 
+class TestInstructionsRulesAndTools(SessionCase):
+    """What the model is told and may do is set on the session."""
+
+    LIGHTS = Tool(name="lights", description="", instruction="Call 'lights' to change the lighting.")
+
+    def test_the_model_receives_instructions_tool_instructions_and_rules(self):
+        session, llm = self.make(["ok"], instructions="You are a butler.", rules=["Be brief."], tools=[self.LIGHTS])
+        list(session("hello"))
+        prompt = "You are a butler.\n\nRules:\n- Call 'lights' to change the lighting.\n- Be brief."
+        self.assertEqual(llm.calls[0].messages[0], {"role": "system", "content": prompt})
+        self.assertEqual(session.system_prompt, prompt)
+
+    def test_a_bare_session_has_no_system_prompt(self):
+        session, llm = self.make(["ok"])
+        list(session("hello"))
+        self.assertEqual(session.system_prompt, "")
+        self.assertEqual([m["role"] for m in llm.calls[0].messages], ["user"])
+
+    def test_they_can_be_changed_between_turns(self):
+        session, llm = self.make(["ok"])
+        session.instructions = "You are a butler."
+        session.rules = ("Be brief.",)
+        session.tools.add(self.LIGHTS, Tool(name="plain", description=""))
+        self.assertEqual((session.instructions, session.rules, list(session.tools)), (
+            "You are a butler.", ["Be brief."], ["lights", "plain"],
+        ))
+
+        list(session("hello"))
+        self.assertIn("- Call 'lights' to change the lighting.\n- Be brief.", llm.calls[0].messages[0]["content"])
+
+        session.tools = [Tool(name="plain", description="")]
+        session.rules.clear()
+        list(session("again"))
+        self.assertEqual(llm.calls[1].messages[0]["content"], "You are a butler.")
+
+    def test_they_are_the_conversations_own(self):
+        """One copy: a conversation set up by hand and the session's view of it cannot disagree."""
+        conversation = Conversation()
+        conversation.set_system_message("You are a butler.")
+        conversation.tools = [self.LIGHTS]
+        session = Session(llm=ScriptedLLM([]), conversation=conversation, rules=["Be brief."])
+        self.addCleanup(session.close)
+
+        self.assertEqual(session.instructions, "You are a butler.")
+        self.assertIs(session.tools, conversation.tools)
+        self.assertEqual(conversation.rules, ["Be brief."])
+
+    def test_constructor_arguments_add_to_a_conversation_that_brings_its_own(self):
+        conversation = Conversation()
+        conversation.set_system_message("old")
+        conversation.tools = [Tool(name="plain", description="")]
+        session = Session(llm=ScriptedLLM([]), conversation=conversation, instructions="new", tools=[self.LIGHTS])
+        self.addCleanup(session.close)
+        self.assertEqual((session.instructions, list(session.tools)), ("new", ["plain", "lights"]))
+
+    def test_the_confirm_tool_adds_no_rule(self):
+        tool = Tool.from_callable("unlock", lambda door: {"unlocked": door})
+        tool.requires_permission = True
+        session, llm = self.make(["ok"], instructions="You are a butler.", tools=[tool])
+        list(session("hello"))
+        self.assertIn("_confirm", session.tools)
+        self.assertEqual(llm.calls[0].messages[0]["content"], "You are a butler.")
+
+
 class TestSessionLifecycle(SessionCase):
-    def test_complete_once_returns_string(self):
-        session, llm = self.make(["hello world"])
-        self.assertEqual(session.complete_once("test", system="sys"), "hello world")
-        self.assertEqual(llm.calls[0].tool_choice, "none")
-        self.assertIsNone(llm.calls[0].state)
-
-    def test_complete_once_empty_query_raises(self):
-        session, _ = self.make([])
-        for query in ("", "   "):
-            with self.assertRaises(LLMError):
-                session.complete_once(query)
-
-    def test_complete_once_does_not_mutate_conversation(self):
-        session, _ = self.make(["result"])
-        session.conversation.add_user_message("persistent")
-        session.complete_once("isolated")
-        self.assertEqual(session.conversation.messages, [{"role": "user", "content": "persistent"}])
-
-    def test_reset_keeps_system_prompt_and_tools_but_clears_the_rest(self):
-        session, _ = self.make([], tools=[Tool(name="t", description="")])
-        session.conversation.set_system_message("sys")
+    def test_reset_keeps_instructions_rules_and_tools_but_clears_the_rest(self):
+        session, _ = self.make([], instructions="sys", rules=["Be brief."], tools=[Tool(name="t", description="")])
         session.conversation.add_user_message("old")
         session.state.user.set("k", "v")
         session.state.tools.set_permission("t", True)
 
         session.reset()
 
-        self.assertEqual(session.conversation.messages, [{"role": "system", "content": "sys"}])
-        self.assertIn("t", session.conversation.tools)
+        self.assertEqual(session.conversation.history, [])
+        self.assertEqual((session.instructions, session.rules, list(session.tools)), ("sys", ["Be brief."], ["t"]))
         self.assertIsNone(session.state.user.get("k"))
         self.assertIsNone(session.state.tools.get_permission("t"))
 
@@ -389,15 +433,19 @@ class TestSessionLifecycle(SessionCase):
         self.assertEqual(restored.state.user.get("note"), "test")
         self.assertEqual(restored.max_tool_iterations, 3)
 
-    def test_save_kv_cache(self):
-        session, _ = self.make([])
-        session.state.model.set_kv_cache(b"\x00\x01\x02")
+    def test_load_restores_instructions_and_rules_and_takes_the_tools_again(self):
+        session, llm = self.make([], instructions="You are a butler.", rules=["Be brief."])
+        session.tools.add(Tool(name="lights", description=""))
+        session.state.model.runtime["cache"] = object()
+
         with tempfile.TemporaryDirectory() as tmp:
             session.save(tmp)
-            self.assertFalse(os.path.exists(os.path.join(tmp, "kv_cache.bin")))
-            session.save(tmp, save_kv_cache=True)
-            with open(os.path.join(tmp, "kv_cache.bin"), "rb") as f:
-                self.assertEqual(f.read(), b"\x00\x01\x02")
+            self.assertEqual(sorted(os.listdir(tmp)), ["conversation.json", "state.json"])
+            restored = Session.load(tmp, llm=llm, tools=[Tool(name="lights", description="")])
+            self.addCleanup(restored.close)
+
+        self.assertEqual((restored.instructions, restored.rules), ("You are a butler.", ["Be brief."]))
+        self.assertEqual(list(restored.tools), ["lights"])
 
     def test_close_stops_tool_caller(self):
         session = Session(llm=ScriptedLLM([]))
@@ -437,7 +485,7 @@ class TestSessionConfirm(SessionCase):
         """A script that answers whatever choice is pending for ``tool_name``."""
 
         def script(conversation):
-            notice = next(m.content for m in reversed(conversation.all_messages) if m.name == tool_name)
+            notice = next(m.content for m in reversed(conversation.history) if m.name == tool_name)
             uid = notice.split('"uid": "')[1].split('"')[0]
             return [ToolCall("_confirm", {"uid": uid, "choice": choice})]
 

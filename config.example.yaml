@@ -6,7 +6,7 @@ llm:
   backend: "local"       # "local" (GGUF) or "litellm" (remote APIs)
   model: "Gemma4_12B"    # key under `local`
   max_tool_iterations: 1 # tool passes per turn before the model must answer; 0 disables tools
-  max_turns: 20          # messages kept in the model's context window
+  max_turns: 10          # turns (a user message and its answer) kept in the model's context
 
   # Local GGUF models — keys without a model_path are downloaded per manifest.yaml
   local:

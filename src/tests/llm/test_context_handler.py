@@ -19,43 +19,137 @@ def archived(storage):
     return [(record.meta["role"], record.content) for _, record in storage._entries]
 
 
-class TestStrategies(unittest.TestCase):
+def conversation_of(turns):
+    """A conversation of ``turns`` question-and-answer turns, q0/a0 first."""
+    conv = Conversation()
+    for i in range(turns):
+        conv.add_user_message(f"q{i}")
+        conv.add_assistant_message(f"a{i}")
+    return conv
+
+
+class TestMaxTurnsStrategy(unittest.TestCase):
+    def test_nothing_to_evict_up_to_the_limit(self):
+        strategy = MaxTurnsStrategy(3)
+        self.assertEqual(strategy(Conversation()), 0)
+        self.assertEqual(strategy(conversation_of(3)), 0)
+
+    def test_over_the_limit_cuts_back_to_trim_to(self):
+        strategy = MaxTurnsStrategy(4, trim_to=2)
+        conv = conversation_of(5)
+        self.assertEqual(strategy(conv), 6, "three turns of two messages each")
+        conv.evict_oldest(strategy(conv))
+        self.assertEqual([m.content for m in conv.history], ["q3", "a3", "q4", "a4"])
+
+    def test_a_turn_counts_once_however_many_messages_it_took(self):
+        conv = Conversation()
+        for i in range(2):
+            conv.add_user_message(f"q{i}")
+            call = ToolCall(name="lookup")
+            conv.add_assistant_message("", tool_calls=[call])
+            conv.add_tool_message("{}", tool_call=call)
+            conv.add_tool_message("Now answer.")
+            conv.add_assistant_message(f"a{i}")
+        self.assertEqual(MaxTurnsStrategy(2)(conv), 0, "ten messages, but only two turns")
+        self.assertEqual(MaxTurnsStrategy(1)(conv), 5)
+
+    def test_the_turn_being_asked_counts(self):
+        conv = conversation_of(2)
+        conv.add_user_message("q2")
+        self.assertEqual(MaxTurnsStrategy(2, trim_to=2)(conv), 2)
+
+    def test_trim_to_defaults_to_sixty_percent_of_the_limit(self):
+        self.assertEqual(MaxTurnsStrategy(10).trim_to, 6)
+        self.assertEqual(MaxTurnsStrategy(20).trim_to, 12)
+        self.assertEqual(MaxTurnsStrategy(1).trim_to, 1)
+
+    def test_rejects_limits_that_make_no_sense(self):
+        for arguments in [dict(max_turns=0), dict(max_turns=4, trim_to=0), dict(max_turns=4, trim_to=5)]:
+            with self.subTest(arguments), self.assertRaises(ValueError):
+                MaxTurnsStrategy(**arguments)
+
+    def test_the_start_of_the_prompt_holds_still_between_cuts(self):
+        """The point of cutting below the limit: a prompt-prefix cache survives most turns."""
+        conv = Conversation()
+        handler = MemoryHandler(MaxTurnsStrategy(10))
+        moved = []
+        for i in range(40):
+            first_before = conv.history[0] if conv.history else None
+            conv.add_user_message(f"q{i}")
+            handler.pre_process(conv)
+            conv.add_assistant_message(f"a{i}")
+            if first_before is not None and conv.history[0] is not first_before:
+                moved.append(i)
+        self.assertEqual(moved, [10, 15, 20, 25, 30, 35], "one cut every five turns, not one per turn")
+        self.assertLessEqual(len(conv.history), 20)
+
+
+class TestTokenBudgetStrategy(unittest.TestCase):
     def _conv(self, *contents):
         conv = Conversation()
         for content in contents:
             conv.add_user_message(content)
         return conv
 
-    def test_token_budget_evicts_oldest_until_it_fits(self):
+    def test_nothing_to_evict_within_the_budget(self):
         strategy = TokenBudgetStrategy(count_tokens=len, budget=30, per_message_overhead=0)
+        self.assertEqual(strategy(Conversation()), 0)
         self.assertEqual(strategy(self._conv("a" * 10, "b" * 10, "c" * 10)), 0)
-        self.assertEqual(strategy(self._conv("a" * 10, "b" * 10, "c" * 10, "d" * 10)), 1)
-        self.assertEqual(strategy(self._conv("a" * 25, "b" * 25, "c" * 10)), 2)
 
-    def test_token_budget_never_evicts_the_newest_message(self):
+    def test_over_budget_evicts_oldest_down_to_trim_to(self):
+        fits_again = TokenBudgetStrategy(len, budget=30, per_message_overhead=0, trim_to=30)
+        self.assertEqual(fits_again(self._conv("a" * 10, "b" * 10, "c" * 10, "d" * 10)), 1)
+        self.assertEqual(fits_again(self._conv("a" * 25, "b" * 25, "c" * 10)), 2)
+
+        with_headroom = TokenBudgetStrategy(len, budget=30, per_message_overhead=0, trim_to=10)
+        self.assertEqual(with_headroom(self._conv("a" * 10, "b" * 10, "c" * 10, "d" * 10)), 3)
+
+    def test_trim_to_defaults_to_sixty_percent_of_the_room_for_messages(self):
+        strategy = TokenBudgetStrategy(len, budget=100, per_message_overhead=0)
+        conv = self._conv(*["m" * 10] * 11)
+        self.assertEqual(strategy(conv), 5, "110 tokens cut back to 60")
+
+        conv.set_system_message("s" * 50)
+        self.assertEqual(strategy(conv), 8, "50 fixed + 60% of the 50 left = 80, so messages shrink to 30")
+
+    def test_never_evicts_the_newest_message(self):
         strategy = TokenBudgetStrategy(count_tokens=len, budget=5, per_message_overhead=0)
         self.assertEqual(strategy(self._conv("a" * 50)), 0)
         self.assertEqual(strategy(self._conv("a" * 50, "b" * 50)), 1)
 
-    def test_token_budget_counts_system_prompt_tools_and_overhead(self):
-        conv = self._conv("a" * 10, "b" * 10)
-        self.assertEqual(TokenBudgetStrategy(len, budget=20, per_message_overhead=0)(conv), 0)
-        self.assertEqual(TokenBudgetStrategy(len, budget=20, per_message_overhead=1)(conv), 1)
-        conv.set_system_message("s" * 5)
-        self.assertEqual(TokenBudgetStrategy(len, budget=20, per_message_overhead=0)(conv), 1)
-        conv.set_system_message("")
-        conv.tools = [Tool(name="t", description="d")]
-        self.assertEqual(TokenBudgetStrategy(len, budget=20, per_message_overhead=0)(conv), 1)
+    def test_counts_system_prompt_rules_tools_and_overhead(self):
+        def strategy(**kwargs):
+            return TokenBudgetStrategy(len, budget=20, trim_to=20, **kwargs)
 
-    def test_token_budget_counts_recalled_context(self):
+        conv = self._conv("a" * 10, "b" * 10)
+        self.assertEqual(strategy(per_message_overhead=0)(conv), 0)
+        self.assertEqual(strategy(per_message_overhead=1)(conv), 1)
+        conv.set_system_message("s" * 5)
+        self.assertEqual(strategy(per_message_overhead=0)(conv), 1)
+        conv.set_system_message("")
+        conv.rules = ["r"]
+        self.assertEqual(strategy(per_message_overhead=0)(conv), 1)
+        conv.rules = []
+        conv.tools = [Tool(name="t", description="d")]
+        self.assertEqual(strategy(per_message_overhead=0)(conv), 1)
+
+    def test_counts_recalled_context(self):
         conv = self._conv("a" * 10, "b" * 10)
         conv.last_message.context = "c" * 10
-        self.assertEqual(TokenBudgetStrategy(len, budget=25, per_message_overhead=0)(conv), 1)
+        self.assertEqual(TokenBudgetStrategy(len, budget=25, per_message_overhead=0, trim_to=25)(conv), 1)
 
-    def test_composite_takes_the_most_demanding(self):
-        conv = self._conv(*["m"] * 6)
-        strategy = CompositeStrategy(MaxTurnsStrategy(4), MaxTurnsStrategy(2), MaxTurnsStrategy(10))
-        self.assertEqual(strategy(conv), 4)
+    def test_rejects_a_trim_target_above_the_budget(self):
+        with self.assertRaises(ValueError):
+            TokenBudgetStrategy(len, budget=10, trim_to=11)
+
+
+class TestCompositeStrategy(unittest.TestCase):
+    def test_takes_the_most_demanding(self):
+        conv = conversation_of(6)
+        strategy = CompositeStrategy(
+            MaxTurnsStrategy(4, trim_to=4), MaxTurnsStrategy(2, trim_to=2), MaxTurnsStrategy(10)
+        )
+        self.assertEqual(strategy(conv), 8)
         self.assertEqual(CompositeStrategy()(conv), 0)
 
 
@@ -67,39 +161,44 @@ class TestMemoryHandler(unittest.TestCase):
         self.assertFalse(handler.post_process(conv))
         handler.finalize(conv)
 
-    def test_trim_and_auto_archive(self):
+    def test_leaves_a_conversation_within_bounds_alone(self):
+        handler = MemoryHandler(MaxTurnsStrategy(5))
+        self.assertFalse(handler.pre_process(Conversation()))
+        conv = conversation_of(3)
+        self.assertFalse(handler.pre_process(conv))
+        self.assertEqual(len(conv.history), 6)
+
+    def test_evicts_and_archives_what_the_strategy_no_longer_wants(self):
         storage = RAMStorage()
-        mem = MemoryStore(storage, session_id="test")
-        handler = MemoryHandler(strategy=MaxTurnsStrategy(max_turns=2), memory_store=mem, amortize_k=1)
+        handler = MemoryHandler(MaxTurnsStrategy(2, trim_to=2), MemoryStore(storage, session_id="test"))
 
         conv = Conversation()
         for i in range(10):
             conv.add_user_message(f"message turn {i}")
 
         self.assertTrue(handler.pre_process(conv))
-        self.assertEqual(conv.visible_count(), 2)
-        self.assertEqual(len(conv.all_messages), 2, "amortize_k=1 drops hidden messages at once")
+        self.assertEqual([m.content for m in conv.history], ["message turn 8", "message turn 9"])
         self.assertEqual(archived(storage), [("user", f"message turn {i}") for i in range(8)])
         self.assertEqual(storage._entries[0][0], "session:test")
 
-    def test_hard_trim_is_amortised(self):
+    def test_works_without_a_memory(self):
+        handler = MemoryHandler(MaxTurnsStrategy(1))
+        conv = conversation_of(3)
+        self.assertTrue(handler.pre_process(conv))
+        self.assertEqual([m.content for m in conv.history], ["q2", "a2"])
+        handler.finalize(conv)
+
+    def test_any_storage_serves_as_memory(self):
+        """The handler needs only ``store`` and ``retrieve``; a MemoryStore is one way to scope them."""
         storage = RAMStorage()
-        handler = MemoryHandler(MaxTurnsStrategy(max_turns=2), MemoryStore(storage), amortize_k=3, recall_top_k=0)
-        conv = Conversation()
-        conv.add_user_message("m0")
-        conv.add_user_message("m1")
-        for i in range(2, 5):
-            conv.add_user_message(f"m{i}")
-            handler.pre_process(conv)
-            if i < 4:
-                self.assertEqual(len(conv.all_messages), i + 1, "hidden, not yet dropped")
-                self.assertEqual(archived(storage), [])
-        self.assertEqual([m.content for m in conv.all_messages], ["m3", "m4"])
-        self.assertEqual(archived(storage), [("user", "m0"), ("user", "m1"), ("user", "m2")])
+        handler = MemoryHandler(MaxTurnsStrategy(1), storage)
+        conv = conversation_of(2)
+        handler.pre_process(conv)
+        self.assertEqual(archived(storage), [("user", "q0"), ("assistant", "a0")])
 
     def test_archives_spoken_turns_only_and_never_recalled_context(self):
         storage = RAMStorage()
-        handler = MemoryHandler(MaxTurnsStrategy(1), MemoryStore(storage), amortize_k=1, recall_top_k=0)
+        handler = MemoryHandler(MaxTurnsStrategy(1), MemoryStore(storage), recall_top_k=0)
         conv = Conversation()
         conv.add_user_message("what is the weather", context="(Earlier: user lives in Oslo)")
         call = ToolCall(name="weather")
@@ -115,7 +214,7 @@ class TestMemoryHandler(unittest.TestCase):
 
     def test_auto_archive_can_be_disabled(self):
         storage = RAMStorage()
-        handler = MemoryHandler(MaxTurnsStrategy(1), MemoryStore(storage), amortize_k=1, auto_archive=False)
+        handler = MemoryHandler(MaxTurnsStrategy(1), MemoryStore(storage), auto_archive=False)
         conv = Conversation()
         conv.add_user_message("first message")
         conv.add_user_message("second message")
@@ -193,7 +292,7 @@ class TestMemoryHandler(unittest.TestCase):
         handler.finalize(conv)
 
         self.assertEqual(archived(storage), [("user", "remember the milk"), ("assistant", "I will.")])
-        self.assertTrue(all(m.archived for m in conv.all_messages))
+        self.assertTrue(all(m.archived for m in conv.history))
         restored = Conversation.from_dict(conv.to_dict())
         handler.finalize(restored)
         self.assertEqual(len(archived(storage)), 2, "a saved and reloaded conversation is not archived again")
@@ -206,14 +305,14 @@ class TestMemoryHandler(unittest.TestCase):
             def retrieve(self, query, **kwargs):
                 raise OSError("disk gone")
 
-        handler = MemoryHandler(MaxTurnsStrategy(1), MemoryStore(Broken()), amortize_k=1)
+        handler = MemoryHandler(MaxTurnsStrategy(1), Broken())
         conv = Conversation()
         conv.add_user_message("first message here")
         conv.add_user_message("second message here")
         with self.assertLogs("voxpipe.llm.context", level="WARNING") as logs:
             self.assertTrue(handler.pre_process(conv))
             handler.finalize(conv)
-        self.assertEqual(conv.visible_count(), 1)
+        self.assertEqual(len(conv.history), 1)
         self.assertGreaterEqual(len(logs.records), 2)
 
 
@@ -247,6 +346,22 @@ class TestMemoryAcrossSessions(unittest.TestCase):
         list(session("call me Ishmael please"))
         session.reset()
         self.assertEqual(archived(storage), [("user", "call me Ishmael please"), ("assistant", "Sure.")])
+
+    def test_turns_pushed_out_of_a_long_conversation_are_archived_as_they_go(self):
+        storage = RAMStorage()
+        llm = ScriptedLLM(["Noted."])
+        handler = MemoryHandler(MaxTurnsStrategy(2, trim_to=1), MemoryStore(storage), recall_top_k=0)
+        session = Session(llm=llm, context_handler=handler)
+        self.addCleanup(session.close)
+
+        for i in range(3):
+            list(session(f"fact number {i}"))
+
+        self.assertEqual(
+            archived(storage),
+            [("user", "fact number 0"), ("assistant", "Noted."), ("user", "fact number 1"), ("assistant", "Noted.")],
+        )
+        self.assertEqual([m["content"] for m in llm.calls[-1].messages], ["fact number 2"])
 
 
 if __name__ == "__main__":

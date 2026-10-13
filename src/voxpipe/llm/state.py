@@ -10,7 +10,6 @@ from typing import Any, Dict, Optional
 from .tools import ToolCall, ToolChoice
 
 _STATE_FILE = "state.json"
-_KV_CACHE_FILE = "kv_cache.bin"
 
 # Turn number of a pending choice that did not arise during a live turn (restored from disk, added by hand).
 NO_TURN = -1
@@ -94,24 +93,16 @@ class ToolStateView:
 
 
 class ModelStateView:
-    """Provider state tied to this session: a serialisable KV cache and live runtime objects."""
+    """Provider objects tied to this session, such as a local model's KV cache.
 
-    def __init__(self, lock: threading.RLock):
-        self._lock = lock
-        self._kv_cache: Optional[bytes] = None
-        # Scratch space for provider objects that live only in this process; never saved.
+    They live only in this process and are never saved: a restored session
+    simply has the model read its history again on the first turn.
+    """
+
+    def __init__(self):
         self.runtime: Dict[str, Any] = {}
 
-    def set_kv_cache(self, raw_bytes: bytes) -> None:
-        with self._lock:
-            self._kv_cache = bytes(raw_bytes)
-
-    def get_kv_cache(self) -> Optional[bytes]:
-        with self._lock:
-            return self._kv_cache
-
     def _clear(self) -> None:
-        self._kv_cache = None
         self.runtime.clear()
 
 
@@ -141,7 +132,7 @@ class SessionState:
     def __init__(self):
         self._lock = threading.RLock()
         self.tools = ToolStateView(self._lock)
-        self.model = ModelStateView(self._lock)
+        self.model = ModelStateView()
         self.user = UserStateView(self._lock)
 
     def atomic(self) -> threading.RLock:
@@ -154,36 +145,25 @@ class SessionState:
             self.model._clear()
             self.user._data.clear()
 
-    def save(self, path: str, save_binary: bool = False) -> None:
-        """Write ``state.json`` into the directory, plus the KV cache when asked and present."""
+    def save(self, path: str) -> None:
+        """Write ``state.json`` into the directory."""
         os.makedirs(path, exist_ok=True)
         with self._lock:
             payload = json.dumps({"tools": self.tools._dump(), "user": dict(self.user._data)}, indent=2)
-            kv_cache = self.model._kv_cache if save_binary else None
-
         _write_atomically(os.path.join(path, _STATE_FILE), payload.encode("utf-8"))
-        if kv_cache is not None:
-            _write_atomically(os.path.join(path, _KV_CACHE_FILE), kv_cache)
 
     def load(self, path: str) -> None:
         """Replace this state with what :meth:`save` wrote into the directory."""
         state_file = os.path.join(path, _STATE_FILE)
-        kv_file = os.path.join(path, _KV_CACHE_FILE)
-
         data: Dict[str, Any] = {}
         if os.path.exists(state_file):
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        kv_cache = None
-        if os.path.exists(kv_file):
-            with open(kv_file, "rb") as f:
-                kv_cache = f.read()
 
         with self._lock:
             self.tools._restore(data.get("tools", {}))
             self.user._data = dict(data.get("user", {}))
             self.model._clear()
-            self.model._kv_cache = kv_cache
 
 
 def _write_atomically(path: str, data: bytes) -> None:

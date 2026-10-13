@@ -16,8 +16,8 @@ from .session import Session
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _MANIFEST_FILE = "manifest.json"
 _STATE_FILE = "state.json"
-_ARCHIVE_FILES = frozenset({_MANIFEST_FILE, _STATE_FILE, "conversation.json", "kv_cache.bin"})
-_MAX_IMPORT_BYTES = 4 * 1024**3
+_ARCHIVE_FILES = frozenset({_MANIFEST_FILE, _STATE_FILE, "conversation.json"})
+_MAX_IMPORT_BYTES = 256 * 1024**2
 
 
 class SessionManager:
@@ -38,18 +38,11 @@ class SessionManager:
             )
         return os.path.join(self.sessions_dir, session_id)
 
-    def save_session(
-        self,
-        session: Session,
-        session_id: str,
-        *,
-        save_kv_cache: bool = False,
-        meta: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    def save_session(self, session: Session, session_id: str, *, meta: Optional[Dict[str, Any]] = None) -> str:
         """Save a session into its directory and write a manifest describing it."""
         session_path = self._session_path(session_id)
         os.makedirs(session_path, exist_ok=True)
-        session.save(session_path, save_kv_cache=save_kv_cache)
+        session.save(session_path)
 
         now = time.time()
         manifest_path = os.path.join(session_path, _MANIFEST_FILE)
@@ -72,7 +65,7 @@ class SessionManager:
         if not os.path.isdir(session_path):
             raise FileNotFoundError(f"Session '{session_id}' not found in {self.sessions_dir}")
 
-        session = Session.load(session_path, llm=llm, session_id=session_id, **session_kwargs)
+        session = Session.load(session_path, llm=llm, **session_kwargs)
         self.logger.info("Loaded session '%s' from %s", session_id, session_path)
         return session
 

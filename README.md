@@ -70,7 +70,7 @@ llm:
   backend: "local"       # "local" (GGUF) or "litellm" (remote APIs)
   model: "Gemma4_12B"
   max_tool_iterations: 1
-  max_turns: 20
+  max_turns: 10          # turns (a question and its answer) kept in context
   local:
     Gemma4_12B:
       decoder: "legacy_xml"
@@ -129,7 +129,7 @@ interrupt it; use headphones or push-to-talk.
 The LLM and storage layers need no audio hardware:
 
 ```python
-from voxpipe import MemoryHandler, MemoryStore, MaxTurnsStrategy, Session, SQLiteStorage, Tool
+from voxpipe import MemoryHandler, MaxTurnsStrategy, Session, SQLiteStorage, Tool
 from voxpipe.llm import LLMProviders, permission
 
 def get_weather(city: str) -> dict:
@@ -137,6 +137,9 @@ def get_weather(city: str) -> dict:
 
     Args:
         city: City name.
+
+    Instruction:
+        Call get_weather when the user asks about the weather.
     """
     return {"city": city, "sky": "clear"}
 
@@ -146,20 +149,33 @@ def unlock_door(door: str) -> str:
     return f"{door} unlocked"
 
 llm = LLMProviders.create("local", "Gemma4_12B")
-memory = MemoryStore(SQLiteStorage("data/conversations.db"))
-handler = MemoryHandler(MaxTurnsStrategy(20), memory)
+memory = SQLiteStorage("data/conversations.db")
 
-with Session(llm, context_handler=handler) as session:
-    session.conversation.tools = [
-        Tool.from_callable("get_weather", get_weather),
-        Tool.from_callable("unlock_door", unlock_door),
-    ]
+with Session(
+    llm,
+    instructions="You are the voice of a smart home.",
+    rules=["Keep answers to a sentence or two."],
+    tools=[Tool.from_callable("get_weather", get_weather), Tool.from_callable("unlock_door", unlock_door)],
+    context_handler=MemoryHandler(MaxTurnsStrategy(10), memory),
+) as session:
     for chunk in session("What's the weather in Oslo?"):
         print(chunk, end="", flush=True)
 ```
 
-`session.events(...)` yields text, tool calls and tool results as typed
-events; `session.cancel()` stops a turn from another thread.
+- **What the model is told.** The system prompt is the `instructions`, then
+  a list of rules: each tool's `Instruction:` and your own `rules`. All of
+  it, and `session.tools`, can be changed between turns
+  (`session.tools.add(tool)`) and survives `session.reset()`.
+- **Events and cancelling.** `session.events(...)` yields text, tool calls
+  and tool results as typed events; `session.cancel()` stops a turn from
+  another thread.
+- **Context and memory.** Once more than `max_turns` turns are held, the
+  oldest are archived to memory and dropped until 60% remain. Cutting in
+  batches keeps the start of the prompt unchanged for several turns, so a
+  model that caches its prompt prefix reads only what is new. Memory is
+  anything with `store` and `retrieve`; wrap a backend in
+  `MemoryStore(backend, session_id=...)` to keep one session's memories apart.
+- **One-off answers.** `llm.complete("Summarise: ...")` needs no session.
 
 To embed the whole pipeline, build it from configuration or from your own
 components, and subscribe to its events:

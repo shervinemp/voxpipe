@@ -7,7 +7,21 @@ import re
 import types
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Type, Union, get_args, get_origin
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Type,
+    Union,
+    get_args,
+    get_origin,
+)
 
 from ..core.exceptions import ToolError
 
@@ -392,6 +406,18 @@ class Tool:
     @classmethod
     def clear_registry(cls) -> None:
         cls._registry.clear()
+
+
+class ToolSet(Dict[str, Tool]):
+    """Tools keyed by name."""
+
+    def __init__(self, tools: Union[Mapping[str, Tool], Iterable[Tool]] = ()):
+        super().__init__(tools if isinstance(tools, Mapping) else {tool.name: tool for tool in tools})
+
+    def add(self, *tools: Tool) -> None:
+        """Add tools under their own names, replacing any that share one."""
+        for tool in tools:
+            self[tool.name] = tool
 
 
 # --- argument casting -------------------------------------------------------

@@ -36,7 +36,6 @@ class TestPipelineIntegration(unittest.TestCase):
     def setUpClass(cls):
         cls.llm = GGUFLLM.from_config("Gemma4E4B")
         cls.tool = Tool.from_callable("retrieve", lambda q: "test result")
-        cls.tool.instruction = "Call when asked about entities."
 
     def _session(self, with_tool=True):
         conversation = Conversation()

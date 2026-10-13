@@ -13,7 +13,7 @@ from .model import LLM, GGUFLLM, LiteLLMProvider, LLMProviders
 from .session import Session, SessionEvent, TextDelta, ToolCallEvent, ToolResultEvent
 from .session_manager import SessionManager
 from .state import SessionState
-from .tools import MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult, permission
+from .tools import MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult, ToolSet, permission
 
 __all__ = [
     "LLM",
@@ -39,6 +39,7 @@ __all__ = [
     "ToolCall",
     "ToolResult",
     "ToolChoice",
+    "ToolSet",
     "MalformedToolCall",
     "permission",
 ]

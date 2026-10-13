@@ -48,6 +48,24 @@ changed; the upgrade notes are at the end.
   failed turn is rolled back from the conversation.
 - `Session.reset()` keeps the system prompt and tools, and never blocks on a
   turn in flight. `Session.cancel()` and `Session.events()` are new.
+- What the model is told and may do is set on the session:
+  `Session(llm, instructions=..., rules=..., tools=...)`, `session.tools.add(...)`.
+  The system prompt is assembled from the instructions, each tool's
+  `instruction` and the rules, for every session rather than only inside the
+  pipeline. A tool `instruction` therefore now reaches the prompt even when
+  you supply your own instructions; leave it unset to keep it out.
+- The context is cut in batches. `MaxTurnsStrategy` and `TokenBudgetStrategy`
+  take `trim_to` (default 60% of the limit) and cut back to it once the limit
+  is exceeded, so the start of the prompt stays put for several turns and a
+  prompt-prefix cache keeps working. Evicted messages are archived and dropped
+  at once; `amortize_k` and the hidden part of a conversation are gone.
+- `max_turns` counts turns (a user message and everything said in answer),
+  not messages, so tool calls no longer use up the window. The default is 10.
+- `MemoryHandler` accepts any object with `store` and `retrieve` as its
+  memory, not only a `MemoryStore`.
+- `LLM.complete(query, system=...)` answers a one-off query without a session.
+- Sessions are saved without a KV cache: nothing ever produced one, and a
+  restored session only has the model read its history once more.
 - Tool permissions and pending choices live in `SessionState` only. A model
   cannot answer its own confirmation request within the same turn.
 - New config keys: `llm.max_turns`, `llm.tool_timeout`, `asr.sound_device`.
@@ -63,13 +81,19 @@ changed; the upgrade notes are at the end.
 | `Pipeline(push_to_talk=...)` | `Pipeline.from_config(push_to_talk=...)`, or `Pipeline(session, asr=..., tts=...)` |
 | `GGUFLLM("Key")` | `GGUFLLM.from_config("Key")` |
 | `LLMProviders.get(name)` | `LLMProviders.create(backend, model)` |
-| `Session(max_turns=n)` | `Session(context_handler=MemoryHandler(MaxTurnsStrategy(n)))` |
+| `Session(max_turns=n)` | `Session(context_handler=MemoryHandler(MaxTurnsStrategy(n)))`; `n` now counts turns, not messages |
+| `session.conversation.tools[name] = tool`, `conversation.set_system_message(text)` | `session.tools.add(tool)`, `session.instructions = text` (the old spellings still work) |
+| `session.complete_once(query)` | `session.llm.complete(query)` |
+| `Session(session_id=...)` | removed; name the session where it is used: `SessionManager.save_session(session, id)`, `MemoryStore(storage, session_id=id)` |
+| `session.save(path, save_kv_cache=True)`, `state.model.set_kv_cache(...)` | removed |
 | `session._session_state[...]` | `session.state.user` / `.tools` / `.model` |
 | `Tool.set_meta(name, "_permission", ...)`, `conversation.set_permission(...)` | `session.state.tools.set_permission(name, ...)` |
 | `tool(**args)` returning a permission `ToolChoice` | `tool.permission_gate(granted)`, enforced by `Session` |
 | `ToolCall(name="_parse_error")` | `MalformedToolCall` |
 | `voxpipe.storage.Memory`, `storage.manager`, `storage.retriever` | `SQLiteStorage`, `voxpipe.core.downloader`, `voxpipe.storage.Retriever` |
-| `MessageList`, `Conversation.get_meta` / token-count methods | `Conversation.visible`, `hide_oldest`, `drop_hidden`; `TokenBudgetStrategy` |
+| `MessageList`, `Conversation.get_meta` / token-count methods, `cutoff_idx` | `Conversation.history`, `evict_oldest`; `TokenBudgetStrategy` |
+| `core.utils.download_file`, `verify_file_sha256` | `voxpipe.core.downloader` |
+| `streaming.splitter.ConsumerProducer`, `llm.context.DropOldestStrategy` | removed; `stream_splitter`, `MaxTurnsStrategy` |
 | `asr.enable()` / `asr.disable_w_passthrough()` | `asr.unmute()` / `asr.mute()` |
 | `tts._synthesize(...)`, `getattr(TTSProviders, name)` | `tts.synthesize(...)`, `TTSProviders.create(name)` |
 | `VoiceControlError` | `VoxpipeError` |

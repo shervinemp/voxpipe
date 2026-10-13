@@ -308,7 +308,7 @@ class TestConversationState(unittest.TestCase):
         for i in range(5):
             list(sess(f"turn {i}"))
 
-        # System prompt, the 3 messages the strategy keeps, and the reply to the last of them.
-        self.assertLessEqual(len(conv.messages), 5, f"too many messages: {len(conv.messages)}")
+        # System prompt, then at most three turns of question and answer.
+        self.assertLessEqual(len(conv.messages), 7, f"too many messages: {len(conv.messages)}")
         self.assertEqual(conv.messages[1]["role"], "user", "the window must open on a user turn")
         sess.close()

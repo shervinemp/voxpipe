@@ -2,7 +2,7 @@ llm:
   backend: "local"
   model: "Gemma4_12B"
   max_tool_iterations: 1
-  max_turns: 20
+  max_turns: 10
   tool_timeout: 10
 
   local:

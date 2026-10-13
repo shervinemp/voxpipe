@@ -59,7 +59,6 @@ class TestModelBehavior(unittest.TestCase):
             )
         if with_tools:
             t = Tool.from_callable("retrieve", lambda q: "")
-            t.instruction = "Call when asked about entities or facts."
             conv.tools["retrieve"] = t
         conv.add_user_message(message)
 
@@ -146,7 +145,6 @@ class TestModelBehavior(unittest.TestCase):
     def test_tool_call_format_is_parseable(self):
         """When model calls a tool natively, verify ToolCall is yielded correctly."""
         t = Tool.from_callable("retrieve", lambda q: "")
-        t.instruction = "Call when asked about entities or facts."
 
         native = 0
 

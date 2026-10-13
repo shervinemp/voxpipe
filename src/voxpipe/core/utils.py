@@ -2,7 +2,10 @@
 
 import json
 import logging
+import re
 from typing import Any
+
+_JSON_VALUE_RE = re.compile(r"(\[.*\]|\{.*\})", re.DOTALL)
 
 
 def setup_logging(log_level: int | str = logging.INFO, log_format: str | None = None, stream=None) -> None:
@@ -19,6 +22,21 @@ def setup_logging(log_level: int | str = logging.INFO, log_format: str | None = 
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
+
+
+def safe_json_loads(text: str, fallback: Any = None) -> Any:
+    """Parse the JSON in a model's output, ignoring prose or Markdown fences around it.
+
+    Returns ``fallback`` (an empty list when that is None) if nothing parses.
+    """
+    if isinstance(text, str):
+        candidates = [match.group(0) for match in _JSON_VALUE_RE.finditer(text.strip())]
+        for candidate in (*reversed(candidates), text):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    return fallback if fallback is not None else []
 
 
 def load_specs(specs_path: str) -> Any:

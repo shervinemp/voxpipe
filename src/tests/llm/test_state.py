@@ -42,8 +42,6 @@ class TestSessionState(unittest.TestCase):
 
     def test_model_view(self):
         state = SessionState()
-        state.model.set_kv_cache(bytearray(b"raw_kv_cache_bytes"))
-        self.assertEqual(state.model.get_kv_cache(), b"raw_kv_cache_bytes")
         state.model.runtime["handle"] = object()
         self.assertIn("handle", state.model.runtime)
 
@@ -52,7 +50,6 @@ class TestSessionState(unittest.TestCase):
         state.tools.set_permission("t", True)
         state.tools.add_pending(ToolCall(name="t"), ToolChoice(result={"a": [1]}))
         state.user.set("k", "v")
-        state.model.set_kv_cache(b"x")
         state.model.runtime["k"] = "v"
 
         state.clear()
@@ -60,7 +57,6 @@ class TestSessionState(unittest.TestCase):
         self.assertIsNone(state.tools.get_permission("t"))
         self.assertFalse(state.tools.has_pending())
         self.assertIsNone(state.user.get("k"))
-        self.assertIsNone(state.model.get_kv_cache())
         self.assertEqual(state.model.runtime, {})
 
     def test_save_and_load(self):
@@ -71,35 +67,28 @@ class TestSessionState(unittest.TestCase):
             state.tools.set_permission("run_script", True)
             state.tools.add_pending(call, choice, turn=7)
             state.user.set("user_id", "usr_100")
-            state.model.set_kv_cache(b"model_binary_bytes")
             state.model.runtime["live"] = object()
 
-            state.save(tmp, save_binary=True)
-            self.assertEqual(sorted(os.listdir(tmp)), ["kv_cache.bin", "state.json"])
+            state.save(tmp)
+            self.assertEqual(os.listdir(tmp), ["state.json"])
+            with open(os.path.join(tmp, "state.json"), encoding="utf-8") as f:
+                self.assertEqual(set(json.load(f)), {"tools", "user"}, "provider objects are never saved")
 
             restored = SessionState()
             restored.user.set("stale", True)
+            restored.model.runtime["stale"] = object()
             restored.load(tmp)
 
         self.assertTrue(restored.tools.get_permission("run_script"))
         self.assertEqual(restored.user.get("user_id"), "usr_100")
         self.assertIsNone(restored.user.get("stale"), "load replaces, not merges")
-        self.assertEqual(restored.model.get_kv_cache(), b"model_binary_bytes")
+        self.assertEqual(restored.model.runtime, {})
 
         pending = restored.tools.get_pending(choice.uid)
         self.assertEqual((pending.call.name, pending.call.arguments, pending.call.id), ("book", {"x": 1}, call.id))
         self.assertEqual(pending.choice.speech, "Which slot?")
         self.assertEqual(pending.choice.choices_dict, choice.choices_dict)
         self.assertEqual(pending.turn, NO_TURN, "a restored choice belongs to no live turn")
-
-    def test_save_without_binary(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = SessionState()
-            state.model.set_kv_cache(b"x")
-            state.save(tmp)
-            self.assertEqual(os.listdir(tmp), ["state.json"])
-            with open(os.path.join(tmp, "state.json"), encoding="utf-8") as f:
-                self.assertEqual(set(json.load(f)), {"tools", "user"})
 
     def test_load_from_empty_directory(self):
         with tempfile.TemporaryDirectory() as empty:

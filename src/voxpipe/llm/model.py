@@ -57,6 +57,24 @@ class LLM(ABC):
         self, conversation: Conversation, *, session_state: Optional["SessionState"], **kwargs
     ) -> Iterator[StreamItem]: ...
 
+    def complete(self, query: str, *, system: str | None = None, **kwargs) -> str:
+        """Answer one query on its own, with no tools and no conversation behind it."""
+        if not isinstance(query, str) or not query.strip():
+            raise LLMError("Queries must be non-empty strings.")
+
+        conversation = Conversation()
+        if system:
+            conversation.set_system_message(system)
+        conversation.add_user_message(query)
+
+        chunks = []
+        for chunk in self(conversation, tool_choice="none", **kwargs):
+            if isinstance(chunk, str):
+                chunks.append(chunk)
+            else:
+                self.logger.warning("Ignored an unexpected tool call during a one-off completion.")
+        return "".join(chunks).strip()
+
     def count_tokens(self, text: str) -> int:
         """Estimate the token count of ``text`` without network access.
 

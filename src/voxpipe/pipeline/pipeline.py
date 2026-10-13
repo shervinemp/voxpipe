@@ -16,7 +16,7 @@ from ..llm.context import CompositeStrategy, MaxTurnsStrategy, MemoryHandler, To
 from ..llm.model import LLM, LLMProviders
 from ..llm.session import Session, TextDelta, ToolCallEvent, ToolResultEvent
 from ..llm.tools import Tool
-from ..storage import MemoryStore, SQLiteStorage
+from ..storage import SQLiteStorage
 from ..streaming.splitter import stream_splitter
 from .events import EventEmitter
 from .gate import qualify_transcript
@@ -27,11 +27,12 @@ if TYPE_CHECKING:
 _STOP = object()
 _POLL_SECONDS = 0.5  # a blocking queue read cannot be interrupted by Ctrl+C on Windows
 _APOLOGY = "Sorry, I ran into a problem answering that."
-_SYSTEM_PROMPT = "You are a voice-controlled assistant. Respond conversationally."
-_BASE_RULES = (
-    "- If the user's message seems incomplete or cut off, ask what they meant.",
-    "- Do not describe your actions or announce tool usage.",
-    "- Respond naturally, as if you already know the answer.",
+# What the model is told when the session arrives with no instructions or rules of its own.
+_INSTRUCTIONS = "You are a voice-controlled assistant. Respond conversationally."
+_RULES = (
+    "If the user's message seems incomplete or cut off, ask what they meant.",
+    "Do not describe your actions or announce tool usage.",
+    "Respond naturally, as if you already know the answer.",
 )
 # How a command's pattern is turned into a test on the (normalised) utterance.
 _COMMAND_MATCHERS: Dict[str, Callable[[str], Callable[[str], Any]]] = {
@@ -84,7 +85,6 @@ class Pipeline:
         self._responding = False
         self._response_parts: list[str] = []
         self._interrupted_at: Optional[str] = None
-        self._generated_system_prompt: Optional[str] = None
         self._closed = False
 
         if asr is not None:
@@ -92,7 +92,9 @@ class Pipeline:
             asr.vad.on_audio_level = lambda rms, probability: self.events.emit("vad:level", rms, probability)
         self.push_to_talk = push_to_talk
         self.press_to_reset = press_to_reset
-        self._configure_session()
+        if not session.instructions and not session.rules:
+            session.instructions = _INSTRUCTIONS
+            session.rules = list(_RULES)
 
     # --- construction from configuration ---------------------------------
 
@@ -185,10 +187,9 @@ class Pipeline:
             MaxTurnsStrategy(config.llm.max_turns),
             TokenBudgetStrategy(llm.count_tokens, budget=llm.n_ctx - llm.max_tokens),
         )
-        store = MemoryStore(memory) if memory is not None else None
-        return MemoryHandler(strategy, store, recall_top_k=config.conversation_history.top_k)
+        return MemoryHandler(strategy, memory, recall_top_k=config.conversation_history.top_k)
 
-    # --- tools, commands, system prompt ----------------------------------
+    # --- tools and commands ----------------------------------------------
 
     def register_tools(self, *tools: Tool | list[Tool]) -> None:
         """Make tools available to the model; lists of tools are flattened."""
@@ -196,17 +197,7 @@ class Pipeline:
             for tool in entry if isinstance(entry, list) else [entry]:
                 if tool.callback is None:
                     self.logger.warning("Tool '%s' has no callback; calls to it will report an error.", tool.name)
-                self.session.conversation.tools[tool.name] = tool
-        self._configure_session()
-
-    def _configure_session(self) -> None:
-        """Write the system prompt from the tools' instructions, unless the caller supplied their own."""
-        conversation = self.session.conversation
-        if conversation.system_message not in ("", self._generated_system_prompt):
-            return
-        rules = [f"- {' '.join(tool.instruction.split())}" for tool in conversation.tools.values() if tool.instruction]
-        self._generated_system_prompt = "\n".join([_SYSTEM_PROMPT, "", "Rules:", *rules, *_BASE_RULES])
-        conversation.set_system_message(self._generated_system_prompt)
+                self.session.tools.add(tool)
 
     def register_command(self, pattern: str, handler: Callable[[], None], mode: str = "exact") -> None:
         """Run ``handler`` instead of the LLM when an utterance matches.

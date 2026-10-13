@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, Iterable, Optional, Protocol, runtime_checkable
 
 from ..core.utils import get_logger
-from ..storage.memory import MemoryStore
+from ..storage.protocols import Storage
 from .conversation import Message
 
 if TYPE_CHECKING:
@@ -15,11 +15,14 @@ if TYPE_CHECKING:
 _ARCHIVED_ROLES = (Message.Role.user, Message.Role.assistant)
 _MIN_RECALL_QUERY_CHARS = 4
 _MAX_SNIPPET_CHARS = 200
+# How far below its limit a strategy cuts by default.  Cutting to the limit itself would move the
+# start of the prompt on every turn, and a model that caches its prompt prefix would re-read it all.
+_TRIM_FRACTION = 0.6
 
 
 @runtime_checkable
 class EvictionStrategy(Protocol):
-    """Decides how many of the oldest visible messages no longer fit the context."""
+    """Decides how many of the oldest messages no longer fit the context."""
 
     def __call__(self, conversation: "Conversation") -> int:
         """Return the number of messages to evict; 0 when none need to go."""
@@ -27,36 +30,67 @@ class EvictionStrategy(Protocol):
 
 
 class MaxTurnsStrategy:
-    """Evicts whatever exceeds ``max_turns`` visible messages."""
+    """Keeps at most ``max_turns`` turns, cutting back to ``trim_to`` once that is exceeded.
 
-    def __init__(self, max_turns: int = 20):
+    A turn is a user message and everything said in answer to it, tool calls
+    included.  ``trim_to`` defaults to 60% of ``max_turns``, which leaves the
+    start of the prompt alone for several turns between cuts.
+    """
+
+    def __init__(self, max_turns: int = 10, *, trim_to: Optional[int] = None):
+        if max_turns < 1:
+            raise ValueError("max_turns must be at least 1.")
         self.max_turns = max_turns
+        self.trim_to = max(1, round(max_turns * _TRIM_FRACTION)) if trim_to is None else trim_to
+        if not 1 <= self.trim_to <= max_turns:
+            raise ValueError("trim_to must be between 1 and max_turns.")
 
     def __call__(self, conversation: "Conversation") -> int:
-        return max(0, conversation.visible_count() - self.max_turns)
+        turn_starts = [i for i, m in enumerate(conversation.history) if m.role is Message.Role.user]
+        if len(turn_starts) <= self.max_turns:
+            return 0
+        return turn_starts[-self.trim_to]
 
 
 class TokenBudgetStrategy:
-    """Evicts oldest messages until the prompt fits a token budget.
+    """Keeps the prompt within a token budget, cutting back to ``trim_to`` once that is exceeded.
 
-    The budget covers everything sent to the model: system prompt, tool
-    schemas and visible messages.  The newest message is never evicted.
+    Both figures cover everything sent to the model: system prompt, tool
+    schemas and messages.  ``trim_to`` defaults to the fixed part of the prompt
+    plus 60% of the room the budget leaves for messages.  The newest message is
+    never evicted.
     """
 
-    def __init__(self, count_tokens: Callable[[str], int], budget: int, per_message_overhead: int = 4):
+    def __init__(
+        self,
+        count_tokens: Callable[[str], int],
+        budget: int,
+        per_message_overhead: int = 4,
+        *,
+        trim_to: Optional[int] = None,
+    ):
+        if trim_to is not None and not 0 <= trim_to <= budget:
+            raise ValueError("trim_to must be between 0 and the budget.")
         self.budget = budget
+        self.trim_to = trim_to
         self.per_message_overhead = per_message_overhead
         self._count = lru_cache(maxsize=4096)(count_tokens)
 
     def __call__(self, conversation: "Conversation") -> int:
-        costs = [self._count(m.rendered) + self.per_message_overhead for m in conversation.visible]
-        total = sum(costs) + self._count(conversation.system_message)
+        costs = [self._count(m.rendered) + self.per_message_overhead for m in conversation.history]
+        fixed = self._count(conversation.system_prompt)
         if conversation.tools:
-            total += self._count(json.dumps([t.to_dict() for t in conversation.tools.values()]))
+            fixed += self._count(json.dumps([t.to_dict() for t in conversation.tools.values()]))
+        total = fixed + sum(costs)
+        if total <= self.budget:
+            return 0
 
+        target = self.trim_to
+        if target is None:
+            target = fixed + int(max(0, self.budget - fixed) * _TRIM_FRACTION)
         evict = 0
         for cost in costs[:-1]:
-            if total <= self.budget:
+            if total <= target:
                 break
             total -= cost
             evict += 1
@@ -89,29 +123,27 @@ class ContextHandler(ABC):
 
 
 class MemoryHandler(ContextHandler):
-    """Keeps the context window within bounds and bridges it to long-term memory.
+    """Keeps the context within bounds and bridges it to long-term memory.
 
-    Each turn it hides the messages the strategy no longer wants and, every
-    ``amortize_k`` such trims, drops the hidden ones for good.  With a memory
-    store it archives what it drops (``auto_archive``) and prefixes the newest
-    user message with up to ``recall_top_k`` related memories.
+    Each turn it evicts the messages the strategy no longer wants.  Given a
+    ``memory`` (anything with ``store`` and ``retrieve``) it archives what it
+    evicts (``auto_archive``) and prefixes the newest user message with up to
+    ``recall_top_k`` related memories.
     """
 
     def __init__(
         self,
         strategy: EvictionStrategy,
-        memory_store: Optional[MemoryStore] = None,
-        amortize_k: int = 4,
+        memory: Optional[Storage] = None,
+        *,
         auto_archive: bool = True,
         recall_top_k: int = 2,
     ):
         self.logger = get_logger(__name__)
         self.strategy = strategy
-        self.memory_store = memory_store
-        self.amortize_k = amortize_k
+        self.memory = memory
         self.auto_archive = auto_archive
         self.recall_top_k = recall_top_k
-        self._trims_since_drop = 0
         self._recalled_for: Optional[Message] = None
 
     def pre_process(self, conversation: "Conversation") -> bool:
@@ -121,38 +153,33 @@ class MemoryHandler(ContextHandler):
 
     def finalize(self, conversation: "Conversation") -> None:
         """Archive everything still held, so a reset or shutdown loses no history."""
-        self._archive(conversation.all_messages)
-        self._trims_since_drop = 0
+        self._archive(conversation.history)
         self._recalled_for = None
 
     def _trim(self, conversation: "Conversation") -> bool:
-        if not conversation.hide_oldest(self.strategy(conversation)):
-            return False
-        self._trims_since_drop += 1
-        if self._trims_since_drop >= self.amortize_k:
-            self._archive(conversation.drop_hidden())
-            self._trims_since_drop = 0
-        return True
+        evicted = conversation.evict_oldest(self.strategy(conversation))
+        self._archive(evicted)
+        return bool(evicted)
 
     def _archive(self, messages: Iterable[Message]) -> None:
-        if not (self.memory_store and self.auto_archive):
+        if self.memory is None or not self.auto_archive:
             return
         pending = [m for m in messages if m.role in _ARCHIVED_ROLES and m.content.strip() and not m.archived]
         try:
             for message in pending:
-                self.memory_store.store(message.content, role=message.role.value)
+                self.memory.store(message.content, role=message.role.value)
                 message.archived = True
         except Exception:  # noqa: BLE001 - a failing memory backend must not break the conversation
             self.logger.warning("Could not archive conversation turns to memory.", exc_info=True)
             return
         if pending:
-            self.logger.info("Archived %d conversation turns to memory.", len(pending))
+            self.logger.info("Archived %d messages to memory.", len(pending))
 
     def _recall(self, conversation: "Conversation") -> bool:
         """Attach related memories to the newest user message, once per message."""
         message = conversation.last_message
         if (
-            not self.memory_store
+            self.memory is None
             or self.recall_top_k <= 0
             or message is None
             or message.role is not Message.Role.user
@@ -163,12 +190,12 @@ class MemoryHandler(ContextHandler):
         self._recalled_for = message
 
         try:
-            records = self.memory_store.retrieve(message.content, top_k=self.recall_top_k)
+            records = self.memory.retrieve(message.content, top_k=self.recall_top_k)
         except Exception:  # noqa: BLE001 - see _archive
             self.logger.warning("Could not recall memories.", exc_info=True)
             return False
 
-        in_context = {m.content for m in conversation.visible}
+        in_context = {m.content for m in conversation.history}
         snippets = [r.text for r in records if r.text not in in_context]
         if not snippets:
             return False
