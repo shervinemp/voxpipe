@@ -1,52 +1,31 @@
+import os
+import tempfile
 import unittest
-from unittest.mock import patch
-import numpy as np
 
-from voxpipe.tts.model import TTSProviders
-import pytest
+import soundfile as sf
 
+from ._integration import requires_model, tts
 
-def _has_kokoro():
-    try:
-        from voxpipe.storage.manager import is_downloaded
-        return is_downloaded("Kokoro")
-    except Exception:
-        return False
-
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not _has_kokoro(), reason="Kokoro ONNX weights not downloaded"),
-]
+pytestmark = requires_model("Kokoro")
 
 
 class TestTTS(unittest.TestCase):
-    @patch("voxpipe.tts.model.AudioPlayer")
-    def test_generate_audio(self, mock_audio_player):
-        for provider_name in dir(TTSProviders):
-            if provider_name.startswith("__"):
-                continue
+    def test_generate_audio(self):
+        samples, sample_rate = tts().synthesize("This is a test sentence for the voice detection system.")
 
-            with self.subTest(provider=provider_name):
-                tts_cls = getattr(TTSProviders, provider_name)
+        self.assertGreater(len(samples), 0)
+        self.assertEqual(sample_rate, 24000)
 
-                tts_cls.download()
-                tts = tts_cls()
-                text = "This is a test sentence for the voice detection system."
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "speech.wav")
+            sf.write(output_path, samples, sample_rate)
+            self.assertGreater(os.path.getsize(output_path), 0)
 
-                samples, sample_rate = tts._synthesize(
-                    text, voice="af_heart", language="en-us",
-                    speed=1.0, interrupt=False,
-                )
+    def test_voice_and_speed_options(self):
+        normal, _ = tts().synthesize("The quick brown fox jumps over the lazy dog.")
+        fast, _ = tts().synthesize("The quick brown fox jumps over the lazy dog.", speed=1.5)
+        self.assertLess(len(fast), len(normal))
 
-                self.assertIsNotNone(samples)
-                self.assertGreater(len(samples), 0)
-                self.assertEqual(sample_rate, 24000)
-
-                import os, soundfile as sf
-                output_path = os.path.join(
-                    os.path.dirname(__file__),
-                    f"test_audio_{provider_name.lower()}.wav",
-                )
-                sf.write(output_path, samples, sample_rate)
-                self.assertTrue(os.path.exists(output_path))
+    def test_unpronounceable_text_is_silence(self):
+        samples, _ = tts().synthesize("*** \U0001F600 ***")
+        self.assertEqual(len(samples), 0)

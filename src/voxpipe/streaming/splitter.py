@@ -1,41 +1,7 @@
-from abc import ABC, abstractmethod
+"""Sentence splitting for streamed text, so speech can start before a reply is complete."""
+
 import re
-from typing import Any, Generator, Iterable
-
-
-class ConsumerProducer(ABC):
-    __allow_consume: bool = True
-    __allow_passthrough: bool = False
-    __passthrough: Any
-
-    def __call__(self, value):
-        if self.__allow_consume:
-            self._consume(value)
-        elif self.__allow_passthrough:
-            self._consume(self.__passthrough)
-
-    def __iter__(self):
-        yield from self._produce()
-
-    def enable(self):
-        self.__allow_consume = True
-        self.__allow_passthrough = False
-
-    def disable(self):
-        self.__allow_consume = False
-        self.__allow_passthrough = False
-
-    def disable_w_passthrough(self, value: Any = None):
-        self.__allow_consume = False
-        self.__allow_passthrough = True
-        self.__passthrough = value
-
-    @abstractmethod
-    def _consume(self, value): ...
-
-    @abstractmethod
-    def _produce(self) -> Generator: ...
-
+from typing import Generator, Iterable
 
 _ABBREVIATIONS = frozenset({
     "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st",
@@ -43,35 +9,59 @@ _ABBREVIATIONS = frozenset({
     "sen", "rep", "gov", "pres", "vp",
     "vs", "etc", "dept", "est", "approx", "min", "max",
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-})
+})  # fmt: skip
+
+# Sentence-ending punctuation, any closing quotes or brackets, then whitespace.
+_BOUNDARY = re.compile(r"[.!?…]+[\"'”’)\]]*\s+")
+# A boundary can straddle two chunks; this many trailing characters are rescanned to catch it.
+_RESCAN_CHARS = 8
 
 
-def stream_splitter(
-    text_stream: Iterable[str], min_len: int = 0
-) -> Generator[str, None, None]:
-    sentences = re.compile(r"[.!?][\"']*\s+")
+def _ends_sentence(buffer: str, match: re.Match) -> bool:
+    """Whether a boundary match really ends a sentence.
+
+    A period does not when it follows an abbreviation ("Dr."), sits inside an
+    initialism ("e.g."), or numbers a list item ("1." opening a line).
+    """
+    if not match.group().startswith("."):
+        return True
+    line = buffer[: match.start()].rsplit("\n", 1)[-1].strip()
+    token = (line.rsplit(None, 1)[-1:] or [""])[0].strip("\"'“‘([-").lower()
+    if token in _ABBREVIATIONS or "." in token:
+        return False
+    return not (token.isdigit() and line == token)
+
+
+def stream_splitter(text_stream: Iterable[str], min_len: int = 0) -> Generator[str, None, None]:
+    """Regroup a stream of text chunks into sentences, yielding each as soon as it is complete.
+
+    Nothing is yielded until ``min_len`` characters are buffered, which keeps a
+    very short opening fragment from being spoken on its own.  Whatever is left
+    when the stream ends is yielded as the last sentence.  Closing this
+    generator closes ``text_stream`` too, so stopping playback stops generation.
+    """
     buffer = ""
-    for chunk in text_stream:
-        buffer += chunk
-        if len(buffer) >= min_len:
-            search_start = max(0, len(buffer) - 100)
-            search_zone = buffer[search_start:]
-            for match in re.finditer(sentences, search_zone):
-                # Check if preceding word is an abbreviation (case-insensitive)
-                end = search_start + match.start()
-                word_start = buffer.rfind(" ", 0, end)
-                if word_start == -1:
-                    word_start = 0
-                else:
-                    word_start += 1
-                word = buffer[word_start:end].strip(' "\'"-').lower()
-                if word in _ABBREVIATIONS:
-                    continue
-                abs_end = search_start + match.end()
-                sentence = buffer[:end + 1]
-                buffer = buffer[abs_end:]
-                yield sentence.strip()
-                break
-    else:
-        if s := buffer.strip():
-            yield s
+    scan_from = 0
+    try:
+        for chunk in text_stream:
+            buffer += chunk
+            if len(buffer) < min_len:
+                continue
+            while True:
+                boundary = next(
+                    (m for m in _BOUNDARY.finditer(buffer, scan_from) if _ends_sentence(buffer, m)), None
+                )
+                if boundary is None:
+                    scan_from = max(0, len(buffer) - _RESCAN_CHARS)
+                    break
+                sentence = buffer[: boundary.end()].strip()
+                buffer = buffer[boundary.end() :]
+                scan_from = 0
+                if sentence:
+                    yield sentence
+        if buffer.strip():
+            yield buffer.strip()
+    finally:
+        close = getattr(text_stream, "close", None)
+        if close:
+            close()

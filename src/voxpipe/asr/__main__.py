@@ -1,54 +1,38 @@
-#!/usr/bin/env python3
-"""
-Main entry point for the Automatic Speech Recognition (ASR) system.
+"""Print what the configured recogniser hears: ``python -m voxpipe.asr``."""
 
-This script demonstrates how to set up and run the ASR pipeline.
-"""
-
+import argparse
 import sys
 
+from ..core.config import get_config
+from ..core.utils import get_logger, setup_logging
 from .model import ASRProviders
 
-from ..core.utils import setup_logging, get_logger
 
-
-def parse_asr_args():
-    """Parses command-line arguments for the ASR system."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Real-time, continuous ASR from microphone using ONNX models and VAD."
-    )
-
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Real-time, continuous ASR from the microphone.")
     parser.add_argument(
         "--sound-device",
-        type=int,
-        default=0,
-        help="Specific audio input device ID. "
+        default=None,
+        help="Input device index or name fragment (default: asr.sound_device from the configuration). "
         "Use `python -m sounddevice` to list devices.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
 
-
-def main():
-    """
-    Main function to run the ASR system.
-    """
     setup_logging(log_level="DEBUG", stream=sys.stdout)
     logger = get_logger(__name__)
 
-    args = parse_asr_args().__dict__
-    model = ASRProviders.ParakeetV2(**args)
+    config = get_config()
+    if args.sound_device is not None:
+        device = int(args.sound_device) if args.sound_device.isdigit() else args.sound_device
+        config = config.model_copy(update={"asr": config.asr.model_copy(update={"sound_device": device})})
 
     logger.info("Starting ASR...")
-    model.start()
-
-    try:
-        for text in model:
-            logger.info(text)
-    except KeyboardInterrupt:
-        logger.info("Stopping ASR...")
-        model.stop()
+    with ASRProviders.create(config=config) as recogniser:
+        try:
+            for text in recogniser:
+                logger.info(text)
+        except KeyboardInterrupt:
+            logger.info("Stopping ASR...")
 
 
 if __name__ == "__main__":

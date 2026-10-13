@@ -1,9 +1,7 @@
-"""
-Package initialization for Text-to-Speech (TTS).
+"""Text-to-speech: providers and interruptible audio playback."""
 
-This module exposes all the important classes from the TTS package.
-"""
+from .audio import AudioPlayer
+from .base import TTSBase
+from .model import Kokoro, TTSProviders
 
-from .model import TTSProviders
-
-__all__ = ["TTSProviders"]
+__all__ = ["AudioPlayer", "TTSBase", "Kokoro", "TTSProviders"]

@@ -1,171 +1,93 @@
-"""End-to-end pipeline integration tests with real model and TTS.
+"""End-to-end pipeline integration tests with the real model (no audio devices).
 
 Verifies:
-  - _callback completes within timing bounds (no hang)
-  - Lock is released after generator consumption
-  - Tool calls during knowledge queries don't deadlock
-  - Multiple utterances can be processed sequentially
+  - a turn completes within timing bounds (no hang)
+  - the session is free again after a reply, complete or cut short
+  - tool calls during knowledge queries don't deadlock
+  - multiple utterances can be processed sequentially
 
 These are non-deterministic (model output varies) and require the GGUF model.
 """
-import time, threading
+import time
 import unittest
-from unittest.mock import MagicMock
-
-import pytest
 
 from voxpipe.llm.conversation import Conversation
+from voxpipe.llm.model import GGUFLLM
 from voxpipe.llm.session import Session
+from voxpipe.llm.tools import Tool
+from voxpipe.pipeline.pipeline import Pipeline
 
+from .._integration import requires_model
 
-def _has_model():
-    try:
-        from voxpipe.storage.manager import is_downloaded
-        return is_downloaded("Gemma4E4B")
-    except Exception:
-        return False
+pytestmark = requires_model("Gemma4E4B")
 
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not _has_model(), reason="Gemma4E4B GGUF not downloaded"),
-]
+SYSTEM_PROMPT = (
+    "You are a voice-controlled game assistant. "
+    "Respond conversationally and naturally.\n\nRules:\n"
+    "- Call 'retrieve' when the user asks about entities.\n"
+    "- If the user seems incomplete, ask what they meant."
+)
 
 
 class TestPipelineIntegration(unittest.TestCase):
-    """Integration tests that run real model through pipeline callback."""
-
-    _pipe = None
+    """Integration tests that run the real model through the pipeline."""
 
     @classmethod
     def setUpClass(cls):
-        from voxpipe.llm import LLMProviders
-        from voxpipe.llm.tools import Tool
-        from voxpipe.core.config import config
-        import logging
-        logging.getLogger("voice_control").setLevel(logging.WARNING)
-
-        cls.llm = LLMProviders.create(
-            config.get("llm.backend"), config.get("llm.model")
-        )
+        cls.llm = GGUFLLM.from_config("Gemma4E4B")
         cls.tool = Tool.from_callable("retrieve", lambda q: "test result")
         cls.tool.instruction = "Call when asked about entities."
-        cls.default_conv = Conversation()
-        cls.default_conv.tools["retrieve"] = cls.tool
-        cls.default_conv.set_system_message(
-            "You are a voice-controlled game assistant. "
-            "Respond conversationally and naturally.\n\nRules:\n"
-            "- Call 'retrieve' when the user asks about entities.\n"
-            "- If the user seems incomplete, ask what they meant."
-        )
 
-    def _make_pipe(self, session):
-        from voxpipe.pipeline.pipeline import Pipeline
-        p = Pipeline.__new__(Pipeline)
-        p.logger = MagicMock()
-        p.events = MagicMock()
-        
-        p.memory = None
-        p._response_parts = []
-        p._llm_busy = False
-        p._interrupt_event = MagicMock()
-        p._interrupt_event.is_set.return_value = False
-        p._interrupted_at = None
-        p._match_command = MagicMock(return_value=False)
-        p.session = session
-        p.tts = None
-        return p
+    def _session(self, with_tool=True):
+        conversation = Conversation()
+        conversation.set_system_message(SYSTEM_PROMPT)
+        if with_tool:
+            conversation.tools = [self.tool]
+        session = Session(llm=self.llm, conversation=conversation)
+        self.addCleanup(session.close)
+        return session
+
+    def _timed(self, pipeline, *utterances):
+        started = time.monotonic()
+        for utterance in utterances:
+            pipeline.handle_transcript(utterance)
+        return time.monotonic() - started
 
     def test_greeting_completes_within_5s(self):
-        """A greeting must complete _callback in under 5 seconds (no hang)."""
-        conv = Conversation()
-        conv.tools["retrieve"] = self.tool
-        conv.set_system_message(self.default_conv._system)
-        session = Session(llm=self.llm, conversation=conv)
-        pipe = self._make_pipe(session)
-
-        t0 = time.monotonic()
-        pipe._callback("Hi, how are you?")
-        dt = time.monotonic() - t0
-
-        session.close()
-        self.assertLess(dt, 5.0, f"_callback took {dt:.1f}s — hung or too slow")
+        elapsed = self._timed(Pipeline(self._session()), "Hi, how are you?")
+        self.assertLess(elapsed, 5.0, f"turn took {elapsed:.1f}s — hung or too slow")
 
     def test_knowledge_query_handles_tool_call(self):
-        """A knowledge query may trigger a tool call; must not hang."""
-        conv = Conversation()
-        conv.tools["retrieve"] = self.tool
-        conv.set_system_message(self.default_conv._system)
-        session = Session(llm=self.llm, conversation=conv)
-        pipe = self._make_pipe(session)
-
-        t0 = time.monotonic()
-        pipe._callback("What is the Elden Ring?")
-        dt = time.monotonic() - t0
-
-        session.close()
-        self.assertLess(dt, 10.0, f"_callback took {dt:.1f}s — possible deadlock")
+        elapsed = self._timed(Pipeline(self._session()), "What is the Elden Ring?")
+        self.assertLess(elapsed, 10.0, f"turn took {elapsed:.1f}s — possible deadlock")
 
     def test_multiple_utterances_sequential(self):
-        """Multiple utterances in sequence must not deadlock."""
-        conv = Conversation()
-        conv.tools["retrieve"] = self.tool
-        conv.set_system_message(self.default_conv._system)
-        session = Session(llm=self.llm, conversation=conv)
-        pipe = self._make_pipe(session)
+        elapsed = self._timed(Pipeline(self._session()), "Hi.", "What is the Elden Ring?", "Thanks.")
+        self.assertLess(elapsed, 20.0, f"3 utterances took {elapsed:.1f}s")
 
-        t0 = time.monotonic()
-        pipe._callback("Hi.")
-        pipe._callback("What is the Elden Ring?")
-        pipe._callback("Thanks.")
-        dt = time.monotonic() - t0
+    def test_session_is_free_after_a_full_reply(self):
+        session = self._session(with_tool=False)
+        list(session("Hi."))
+        self.assertFalse(session._lock.locked())
 
-        session.close()
-        self.assertLess(dt, 20.0, f"3 utterances took {dt:.1f}s")
+    def test_session_is_free_after_a_reply_is_cut_short(self):
+        session = self._session(with_tool=False)
+        stream = session("Hi.")
+        next(stream, None)
+        stream.close()
+        self.assertFalse(session._lock.locked())
+        self.assertFalse(self.llm._lock.locked(), "the model must be released for the next turn")
 
-    def test_lock_released_after_generator(self):
-        """Generator lock must be released after session() call completes."""
-        conv = Conversation()
-        conv.set_system_message(self.default_conv._system)
-        session = Session(llm=self.llm, conversation=conv)
+    def test_interrupt_stops_the_reply(self):
+        session = self._session(with_tool=False)
+        pipeline = Pipeline(session)
+        pipeline.events.on("tts:start", lambda sentence: pipeline.interrupt())
 
-        gen = session("Hi.")
-        list(gen)
+        elapsed = self._timed(pipeline, "Tell me a very long story about a dragon.")
 
-        lock_held = session._lock.locked()
-        self.assertFalse(lock_held, "Lock still held after generator consumed")
-        session.close()
+        self.assertLess(elapsed, 5.0, f"turn took {elapsed:.1f}s despite the interrupt")
+        self.assertEqual(len(pipeline._response_parts), 1, "nothing is spoken after the interruption")
 
-    def test_lock_released_on_partial_consumption(self):
-        """Lock must be released even if generator is only partially consumed."""
-        conv = Conversation()
-        conv.set_system_message(self.default_conv._system)
-        session = Session(llm=self.llm, conversation=conv)
 
-        gen = session("Hi.")
-        try:
-            next(gen)
-        except StopIteration:
-            pass
-        finally:
-            gen.close()
-
-        lock_held = session._lock.locked()
-        self.assertFalse(lock_held, "Lock still held after partial iteration + close")
-        session.close()
-
-    def test_interrupt_stops_tts_chain(self):
-        """Setting interrupt_event mid-stream must break the callback loop."""
-        conv = Conversation()
-        conv.set_system_message(self.default_conv._system)
-        session = Session(llm=self.llm, conversation=conv)
-
-        pipe = self._make_pipe(session)
-        pipe._interrupt_event.is_set.side_effect = [False, True]
-
-        t0 = time.monotonic()
-        pipe._callback("Hi, how are you?")
-        dt = time.monotonic() - t0
-
-        session.close()
-        self.assertLess(dt, 5.0, f"_callback took {dt:.1f}s despite interrupt")
+if __name__ == "__main__":
+    unittest.main()

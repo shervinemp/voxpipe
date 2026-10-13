@@ -36,7 +36,6 @@ class TestEventEmitter(unittest.TestCase):
         self.em.emit("nonexistent")
 
     def test_async_handler(self):
-        import time
         results = []
         def slow():
             time.sleep(0.02)
