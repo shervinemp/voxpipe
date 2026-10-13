@@ -461,15 +461,6 @@ wheels = [
 ]
 
 [[package]]
-name = "emoji"
-version = "2.15.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a2/78/0d2db9382c92a163d7095fc08efff7800880f830a152cfced40161e7638d/emoji-2.15.0.tar.gz", hash = "sha256:eae4ab7d86456a70a00a985125a03263a5eac54cd55e51d7e184b1ed3b6757e4", size = 615483, upload-time = "2025-09-21T12:13:02.755Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e1/5e/4b5aaaabddfacfe36ba7768817bd1f71a7a810a43705e531f3ae4c690767/emoji-2.15.0-py3-none-any.whl", hash = "sha256:205296793d66a89d88af4688fa57fd6496732eb48917a87175a023c8138995eb", size = 608433, upload-time = "2025-09-21T12:13:01.197Z" },
-]
-
-[[package]]
 name = "espeakng-loader"
 version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2351,10 +2342,8 @@ wheels = [
 
 [[package]]
 name = "voxpipe"
-version = "0.1.1"
 source = { editable = "." }
 dependencies = [
-    { name = "emoji" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pydantic" },
@@ -2363,7 +2352,6 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "sounddevice" },
-    { name = "soundfile" },
 ]
 
 [package.optional-dependencies]
@@ -2375,7 +2363,6 @@ all = [
     { name = "llama-cpp-python" },
     { name = "onnx-asr" },
     { name = "onnxruntime" },
-    { name = "tiktoken" },
 ]
 asr = [
     { name = "onnx-asr" },
@@ -2386,11 +2373,11 @@ crisperwhisper = [
 ]
 dev = [
     { name = "pytest" },
+    { name = "soundfile" },
 ]
 gguf = [
     { name = "huggingface-hub" },
     { name = "llama-cpp-python" },
-    { name = "tiktoken" },
 ]
 litellm = [
     { name = "litellm" },
@@ -2403,7 +2390,6 @@ tts = [
 [package.metadata]
 requires-dist = [
     { name = "crisperwhisper", extras = ["transformers"], marker = "extra == 'crisperwhisper'", specifier = ">=2.0.1,<3" },
-    { name = "emoji", specifier = ">=2.14,<3" },
     { name = "huggingface-hub", marker = "extra == 'gguf'", specifier = "~=0.32.6" },
     { name = "huggingface-hub", marker = "extra == 'tts'", specifier = "~=0.32.6" },
     { name = "kokoro-onnx", marker = "extra == 'tts'", specifier = "~=0.4.9" },
@@ -2419,9 +2405,8 @@ requires-dist = [
     { name = "pyyaml", specifier = "~=6.0.2" },
     { name = "requests", specifier = ">=2.32,<3" },
     { name = "sounddevice", specifier = "~=0.5.2" },
-    { name = "soundfile", specifier = "~=0.13.1" },
-    { name = "tiktoken", marker = "extra == 'gguf'", specifier = ">=0.7,<1" },
-    { name = "voxpipe", extras = ["asr", "tts", "gguf", "litellm", "crisperwhisper"], marker = "extra == 'all'" },
+    { name = "soundfile", marker = "extra == 'dev'", specifier = "~=0.13.1" },
+    { name = "voxpipe", extras = ["asr", "crisperwhisper", "gguf", "litellm", "tts"], marker = "extra == 'all'" },
 ]
 provides-extras = ["asr", "crisperwhisper", "tts", "gguf", "litellm", "all", "dev"]
 
