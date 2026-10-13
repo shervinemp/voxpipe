@@ -1,12 +1,29 @@
-"""voxpipe: Modular Voice Pipeline Framework (ASR, LLM Tool Calling, Streaming TTS, RAG Storage)."""
+"""voxpipe: modular voice pipeline (ASR, LLM tool calling, streaming TTS, conversation memory).
 
-__version__ = "0.1.1"
+The package root exposes the LLM and storage building blocks, which need no
+audio hardware.  The audio pipeline lives in :mod:`voxpipe.pipeline` and is
+imported on demand.
+"""
 
-from voxpipe.llm import Session, SessionManager, SessionState, Conversation, ContextHandler, MemoryHandler, EvictionStrategy, MaxTurnsStrategy, Tool
-from voxpipe.storage import Record, Query, QueryInput, Retriever, Storer, Storage, RAMStorage, SQLiteStorage, MemoryStore
+__version__ = "0.2.0"
+
+from voxpipe.core import VoxpipeError
+from voxpipe.llm import (
+    ContextHandler,
+    Conversation,
+    EvictionStrategy,
+    MaxTurnsStrategy,
+    MemoryHandler,
+    Session,
+    SessionManager,
+    SessionState,
+    Tool,
+)
+from voxpipe.storage import MemoryStore, Query, QueryInput, RAMStorage, Record, Retriever, SQLiteStorage, Storage, Storer
 
 __all__ = [
     "__version__",
+    "VoxpipeError",
     "Session",
     "SessionManager",
     "SessionState",

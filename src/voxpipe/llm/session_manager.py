@@ -1,25 +1,42 @@
-"""Centralized SessionManager for organizing, listing, saving, loading, and deleting sessions."""
+"""SessionManager: saves, lists, loads, deletes, exports and imports sessions on disk."""
 
 import json
 import os
+import re
 import shutil
 import time
 import zipfile
 from typing import Any, Dict, List, Optional
 
-from voxpipe.core.utils import get_logger
+from ..core.exceptions import VoxpipeError
+from ..core.utils import get_logger
 from .model import LLM
 from .session import Session
 
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_MANIFEST_FILE = "manifest.json"
+_STATE_FILE = "state.json"
+_ARCHIVE_FILES = frozenset({_MANIFEST_FILE, _STATE_FILE, "conversation.json", "kv_cache.bin"})
+_MAX_IMPORT_BYTES = 4 * 1024**3
+
 
 class SessionManager:
-    """Centralized manager for isolated session directories, manifests, and session lifecycles."""
+    """Keeps each session in its own directory under ``<root_dir>/sessions``."""
 
     def __init__(self, root_dir: str = "voxpipe_data"):
         self.logger = get_logger(__name__)
         self.root_dir = root_dir
         self.sessions_dir = os.path.join(root_dir, "sessions")
         os.makedirs(self.sessions_dir, exist_ok=True)
+
+    def _session_path(self, session_id: str) -> str:
+        """Directory for ``session_id``, refusing ids that could name anything outside the sessions folder."""
+        if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id) or ".." in session_id:
+            raise VoxpipeError(
+                f"Invalid session id {session_id!r}: use 1-128 letters, digits, '.', '_' or '-', "
+                "starting with a letter or digit."
+            )
+        return os.path.join(self.sessions_dir, session_id)
 
     def save_session(
         self,
@@ -29,100 +46,122 @@ class SessionManager:
         save_kv_cache: bool = False,
         meta: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Save session into an isolated directory with manifest provenance."""
-        session_path = os.path.join(self.sessions_dir, session_id)
+        """Save a session into its directory and write a manifest describing it."""
+        session_path = self._session_path(session_id)
         os.makedirs(session_path, exist_ok=True)
-
-        # 1. Delegate core session save
         session.save(session_path, save_kv_cache=save_kv_cache)
 
-        # 2. Write manifest.json
+        now = time.time()
+        manifest_path = os.path.join(session_path, _MANIFEST_FILE)
         manifest = {
             "session_id": session_id,
-            "created_at": getattr(session, "_created_at", time.time()),
-            "saved_at": time.time(),
+            "created_at": self._read_manifest(manifest_path).get("created_at", now),
+            "saved_at": now,
             "llm_provider": type(session.llm).__name__,
-            "max_turns": getattr(session.context_handler, "max_turns", 20),
             "custom": meta or {},
         }
-        manifest_path = os.path.join(session_path, "manifest.json")
-        with open(manifest_path, "w") as f:
+        with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
 
         self.logger.info("Saved session '%s' to %s", session_id, session_path)
         return session_path
 
-    def load_session(self, session_id: str, llm: LLM) -> Session:
-        """Load a session by its unique ID."""
-        session_path = os.path.join(self.sessions_dir, session_id)
-        if not os.path.exists(session_path):
+    def load_session(self, session_id: str, llm: LLM, **session_kwargs) -> Session:
+        """Load a saved session; keyword arguments are passed to the Session constructor."""
+        session_path = self._session_path(session_id)
+        if not os.path.isdir(session_path):
             raise FileNotFoundError(f"Session '{session_id}' not found in {self.sessions_dir}")
 
-        session = Session.load(session_path, llm=llm)
-        session_id_attr = session_id
-        setattr(session, "session_id", session_id_attr)
+        session = Session.load(session_path, llm=llm, session_id=session_id, **session_kwargs)
         self.logger.info("Loaded session '%s' from %s", session_id, session_path)
         return session
 
     def list_sessions(self) -> List[Dict[str, Any]]:
-        """List all saved sessions and their manifest metadata."""
+        """Manifest of every saved session; unreadable ones are flagged rather than skipped."""
         sessions = []
-        if not os.path.exists(self.sessions_dir):
-            return sessions
-
-        for s_id in os.listdir(self.sessions_dir):
-            session_path = os.path.join(self.sessions_dir, s_id)
-            if os.path.isdir(session_path):
-                manifest_path = os.path.join(session_path, "manifest.json")
-                if os.path.exists(manifest_path):
-                    try:
-                        with open(manifest_path) as f:
-                            sessions.append(json.load(f))
-                    except Exception:
-                        sessions.append({"session_id": s_id, "corrupted": True})
-                else:
-                    sessions.append({"session_id": s_id, "manifest": False})
+        for entry in sorted(os.listdir(self.sessions_dir)):
+            session_path = os.path.join(self.sessions_dir, entry)
+            if not os.path.isdir(session_path):
+                continue
+            manifest_path = os.path.join(session_path, _MANIFEST_FILE)
+            if not os.path.exists(manifest_path):
+                sessions.append({"session_id": entry, "manifest": False})
+                continue
+            manifest = self._read_manifest(manifest_path)
+            sessions.append(manifest or {"session_id": entry, "corrupted": True})
         return sessions
 
     def delete_session(self, session_id: str) -> bool:
-        """Safely delete an isolated session directory."""
-        session_path = os.path.join(self.sessions_dir, session_id)
-        if os.path.exists(session_path):
-            shutil.rmtree(session_path)
-            self.logger.info("Deleted session '%s'", session_id)
-            return True
-        return False
+        """Delete a session's directory. Returns False if there was none."""
+        session_path = self._session_path(session_id)
+        if not os.path.isdir(session_path):
+            return False
+        shutil.rmtree(session_path)
+        self.logger.info("Deleted session '%s'", session_id)
+        return True
 
     def export_zip(self, session_id: str, zip_path: str) -> str:
-        """Export an isolated session directory to a clean zip package."""
-        session_path = os.path.join(self.sessions_dir, session_id)
-        if not os.path.exists(session_path):
+        """Pack a session's files into a zip archive."""
+        session_path = self._session_path(session_id)
+        if not os.path.isdir(session_path):
             raise FileNotFoundError(f"Session '{session_id}' not found")
 
         os.makedirs(os.path.dirname(zip_path) or ".", exist_ok=True)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(session_path):
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    arcname = os.path.relpath(full_path, session_path)
-                    zf.write(full_path, arcname)
+            for name in sorted(_ARCHIVE_FILES):
+                file_path = os.path.join(session_path, name)
+                if os.path.isfile(file_path):
+                    zf.write(file_path, name)
 
         self.logger.info("Exported session '%s' to zip %s", session_id, zip_path)
         return zip_path
 
     def import_zip(self, zip_path: str, session_id: Optional[str] = None) -> str:
-        """Import a session from a .zip archive package into the sessions directory."""
+        """Import a session archive, replacing any session already stored under the id.
+
+        The archive is treated as untrusted: only the known session files are
+        extracted, its total size is capped, and any tool permissions or pending
+        tool calls it carries are dropped, so importing a conversation can never
+        pre-authorise an action.
+        """
         if not os.path.exists(zip_path):
             raise FileNotFoundError(f"Zip file '{zip_path}' not found")
-
-        if not session_id:
-            session_id = os.path.splitext(os.path.basename(zip_path))[0]
-
-        session_path = os.path.join(self.sessions_dir, session_id)
-        os.makedirs(session_path, exist_ok=True)
+        session_id = session_id or os.path.splitext(os.path.basename(zip_path))[0]
+        session_path = self._session_path(session_id)
 
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(session_path)
+            members = [info for info in zf.infolist() if not info.is_dir()]
+            unexpected = sorted(info.filename for info in members if info.filename not in _ARCHIVE_FILES)
+            if unexpected:
+                raise VoxpipeError(f"Session archive contains unexpected files: {', '.join(unexpected)}")
+            if sum(info.file_size for info in members) > _MAX_IMPORT_BYTES:
+                raise VoxpipeError("Session archive is too large to import.")
 
+            if os.path.isdir(session_path):
+                shutil.rmtree(session_path)
+            os.makedirs(session_path)
+            zf.extractall(session_path, members=members)
+
+        self._strip_tool_state(os.path.join(session_path, _STATE_FILE))
         self.logger.info("Imported zip '%s' into session '%s'", zip_path, session_id)
         return session_id
+
+    @staticmethod
+    def _strip_tool_state(state_path: str) -> None:
+        if not os.path.exists(state_path):
+            return
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if state.pop("tools", None) is not None:
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+
+    @staticmethod
+    def _read_manifest(manifest_path: str) -> Dict[str, Any]:
+        """The manifest's contents, or an empty dict if it is missing or unreadable."""
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return manifest if isinstance(manifest, dict) else {}

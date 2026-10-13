@@ -1,581 +1,649 @@
+import asyncio
+import os
+import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock
 
-from voxpipe.llm.tools import ToolCall
+from voxpipe.core.exceptions import LLMError, ToolError
+from voxpipe.llm.conversation import Conversation
+from voxpipe.llm.decoders import GeneralDecoder
+from voxpipe.llm.session import Session, TextDelta, ToolCallEvent, ToolCaller, ToolResultEvent
+from voxpipe.llm.tools import Tool, ToolCall, ToolChoice, ToolResult, permission
+
+from ._fakes import ScriptedLLM
 
 
-class TestSessionIntegration(unittest.TestCase):
-    """End-to-end Session flow with a mocked LLM streaming output."""
+def gemma_call(name, args="{}"):
+    """The chunks a Gemma-style model streams for one tool call."""
+    return ["<|tool_call>", f"call:{name}{args}", "<tool_call|>"]
 
-    def _make_mock_llm(self, tokens: list[str], decoder=None):
-        from voxpipe.llm.decoders import GeneralDecoder
-        from voxpipe.llm.model import LLM
-        from voxpipe.llm.context import MaxTurnsStrategy
-        _decoder = decoder or GeneralDecoder()
 
-        class MockLLM(LLM):
-            decoder = _decoder
-            def _infer(self, conversation, *, session_state, **kwargs):
-                yield from tokens
-            def create_context_strategy(self, max_turns=20):
-                return MaxTurnsStrategy(max_turns)
-            def count_tokens(self, text):
-                return max(1, len(text) // 2)
+def tool_messages(session):
+    return [m["content"] for m in session.conversation.messages if m["role"] == "tool"]
 
-        llm = MockLLM()
-        llm.logger = MagicMock()
-        return llm
 
-    def _collect(self, gen):
-        text, calls = [], []
-        for item in gen:
-            if isinstance(item, ToolCall):
-                calls.append((item.name, item.arguments))
-            elif isinstance(item, str):
-                text.append(item)
-        return text, calls
+class SessionCase(unittest.TestCase):
+    def make(self, *scripts, tools=(), decoder=None, **session_kwargs):
+        """A session over a scripted LLM; pass a decoder when the scripts hold tagged tool-call text."""
+        llm = ScriptedLLM(*scripts, decoder=decoder)
+        session = Session(llm=llm, **session_kwargs)
+        session.conversation.tools = list(tools)
+        self.addCleanup(session.close)
+        return session, llm
 
-    def test_session_plain_text(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm(["Hello! ", "How ", "can ", "I ", "help?"])
-        sess = Session(llm=llm)
-        text, calls = self._collect(sess("Hi."))
-        self.assertEqual("".join(text), "Hello! How can I help?")
-        self.assertEqual(calls, [])
-        sess.close()
 
-    def test_session_with_tool_call(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolResult
-        from voxpipe.llm.conversation import Conversation
-        tool_results = []
+class TestSessionTurns(SessionCase):
+    """Text replies, streaming and history."""
+
+    def test_plain_text(self):
+        session, _ = self.make(["Hello! ", "How ", "can ", "I ", "help?"])
+        self.assertEqual("".join(session("Hi.")), "Hello! How can I help?")
+        self.assertEqual(
+            session.conversation.messages,
+            [{"role": "user", "content": "Hi."}, {"role": "assistant", "content": "Hello! How can I help?"}],
+        )
+
+    def test_text_is_streamed_chunk_by_chunk(self):
+        session, _ = self.make(["Hello ", "there. ", "How ", "are ", "you?"])
+        self.assertEqual(list(session("hi")), ["Hello ", "there. ", "How ", "are ", "you?"])
+
+    def test_continue_without_query(self):
+        session, _ = self.make(["answer"])
+        session.conversation.add_user_message("question")
+        self.assertEqual("".join(session()), "answer")
+        self.assertEqual([m["role"] for m in session.conversation.messages], ["user", "assistant"])
+
+    def test_empty_reply_records_nothing(self):
+        session, _ = self.make([])
+        self.assertEqual(list(session("hello")), [])
+        self.assertEqual([m["role"] for m in session.conversation.messages], ["user"])
+
+    def test_unanswered_user_message_is_extended_not_duplicated(self):
+        session, llm = self.make([], ["Paris is sunny, London is wet."])
+        list(session("what's the weather in Paris"))
+        list(session("and in London?"))
+        self.assertEqual(
+            llm.calls[1].messages, [{"role": "user", "content": "what's the weather in Paris\nand in London?"}]
+        )
+
+    def test_context_is_shown_to_the_model_but_not_stored_as_content(self):
+        session, llm = self.make(["ok"])
+        list(session("stop", context="(User interrupted you.)"))
+        self.assertEqual(llm.calls[0].messages[0]["content"], "(User interrupted you.)\nstop")
+        self.assertEqual(session.conversation.all_messages[0].content, "stop")
+
+    def test_generation_parameters_reach_the_llm(self):
+        session, llm = self.make(["ok"])
+        list(session("hi", temperature=0.2))
+        self.assertEqual(llm.calls[0].kwargs, {"temperature": 0.2})
+
+    def test_session_state_reaches_the_llm(self):
+        session, llm = self.make(["ok"])
+        list(session("hi"))
+        self.assertIs(llm.calls[0].state, session.state)
+
+    def test_llm_failure_rolls_the_turn_back(self):
+        def explode(conversation):
+            raise RuntimeError("backend down")
+
+        session, _ = self.make(["first reply"], explode)
+        list(session("one"))
+        with self.assertRaises(LLMError):
+            list(session("two"))
+        self.assertEqual([m["content"] for m in session.conversation.messages], ["one", "first reply"])
+        self.assertFalse(session._lock.locked())
+
+
+class TestSessionTools(SessionCase):
+    """Tool dispatch, result handling and the pass budget."""
+
+    def test_tool_call_then_answer(self):
+        seen = []
+
         def my_tool(query: str) -> ToolResult:
-            tool_results.append(query)
+            seen.append(query)
             return ToolResult(result={"result": f"result for {query}"})
-        tokens = [
-            "Let me check...",
-            "<|tool_call>", 'call:my_tool{query:<|"|>hello<|"|>}', "<tool_call|>",
+
+        session, llm = self.make(
+            ["Let me check...", *gemma_call("my_tool", '{query:<|"|>hello<|"|>}')],
+            ["Final answer."],
+            tools=[Tool.from_callable("my_tool", my_tool)],
+            decoder=GeneralDecoder(),
+        )
+        self.assertEqual("".join(session("find hello")), "Let me check...Final answer.")
+        self.assertEqual(seen, ["hello"])
+        self.assertEqual([c.tool_choice for c in llm.calls], ["auto", "none"])
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in session.conversation.messages],
+            [
+                ("user", "find hello"),
+                ("assistant", "Let me check..."),
+                ("tool", 'my_tool: {"result": "result for hello"}'),
+                ("tool", "Now, generate an answer based only on the returned responses."),
+                ("assistant", "Final answer."),
+            ],
+        )
+
+    def test_openai_format_pairs_calls_with_results(self):
+        session, llm = self.make(
+            [ToolCall("lookup", {"q": "x"}, id="call_1")],
+            ["done"],
+            tools=[Tool.from_callable("lookup", lambda q: {"answer": 42})],
+        )
+        list(session("go"))
+        second_pass = llm.calls[1].openai_messages
+        self.assertEqual(second_pass[1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(second_pass[1]["tool_calls"][0]["function"], {"name": "lookup", "arguments": '{"q": "x"}'})
+        self.assertEqual(second_pass[2]["role"], "tool")
+        self.assertEqual(second_pass[2]["tool_call_id"], "call_1")
+        self.assertIn('{"answer": 42}', second_pass[2]["content"])
+        self.assertIn("Now, generate an answer", second_pass[2]["content"], "notes fold into the tool result")
+        self.assertEqual(len(second_pass), 3)
+
+    def test_same_tool_called_twice_keeps_both_results(self):
+        session, _ = self.make(
+            [ToolCall("weather", {"city": "Paris"}), ToolCall("weather", {"city": "London"})],
+            ["ok"],
+            tools=[Tool.from_callable("weather", lambda city: {"city": city})],
+        )
+        list(session("weather in paris and london"))
+        self.assertEqual(tool_messages(session)[:2], ['weather: {"city": "Paris"}', 'weather: {"city": "London"}'])
+
+    def test_async_tool(self):
+        async def lookup(q: str):
+            await asyncio.sleep(0)
+            return {"answer": 42}
+
+        session, _ = self.make(
+            [ToolCall("lookup", {"q": "x"})], ["final"], tools=[Tool.from_callable("lookup", lookup)]
+        )
+        self.assertEqual(list(session("go")), ["final"])
+        self.assertEqual(tool_messages(session)[0], 'lookup: {"answer": 42}')
+
+    def test_tool_speech_is_the_answer(self):
+        """A tool that says its own result needs no second model pass."""
+        session, llm = self.make(
+            [ToolCall("lights", {})],
+            ["The lights have been turned on for you."],
+            tools=[Tool.from_callable("lights", lambda: ToolResult({"ok": True}, speech="Lights are on."))],
+        )
+        self.assertEqual(list(session("lights on")), ["Lights are on."])
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(session.conversation.messages[-1], {"role": "assistant", "content": "Lights are on."})
+
+    def test_mixed_speech_and_silent_tools_get_one_assistant_turn(self):
+        tools = [
+            Tool.from_callable("lights", lambda: ToolResult({"ok": True}, speech="Lights are on.")),
+            Tool.from_callable("weather", lambda: {"sky": "clear"}),
         ]
-        llm = self._make_mock_llm(tokens)
-        conv = Conversation()
-        conv.set_system_message("You are a helpful assistant.")
-        conv.tools["my_tool"] = Tool.from_callable("my_tool", my_tool)
-        conv.add_user_message("find hello")
-        sess = Session(llm=llm, conversation=conv)
-        text, calls = self._collect(sess())
-        self.assertEqual(len(tool_results), 1)
-        self.assertEqual(tool_results[0], "hello")
-        msgs = sess.conversation.messages
-        tool_msgs = [m for m in msgs if m["role"] == "tool"]
-        self.assertIn("result for hello", tool_msgs[0]["content"])
-        sess.close()
+        session, llm = self.make([ToolCall("lights", {}), ToolCall("weather", {})], ["And it is clear out."], tools=tools)
+        self.assertEqual(list(session("lights and weather")), ["Lights are on.", "And it is clear out."])
+        self.assertEqual(
+            session.conversation.messages[-1],
+            {"role": "assistant", "content": "Lights are on. And it is clear out."},
+        )
 
-    def test_session_second_pass_uses_tool_results(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolResult
-        from voxpipe.llm.conversation import Conversation
-        from voxpipe.llm.decoders import GeneralDecoder
-
-        class TwoPassLLM:
-            decoder = GeneralDecoder()
-            _call_count = 0
-            def create_context_strategy(self, max_turns=20):
-                from voxpipe.llm.context import MaxTurnsStrategy
-                return MaxTurnsStrategy(max_turns)
-            def count_tokens(self, text):
-                return max(1, len(text) // 2)
-            def __call__(self, conversation, session_state=None, **kwargs):
-                self._call_count += 1
-                if self._call_count == 1:
-                    tokens = ["<|tool_call>", 'call:retrieve{query:<|"|>test<|"|>}', "<tool_call|>"]
-                else:
-                    tokens = ["Based on retrieval, the answer is 42."]
-                yield from self.decoder(iter(tokens))
-
-        def retrieve(query: str) -> ToolResult:
-            return ToolResult(result={"answer": "42"})
-        conv = Conversation()
-        conv.set_system_message("You are a helpful assistant.")
-        conv.tools["retrieve"] = Tool.from_callable("retrieve", retrieve)
-        conv.add_user_message("what is the answer?")
-        llm = TwoPassLLM()
-        llm.logger = MagicMock()
-        sess = Session(llm=llm, conversation=conv)
-        text, calls = self._collect(sess())
-        self.assertIn("Based on retrieval, the answer is 42.", "".join(text))
-        sess.close()
-
-    def test_session_recovers_from_tool_error(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool
-        from voxpipe.llm.conversation import Conversation
+    def test_tool_error_is_reported_to_the_model(self):
         def broken_tool(**kwargs):
             raise RuntimeError("tool exploded")
-        tokens = ["<|tool_call>", 'call:broken_tool{x:1}', "<tool_call|>"]
-        llm = self._make_mock_llm(tokens)
-        conv = Conversation()
-        conv.tools["broken_tool"] = Tool.from_callable("broken_tool", broken_tool)
-        conv.add_user_message("do something")
-        sess = Session(llm=llm, conversation=conv)
-        text, calls = self._collect(sess())
-        msgs = sess.conversation.messages
-        self.assertTrue(any("Tool Error" in m["content"] for m in msgs if m["role"] == "tool"))
-        sess.close()
 
-    def test_session_unknown_tool(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.conversation import Conversation
-        # Tool name not in conversation.tools — triggers retry, then fallback
-        tokens = ["<|tool_call>", 'call:nonexistent{args:{}}', "<tool_call|>"]
-        llm = self._make_mock_llm(tokens)
-        conv = Conversation()
-        conv.add_user_message("test")
-        sess = Session(llm=llm, conversation=conv)
-        text, calls = self._collect(sess())
-        combined = "".join(text)
-        self.assertIn("persistent error", combined)
+        session, _ = self.make(
+            gemma_call("broken_tool", "{x:1}"),
+            ["Sorry."],
+            tools=[Tool.from_callable("broken_tool", broken_tool)],
+            decoder=GeneralDecoder(),
+        )
+        list(session("do something"))
+        self.assertEqual(
+            tool_messages(session),
+            [
+                "broken_tool: Tool Error: tool exploded",
+                "One or more tools failed to execute. "
+                "Please inform the user of the error and suggest an alternative action.",
+            ],
+        )
 
-    def test_session_lock_serializes_access(self):
-        from voxpipe.llm.session import Session
-        import threading, time
-        call_order = []
+    def test_unknown_tool(self):
+        session, _ = self.make(gemma_call("nonexistent", "{args:{}}"), decoder=GeneralDecoder())
+        self.assertIn("persistent error", "".join(session("test")))
+        self.assertIn("'nonexistent' is not a recognized tool", tool_messages(session)[0])
 
-        class LockTestLLM:
-            def create_context_strategy(self, max_turns=20):
-                from voxpipe.llm.context import MaxTurnsStrategy
-                return MaxTurnsStrategy(max_turns)
-            def count_tokens(self, text):
-                return max(1, len(text) // 2)
-            def __call__(self, conversation, session_state=None, **kwargs):
-                call_order.append("enter")
-                time.sleep(0.05)
-                call_order.append("exit")
-                return iter(["x"])
+    def test_unparseable_tool_call(self):
+        session, _ = self.make(gemma_call("bad_tool", "{invalid!!!}}"), decoder=GeneralDecoder())
+        self.assertIn("persistent error", "".join(session("do it")))
+        self.assertIn("Could not parse tool call", tool_messages(session)[0])
 
-        llm = LockTestLLM()
-        llm.logger = MagicMock()
-        sess = Session(llm=llm)
-        results = []
-        def run():
-            for chunk in sess("hello"):
-                results.append(chunk)
-        t1 = threading.Thread(target=run)
-        t2 = threading.Thread(target=run)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-        self.assertEqual(call_order, ["enter", "exit", "enter", "exit"])
-        sess.close()
+    def test_tool_call_during_answer_pass_is_ignored(self):
+        ran = []
+        session, _ = self.make(
+            ["Here you go. ", ToolCall("t", {})],
+            tools=[Tool.from_callable("t", lambda: ran.append(1))],
+            max_tool_iterations=0,
+        )
+        self.assertEqual(list(session("hi")), ["Here you go. "])
+        self.assertEqual(ran, [])
 
-    def test_session_retry_on_parse_error(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.conversation import Conversation
-        tokens = ["<|tool_call>", "call:bad_tool{invalid!!!}}", "<tool_call|>"]
-        llm = self._make_mock_llm(tokens)
-        conv = Conversation()
-        conv.add_user_message("do it")
-        sess = Session(llm=llm, conversation=conv)
-        text, calls = self._collect(sess())
-        self.assertIn("persistent error", "".join(text))
-        sess.close()
-
-    def test_session_empty_query(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm)
-        text, calls = self._collect(sess())
-        sess.close()
-
-    def test_session_gather_timeout(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool
-        from voxpipe.llm.conversation import Conversation
-        import time
-
+    def test_tool_timeout(self):
         def slow_tool(**kwargs):
-            time.sleep(20)
+            time.sleep(1.5)
             return "too late"
 
-        tokens = ["<|tool_call>", 'call:slow_tool{x:1}', "<tool_call|>"]
-        llm = self._make_mock_llm(tokens)
-        conv = Conversation()
-        conv.tools["slow_tool"] = Tool.from_callable("slow_tool", slow_tool)
-        conv.add_user_message("do slow")
-        sess = Session(llm=llm, conversation=conv)
-        t0 = time.monotonic()
-        text, calls = self._collect(sess())
-        elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 15)
-        msgs = sess.conversation.messages
-        self.assertTrue(any("Tool Error" in m["content"] for m in msgs if m["role"] == "tool"))
-        sess.close()
+        session, _ = self.make(
+            gemma_call("slow_tool", "{x:1}"),
+            ["Sorry."],
+            tools=[Tool.from_callable("slow_tool", slow_tool)],
+            decoder=GeneralDecoder(),
+            tool_timeout=0.2,
+        )
+        started = time.monotonic()
+        list(session("do slow"))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(tool_messages(session)[0], "slow_tool: Tool Error: slow_tool timed out")
 
-    def test_toolcall_passthrough_ge(self):
-        from voxpipe.llm.decoders import GemmaE2BDecoder
-        d = GemmaE2BDecoder()
-        tc = ToolCall(name="direct", arguments={"from": "test"})
-        result = list(d(iter([tc])))
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].name, "direct")
+    def test_tools_in_one_pass_run_concurrently(self):
+        def nap():
+            time.sleep(0.3)
+            return {"ok": True}
+
+        session, _ = self.make(
+            [ToolCall("nap", {}), ToolCall("nap", {}), ToolCall("nap", {})],
+            ["done"],
+            tools=[Tool.from_callable("nap", nap)],
+        )
+        started = time.monotonic()
+        list(session("go"))
+        self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_events_expose_tool_activity(self):
+        session, _ = self.make(
+            ["Checking. ", ToolCall("lookup", {"q": "x"})],
+            ["Done."],
+            tools=[Tool.from_callable("lookup", lambda q: {"answer": 42})],
+        )
+        events = list(session.events("go"))
+        self.assertEqual([type(e) for e in events], [TextDelta, ToolCallEvent, ToolResultEvent, TextDelta])
+        self.assertEqual(events[1].call.name, "lookup")
+        self.assertEqual(events[2].result.raw_result, {"answer": 42})
+        self.assertIsNone(events[2].error)
 
 
-class TestSessionMethods(unittest.TestCase):
-    """Session methods not covered by integration tests."""
+class TestSessionConcurrency(SessionCase):
+    """Turn serialisation, cancellation and reset."""
 
-    def _make_mock_llm(self, tokens):
-        from voxpipe.llm.model import LLM
-        from voxpipe.llm.decoders import GeneralDecoder
-        from voxpipe.llm.context import MaxTurnsStrategy
-        _decoder = GeneralDecoder()
-        class M(LLM):
-            decoder = _decoder
-            def _infer(self, conversation, *, session_state, **kwargs):
-                yield from tokens
-            def create_context_strategy(self, max_turns=20):
-                return MaxTurnsStrategy(max_turns)
-            def count_tokens(self, text):
-                return max(1, len(text) // 2)
-        llm = M()
-        llm.logger = MagicMock()
-        return llm
+    def test_turns_do_not_interleave(self):
+        order = []
 
-    def test_complete_once_returns_string(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm(["hello world"])
-        sess = Session(llm=llm)
-        result = sess.complete_once("test", system="sys")
-        self.assertEqual(result, "hello world")
-        sess.close()
+        def slow(conversation):
+            order.append("enter")
+            time.sleep(0.05)
+            order.append("exit")
+            return ["x"]
 
-    def test_complete_once_empty_query_raises(self):
-        from voxpipe.llm.session import Session, LLMError
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm)
-        with self.assertRaises(LLMError):
-            sess.complete_once("")
-        with self.assertRaises(LLMError):
-            sess.complete_once("   ")
-        sess.close()
-
-    def test_complete_once_does_not_mutate_conversation(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.conversation import Conversation
-        conv = Conversation()
-        conv.add_user_message("persistent")
-        llm = self._make_mock_llm(["result"])
-        sess = Session(llm=llm, conversation=conv)
-        sess.complete_once("isolated")
-        self.assertEqual(len(conv._messages), 1)
-        self.assertEqual(conv.messages[-1]["content"], "persistent")
-        sess.close()
-
-    def test_complete_once_with_system(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm(["answer"])
-        sess = Session(llm=llm)
-        result = sess.complete_once("q", system="You are helpful.")
-        self.assertEqual(result, "answer")
-        sess.close()
-
-    def test_reset_clears_conversation_and_state(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.conversation import Conversation
-        conv = Conversation()
-        conv.add_user_message("old")
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm, conversation=conv)
-        sess._session_state["k"] = "v"
-        sess.reset()
-        self.assertEqual(len(sess.conversation._messages), 0)
-        self.assertEqual(sess._session_state, {})
-        sess.close()
-
-    def test_reset_with_new_conversation(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.conversation import Conversation
-        new_conv = Conversation()
-        new_conv.add_user_message("new")
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm)
-        sess.reset(new_conv)
-        self.assertEqual(len(sess.conversation._messages), 1)
-        self.assertEqual(sess.conversation.messages[-1]["content"], "new")
-        sess.close()
-
-    def test_save_load_round_trip(self):
-        import tempfile, os, json
-        from voxpipe.llm.session import Session
-        from pathlib import Path
-
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm)
-        sess.conversation.add_user_message("hello")
-        sess._session_state["note"] = "test"
-
-        with tempfile.TemporaryDirectory() as tmp:
-            sess.save(tmp)
-            self.assertTrue(os.path.exists(os.path.join(tmp, "conversation.json")))
-            self.assertTrue(os.path.exists(os.path.join(tmp, "state.json")))
-
-            sess2 = Session.load(tmp, llm=llm)
-            self.assertEqual(len(sess2.conversation._messages), 1)
-            self.assertEqual(sess2.conversation.messages[-1]["content"], "hello")
-            self.assertEqual(sess2._session_state.get("note"), "test")
-        sess.close()
-        sess2.close()
-
-    def test_save_kv_cache(self):
-        import tempfile, os
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm)
-        sess._session_state["model_state"] = b"\x00\x01\x02"
-        with tempfile.TemporaryDirectory() as tmp:
-            sess.save(tmp, save_kv_cache=True)
-            self.assertTrue(os.path.exists(os.path.join(tmp, "kv_cache.bin")))
-        sess.close()
-
-    def test_close_stops_tool_caller(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm)
-        t = sess.tool_caller._loop_thread
-        self.assertTrue(t.is_alive())
-        sess.close()
-        t.join(timeout=2)
-        self.assertFalse(t.is_alive())
-
-    def test_gather_empty_queue(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm([])
-        sess = Session(llm=llm)
-        result = sess.tool_caller.gather()
-        self.assertEqual(result, {})
-        sess.close()
+        session, _ = self.make(slow)
+        threads = [threading.Thread(target=lambda: list(session("hello"))) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(order, ["enter", "exit", "enter", "exit"])
 
     def test_lock_released_after_full_consumption(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm(["hello", " world"])
-        sess = Session(llm=llm)
-        gen = sess("Hi.")
-        list(gen)
-        self.assertFalse(sess._lock.locked(), "Lock still held after generator consumed")
-        sess.close()
+        session, _ = self.make(["hello", " world"])
+        list(session("Hi."))
+        self.assertFalse(session._lock.locked())
 
-    def test_lock_released_after_close(self):
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm(["hello", " world"])
-        sess = Session(llm=llm)
-        gen = sess("Hi.")
-        try:
-            next(gen)
-        except StopIteration:
-            pass
-        finally:
-            gen.close()
-        self.assertFalse(sess._lock.locked(), "Lock still held after partial iteration + close")
-        sess.close()
+    def test_closing_the_stream_ends_the_turn_and_keeps_what_was_said(self):
+        session, _ = self.make(["hello", " world"])
+        stream = session("Hi.")
+        self.assertEqual(next(stream), "hello")
+        stream.close()
+        self.assertFalse(session._lock.locked())
+        self.assertEqual(session.conversation.messages[-1], {"role": "assistant", "content": "hello"})
 
-    def test_concurrent_call_blocks_until_lock_released(self):
-        import threading
-        from voxpipe.llm.session import Session
-        llm = self._make_mock_llm(["hello", " world"])
-        sess = Session(llm=llm)
+    def test_cancel_stops_the_turn_at_the_next_chunk(self):
+        session, _ = self.make(["one ", "two ", "three"])
+        stream = session("count")
+        self.assertEqual(next(stream), "one ")
+        session.cancel()
+        self.assertEqual(list(stream), [])
+        self.assertEqual(session.conversation.messages[-1], {"role": "assistant", "content": "one "})
+        self.assertEqual("".join(session("again")), "one two three", "the next turn is unaffected")
 
-        results = []
-        def consume(gen):
-            list(gen)
-            results.append("done")
+    def test_reset_does_not_wait_for_the_turn_in_flight(self):
+        session, _ = self.make(["partial ", "answer"])
+        session.conversation.set_system_message("You are helpful.")
+        stream = session("hi")
+        next(stream)
 
-        gen1 = sess("First.")
-        t = threading.Thread(target=consume, args=(gen1,), daemon=True)
-        t.start()
-        t.join(timeout=5)
-        self.assertIn("done", results)
-        self.assertFalse(sess._lock.locked(), "Lock still held after threaded consumption")
-        sess.close()
+        worker = threading.Thread(target=session.reset)
+        worker.start()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "reset() blocked behind the running turn")
+
+        self.assertEqual(list(stream), [], "the reset turn stops at its next chunk")
+        self.assertEqual(session.conversation.messages, [{"role": "system", "content": "You are helpful."}])
 
 
-class TestSessionConfirm(unittest.TestCase):
-    """_confirm registration and ToolChoice handling."""
+class TestSessionLifecycle(SessionCase):
+    def test_complete_once_returns_string(self):
+        session, llm = self.make(["hello world"])
+        self.assertEqual(session.complete_once("test", system="sys"), "hello world")
+        self.assertEqual(llm.calls[0].tool_choice, "none")
+        self.assertIsNone(llm.calls[0].state)
 
-    def test_register_confirm_adds_tool(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolChoice
-        from voxpipe.llm.conversation import Conversation
-        def fn(x: int) -> ToolChoice:
-            return ToolChoice(result=str(x))
-        conv = Conversation()
-        conv.tools["test"] = Tool.from_callable("test", fn)
-        llm = MagicMock()
-        llm.create_context_strategy = MagicMock(return_value=MagicMock())
-        llm.count_tokens = MagicMock(return_value=1)
-        sess = Session(llm=llm, conversation=conv)
-        try:
-            list(sess("go"))
-            self.assertIn("_confirm", sess.conversation.tools)
-            confirm = sess.conversation.tools["_confirm"]
-            self.assertEqual(confirm.name, "_confirm")
-            self.assertIsNotNone(confirm.callback)
-        finally:
-            sess.close()
+    def test_complete_once_empty_query_raises(self):
+        session, _ = self.make([])
+        for query in ("", "   "):
+            with self.assertRaises(LLMError):
+                session.complete_once(query)
 
-    def test_no_register_when_no_choice(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolResult
-        from voxpipe.llm.conversation import Conversation
-        def fn(x: int) -> ToolResult:
-            return ToolResult(result=str(x))
-        conv = Conversation()
-        conv.tools["test"] = Tool.from_callable("test", fn)
-        llm = MagicMock()
-        llm.create_context_strategy = MagicMock(return_value=MagicMock())
-        llm.count_tokens = MagicMock(return_value=1)
-        sess = Session(llm=llm, conversation=conv)
-        try:
-            list(sess("go"))
-            self.assertNotIn("_confirm", sess.conversation.tools)
-        finally:
-            sess.close()
+    def test_complete_once_does_not_mutate_conversation(self):
+        session, _ = self.make(["result"])
+        session.conversation.add_user_message("persistent")
+        session.complete_once("isolated")
+        self.assertEqual(session.conversation.messages, [{"role": "user", "content": "persistent"}])
 
-    def test_register_idempotent(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolChoice
-        from voxpipe.llm.conversation import Conversation
-        conv = Conversation()
-        conv.tools["_confirm"] = Tool(name="_confirm", description="existing")
-        conv.tools["test"] = Tool.from_callable("test", lambda x: ToolChoice(result=str(x)))
-        llm = MagicMock()
-        llm.create_context_strategy = MagicMock(return_value=MagicMock())
-        llm.count_tokens = MagicMock(return_value=1)
-        sess = Session(llm=llm, conversation=conv)
-        try:
-            list(sess("go"))
-            self.assertIn("_confirm", sess.conversation.tools)
-            self.assertEqual(sess.conversation.tools["_confirm"].description, "existing")
-        finally:
-            sess.close()
+    def test_reset_keeps_system_prompt_and_tools_but_clears_the_rest(self):
+        session, _ = self.make([], tools=[Tool(name="t", description="")])
+        session.conversation.set_system_message("sys")
+        session.conversation.add_user_message("old")
+        session.state.user.set("k", "v")
+        session.state.tools.set_permission("t", True)
 
-    def test_on_confirm_dispatches_to_tool(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolResult, ToolCall, ToolChoice
-        from voxpipe.llm.conversation import Conversation
+        session.reset()
+
+        self.assertEqual(session.conversation.messages, [{"role": "system", "content": "sys"}])
+        self.assertIn("t", session.conversation.tools)
+        self.assertIsNone(session.state.user.get("k"))
+        self.assertIsNone(session.state.tools.get_permission("t"))
+
+    def test_reset_with_new_conversation_replaces_everything(self):
+        session, _ = self.make([], tools=[Tool(name="t", description="")])
+        replacement = Conversation()
+        replacement.add_user_message("new")
+        session.reset(replacement)
+        self.assertIs(session.conversation, replacement)
+        self.assertEqual(session.conversation.tools, {})
+
+    def test_empty_conversation_argument_is_kept(self):
+        conversation = Conversation()
+        session = Session(llm=ScriptedLLM([]), conversation=conversation)
+        self.addCleanup(session.close)
+        self.assertIs(session.conversation, conversation)
+
+    def test_save_load_round_trip(self):
+        session, llm = self.make([])
+        session.conversation.add_user_message("hello")
+        session.state.user.set("note", "test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session.save(tmp)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "conversation.json")))
+            self.assertTrue(os.path.exists(os.path.join(tmp, "state.json")))
+            restored = Session.load(tmp, llm=llm, max_tool_iterations=3)
+            self.addCleanup(restored.close)
+
+        self.assertEqual(restored.conversation.messages, [{"role": "user", "content": "hello"}])
+        self.assertEqual(restored.state.user.get("note"), "test")
+        self.assertEqual(restored.max_tool_iterations, 3)
+
+    def test_save_kv_cache(self):
+        session, _ = self.make([])
+        session.state.model.set_kv_cache(b"\x00\x01\x02")
+        with tempfile.TemporaryDirectory() as tmp:
+            session.save(tmp)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "kv_cache.bin")))
+            session.save(tmp, save_kv_cache=True)
+            with open(os.path.join(tmp, "kv_cache.bin"), "rb") as f:
+                self.assertEqual(f.read(), b"\x00\x01\x02")
+
+    def test_close_stops_tool_caller(self):
+        session = Session(llm=ScriptedLLM([]))
+        thread = session.tool_caller._loop_thread
+        self.assertTrue(thread.is_alive())
+        session.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+    def test_context_manager_closes(self):
+        with Session(llm=ScriptedLLM([])) as session:
+            thread = session.tool_caller._loop_thread
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+    def test_tool_caller_requires_start(self):
+        caller = ToolCaller()
+        with self.assertRaises(LLMError):
+            caller.submit(Tool.from_callable("t", lambda: None), {})
+
+
+class TestSessionConfirm(SessionCase):
+    """ToolChoice handling, the _confirm tool and permissions."""
+
+    @staticmethod
+    def unlock_tool(ran):
+        def unlock(door: str):
+            ran.append(door)
+            return {"unlocked": door}
+
+        tool = Tool.from_callable("unlock", unlock)
+        tool.requires_permission = True
+        return tool
+
+    @staticmethod
+    def confirm(tool_name, choice):
+        """A script that answers whatever choice is pending for ``tool_name``."""
+
+        def script(conversation):
+            notice = next(m.content for m in reversed(conversation.all_messages) if m.name == tool_name)
+            uid = notice.split('"uid": "')[1].split('"')[0]
+            return [ToolCall("_confirm", {"uid": uid, "choice": choice})]
+
+        return script
+
+    def test_confirm_tool_offered_only_when_needed(self):
+        def choose(x: int) -> ToolChoice:
+            return ToolChoice(result={"x": [x]})
+
+        with_choice, _ = self.make([], tools=[Tool.from_callable("choose", choose)])
+        list(with_choice("go"))
+        self.assertIsNotNone(with_choice.conversation.tools["_confirm"].callback)
+
+        without, _ = self.make([], tools=[Tool.from_callable("plain", lambda x: {"x": x})])
+        list(without("go"))
+        self.assertNotIn("_confirm", without.conversation.tools)
+
+    def test_existing_confirm_tool_is_left_alone(self):
+        tools = [Tool(name="_confirm", description="existing"), self.unlock_tool([])]
+        session, _ = self.make([], tools=tools)
+        list(session("go"))
+        self.assertEqual(session.conversation.tools["_confirm"].description, "existing")
+
+    def test_choice_with_speech_asks_the_user_directly(self):
+        def book(x: int) -> ToolChoice:
+            return ToolChoice(result={"slot": ["1", "2", "3"]}, speech="Which slot?")
+
+        session, llm = self.make([ToolCall("book", {"x": 5})], ["unused"], tools=[Tool.from_callable("book", book)])
+        self.assertEqual(list(session("choose")), ["Which slot?"])
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIn("Ask the user, then call _confirm.", tool_messages(session))
+        self.assertEqual(session.conversation.messages[-1], {"role": "assistant", "content": "Which slot?"})
+
+    def test_choice_without_speech_lets_the_model_ask(self):
+        def book(x: int) -> ToolChoice:
+            return ToolChoice(result={"slot": ["1", "2", "3"]})
+
+        session, llm = self.make(
+            [ToolCall("book", {"x": 5})], ["Which slot would you like?"], tools=[Tool.from_callable("book", book)]
+        )
+        self.assertEqual(list(session("choose")), ["Which slot would you like?"])
+        self.assertIn("Ask the user, then call _confirm.", tool_messages(session))
+
+    def test_choice_resolved_on_the_next_turn(self):
+        booked = []
+
+        def book(x: int, slot: str = "") -> ToolResult | ToolChoice:
+            if not slot:
+                return ToolChoice(result={"slot": ["1", "2"]}, speech="Which slot?")
+            booked.append((x, slot))
+            return ToolResult({"booked": slot})
+
+        session, _ = self.make(
+            [ToolCall("book", {"x": 5})],
+            self.confirm("book", {"slot": "2"}),
+            ["Booked."],
+            tools=[Tool.from_callable("book", book)],
+        )
+        list(session("book it"))
+        self.assertEqual("".join(session("slot two")), "Booked.")
+        self.assertEqual(booked, [(5, "2")])
+        self.assertFalse(session.state.tools.has_pending())
+
+    def test_permission_is_requested_then_remembered(self):
+        ran = []
+        session, _ = self.make(
+            [ToolCall("unlock", {"door": "front"})],
+            self.confirm("unlock", {"allow": True, "remember": True}),
+            ["Unlocked."],
+            [ToolCall("unlock", {"door": "back"})],
+            ["Unlocked again."],
+            tools=[self.unlock_tool(ran)],
+        )
+        self.assertEqual(list(session("unlock the front door")), ["Permission requested to run unlock."])
+        self.assertEqual(ran, [])
+
+        list(session("yes, always"))
+        self.assertEqual(ran, ["front"])
+        self.assertTrue(session.state.tools.get_permission("unlock"))
+
+        list(session("unlock the back door"))
+        self.assertEqual(ran, ["front", "back"], "a remembered permission must not be asked for again")
+
+    def test_permission_decorator(self):
+        ran = []
+
+        @permission
+        def wipe(target: str):
+            ran.append(target)
+            return {"wiped": target}
+
+        session, _ = self.make(
+            [ToolCall("wipe", {"target": "cache"})],
+            self.confirm("wipe", {"allow": True}),
+            ["Done."],
+            tools=[Tool.from_callable("wipe", wipe)],
+        )
+        list(session("wipe the cache"))
+        self.assertEqual(ran, [])
+        list(session("yes"))
+        self.assertEqual(ran, ["cache"])
+        self.assertIsNone(session.state.tools.get_permission("wipe"), "not remembered unless asked")
+
+    def test_permission_denied_and_remembered(self):
+        ran = []
+        session, _ = self.make(
+            [ToolCall("unlock", {"door": "front"})],
+            self.confirm("unlock", {"allow": False, "remember": True}),
+            [ToolCall("unlock", {"door": "back"})],
+            tools=[self.unlock_tool(ran)],
+        )
+        list(session("unlock"))
+        self.assertIn("Action unlock was cancelled.", list(session("never")))
+        self.assertIn("Permission for unlock was denied.", list(session("unlock the back door")))
+        self.assertEqual(ran, [])
+
+    def test_model_cannot_answer_its_own_question(self):
+        """With several tool passes per turn, _confirm in the same turn must not run the tool."""
+        erased = []
+
+        def erase(disk: str, sure: str = "") -> ToolResult | ToolChoice:
+            if not sure:
+                return ToolChoice(result={"sure": ["yes", "no"]})
+            erased.append(disk)
+            return ToolResult({"erased": disk})
+
+        session, _ = self.make(
+            [ToolCall("erase", {"disk": "C"})],
+            self.confirm("erase", {"sure": "yes"}),
+            ["Are you sure you want to erase C?"],
+            tools=[Tool.from_callable("erase", erase)],
+            max_tool_iterations=2,
+        )
+        self.assertEqual(list(session("erase my disk")), ["Are you sure you want to erase C?"])
+        self.assertEqual(erased, [])
+        self.assertTrue(any("The user has not answered yet" in m for m in tool_messages(session)))
+        self.assertTrue(session.state.tools.has_pending(), "the question stays open for the user's real answer")
+
+    def _pending(self, session, tool_name="test", arguments=None, options=None, uid="tc_1"):
+        call = ToolCall(name=tool_name, arguments=arguments or {})
+        choice = ToolChoice(result=options or {"allow": [True, False], "remember": [True, False]}, uid=uid)
+        session.state.tools.add_pending(call, choice)
+        return uid
+
+    def test_on_confirm_runs_the_held_tool(self):
         captured = []
-        def fn(x: int) -> ToolResult:
-            captured.append(x)
-            return ToolResult(result={"x": x})
-        conv = Conversation()
-        conv.tools["test"] = Tool.from_callable("test", fn)
-        llm = MagicMock()
-        llm.create_context_strategy = MagicMock(return_value=MagicMock())
-        llm.count_tokens = MagicMock(return_value=1)
-        sess = Session(llm=llm, conversation=conv)
-        try:
-            call = ToolCall(name="test", arguments={"x": 42})
-            choice = ToolChoice(result={"uid": "tc_1234", "allow": [True, False], "remember": [True, False]})
-            conv.get_meta("test")["pending"] = {"tc_1234": (call, choice)}
-            result = sess._on_confirm(uid="tc_1234", choice={"allow": True, "remember": False})
-            self.assertIsInstance(result, ToolResult)
-            self.assertEqual(captured, [42])
-            self.assertIn("42", result.result)
-        finally:
-            sess.close()
 
-    def test_on_confirm_permission_remember(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolResult, ToolCall, ToolChoice
-        from voxpipe.llm.conversation import Conversation
+        def record(x: int) -> dict:
+            captured.append(x)
+            return {"x": x}
+
+        session, _ = self.make([], tools=[Tool.from_callable("test", record)])
+        uid = self._pending(session, arguments={"x": 42})
+        result = asyncio.run(session._on_confirm(uid=uid, choice={"allow": True, "remember": False}))
+        self.assertEqual(captured, [42])
+        self.assertIn("42", result.result)
+        self.assertIsNone(session.state.tools.get_permission("test"))
+
+    def test_on_confirm_accepts_json_string_and_missing_remember(self):
         captured = []
-        def fn(x: int) -> ToolResult:
-            captured.append(x)
-            return ToolResult(result={"x": x})
-        conv = Conversation()
-        conv.tools["test"] = Tool.from_callable("test", fn)
-        llm = MagicMock()
-        llm.create_context_strategy = MagicMock(return_value=MagicMock())
-        llm.count_tokens = MagicMock(return_value=1)
-        sess = Session(llm=llm, conversation=conv)
-        try:
-            call = ToolCall(name="test", arguments={"x": 99})
-            choice = ToolChoice(result={"uid": "tc_5678", "allow": [True, False], "remember": [True, False]})
-            conv.get_meta("test")["pending"] = {"tc_5678": (call, choice)}
-            result = sess._on_confirm(uid="tc_5678", choice={"allow": True, "remember": True})
-            self.assertIsInstance(result, ToolResult)
-            self.assertEqual(captured, [99])
-            self.assertTrue(conv.get_meta("test").get("_permission"))
-        finally:
-            sess.close()
+        session, _ = self.make([], tools=[Tool.from_callable("test", lambda: captured.append(1))])
+        asyncio.run(session._on_confirm(uid=self._pending(session), choice='{"allow": "true"}'))
+        self.assertEqual(captured, [1])
 
-    def test_on_confirm_mismatched_keys_raises(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import ToolCall, ToolChoice
-        from voxpipe.core.exceptions import ToolError
-        llm = MagicMock()
-        llm.create_context_strategy = MagicMock(return_value=MagicMock())
-        llm.count_tokens = MagicMock(return_value=1)
-        sess = Session(llm=llm)
-        try:
-            call = ToolCall(name="test", arguments={})
-            choice = ToolChoice(result={"uid": "tc_9999", "allow": [True, False], "remember": [True, False]})
-            sess.conversation.get_meta("test")["pending"] = {"tc_9999": (call, choice)}
-            with self.assertRaises(ToolError):
-                sess._on_confirm(uid="tc_9999", choice={"allow": True})  # Missing 'remember'
-        finally:
-            sess.close()
+    def test_on_confirm_mismatched_keys_raises_and_keeps_the_request(self):
+        session, _ = self.make([], tools=[Tool.from_callable("test", lambda slot: None)])
+        uid = self._pending(session, options={"slot": ["1", "2"]})
+        with self.assertRaises(ToolError):
+            asyncio.run(session._on_confirm(uid=uid, choice={"seat": "1"}))
+        self.assertIsNotNone(session.state.tools.get_pending(uid))
+
+    def test_on_confirm_permission_rejects_stray_keys(self):
+        session, _ = self.make([], tools=[Tool.from_callable("test", lambda: None)])
+        uid = self._pending(session)
+        for choice in ({"remember": True}, {"allow": True, "door": "front"}):
+            with self.subTest(choice=choice), self.assertRaises(ToolError):
+                asyncio.run(session._on_confirm(uid=uid, choice=choice))
 
     def test_on_confirm_unknown_uid_raises(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.core.exceptions import ToolError
-        llm = MagicMock()
-        llm.create_context_strategy = MagicMock(return_value=MagicMock())
-        llm.count_tokens = MagicMock(return_value=1)
-        sess = Session(llm=llm)
-        try:
-            with self.assertRaises(ToolError):
-                sess._on_confirm(uid="nonexistent", choice={"allow": True, "remember": False})
-        finally:
-            sess.close()
+        session, _ = self.make([])
+        with self.assertRaises(ToolError):
+            asyncio.run(session._on_confirm(uid="nonexistent", choice={"allow": True}))
 
-    def test_tool_choice_injects_assistant_message(self):
-        from voxpipe.llm.session import Session
-        from voxpipe.llm.tools import Tool, ToolChoice
-        from voxpipe.llm.conversation import Conversation
-        from voxpipe.llm.decoders import GeneralDecoder
+    def test_on_confirm_uses_the_pending_calls_own_tool(self):
+        ran = []
+        tools = [
+            Tool.from_callable("first", lambda: ran.append("first")),
+            Tool.from_callable("second", lambda: ran.append("second")),
+        ]
+        session, _ = self.make([], tools=tools)
+        asyncio.run(session._on_confirm(uid=self._pending(session, tool_name="first"), choice={"allow": True}))
+        self.assertEqual(ran, ["first"])
 
-        class ChoiceLLM:
-            decoder = GeneralDecoder()
-            called = False
-            def create_context_strategy(self, max_turns=20):
-                from voxpipe.llm.context import MaxTurnsStrategy
-                return MaxTurnsStrategy(max_turns)
-            def count_tokens(self, text):
-                return max(1, len(text) // 2)
-            def __call__(self, conversation, session_state=None, **kwargs):
-                if not self.called:
-                    self.called = True
-                    from voxpipe.llm.tools import ToolCall
-                    yield ToolCall(name="test", arguments={"x": 5})
-                else:
-                    yield "Got it."
 
-        captured = []
-        def fn(x: int) -> ToolChoice:
-            captured.append(x)
-            return ToolChoice(result={"slot": ["1", "2", "3"]}, speech="Which slot?")
-        conv = Conversation()
-        conv.set_system_message("You are helpful.")
-        conv.tools["test"] = Tool.from_callable("test", fn)
-        llm = ChoiceLLM()
-        llm.logger = MagicMock()
-        sess = Session(llm=llm, conversation=conv)
-        try:
-            text = list(sess("choose"))
-            roles = [m["role"] for m in conv.messages]
-            self.assertIn("tool", roles)
-            assistant_msgs = [m for m in conv.messages if m["role"] == "assistant"]
-            self.assertTrue(any("_confirm" in m["content"] for m in assistant_msgs),
-                            "assistant message should mention _confirm")
-            self.assertIn("Which slot?", "".join(text), "speech should be yielded")
-        finally:
-            sess.close()
+class TestSessionContextHandler(SessionCase):
+    def test_hooks_run_around_the_turn_and_on_close(self):
+        handler = MagicMock()
+        session, _ = self.make(["ok"], context_handler=handler)
+        list(session("hi"))
+        handler.pre_process.assert_called_once_with(session.conversation)
+        handler.post_process.assert_called_once_with(session.conversation)
+
+        previous = session.conversation
+        session.reset()
+        handler.finalize.assert_called_once_with(previous)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,17 +1,24 @@
-import json
-import os
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Dict, Optional, Tuple
-from .tools import Tool, ToolCall, ToolChoice
+"""Conversation history: messages, the visible context window, and provider wire formats."""
 
-if TYPE_CHECKING:
-    from .model import LLM
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, Iterable, List, Optional
+
+from .tools import Tool, ToolCall
 
 
 @dataclass
 class Message:
+    """One turn of a conversation.
+
+    ``content`` is what was said.  ``context`` is a preamble shown to the model
+    ahead of it (recalled memories, annotations) that is not part of what was
+    said, so it never reaches long-term memory.  Assistant turns that request
+    tools carry ``tool_calls``; the tool turns answering them carry the matching
+    ``tool_call_id`` and tool ``name``.  A tool turn with neither is a note to
+    the model rather than a result.
+    """
 
     class Role(Enum):
         system = "system"
@@ -21,234 +28,247 @@ class Message:
 
     role: Role
     content: str
+    context: Optional[str] = None
+    tool_calls: List[ToolCall] = field(default_factory=list)
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    archived: bool = False
 
-    def asdict(self):
-        return {"role": self.role.value, "content": self.content}
+    @property
+    def rendered(self) -> str:
+        """The text the model sees for this turn."""
+        return f"{self.context}\n{self.content}" if self.context else self.content
 
-    @staticmethod
-    def from_dict(data: Dict[str, str]):
-        return Message(Message.Role(data["role"]), data["content"])
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise for persistence, omitting fields left at their defaults."""
+        data: Dict[str, Any] = {"role": self.role.value, "content": self.content}
+        if self.context:
+            data["context"] = self.context
+        if self.tool_calls:
+            data["tool_calls"] = [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in self.tool_calls]
+        if self.tool_call_id:
+            data["tool_call_id"] = self.tool_call_id
+        if self.name:
+            data["name"] = self.name
+        if self.archived:
+            data["archived"] = True
+        return data
 
-
-class MessageList(list):
-    def __init__(self, other: Iterable | None = None):
-        super().__init__()
-        if other:
-            for item in other:
-                self.append(item)
-
-    def append(self, x: Message | Dict[str, str]):
-        if isinstance(x, Message):
-            super().append(x)
-        elif isinstance(x, dict):
-            super().append(Message.from_dict(x))
-        else:
-            raise NotImplementedError
-
-    def __getitem__(self, key: int | slice) -> Dict[str, str] | List[Dict[str, str]]:
-        if isinstance(key, slice):
-            return MessageList(super().__getitem__(key))
-        else:
-            return Message.asdict(super().__getitem__(key))
-
-    def __setitem__(self, key: int | slice, value: Any):
-        if isinstance(key, slice):
-            converted = [
-                v if isinstance(v, Message) else Message.from_dict(v) for v in value
-            ]
-            super().__setitem__(key, converted)
-        else:
-            v = value if isinstance(value, Message) else Message.from_dict(value)
-            super().__setitem__(key, v)
-
-    def __iter__(self) -> Iterable[Dict[str, str]]:
-        return map(Message.asdict, super().__iter__())
-
-    def __add__(self, other):
-        if isinstance(other, list):
-            return MessageList(super().__add__(other))
-        return NotImplemented
-
-    def __radd__(self, other):
-        if isinstance(other, list):
-            return MessageList(other.__add__(self))
-        return NotImplemented
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Message":
+        return cls(
+            role=cls.Role(data["role"]),
+            content=data.get("content") or "",
+            context=data.get("context"),
+            tool_calls=[
+                ToolCall(name=c["name"], arguments=c.get("arguments", {}), id=c["id"])
+                for c in data.get("tool_calls", [])
+            ],
+            tool_call_id=data.get("tool_call_id"),
+            name=data.get("name"),
+            archived=bool(data.get("archived", False)),
+        )
 
 
 class Conversation:
+    """An ordered message history with a system prompt, a tool set and a visible window.
+
+    Messages before the cutoff stay in the history but are hidden from the
+    model; :meth:`hide_oldest` advances the cutoff and :meth:`drop_hidden`
+    removes what lies behind it.
+    """
 
     def __init__(self):
-        self._messages: MessageList = MessageList()
-        self._token_counts: List[int] = []
-
+        self._messages: List[Message] = []
         self._system: str = ""
         self._tools: Dict[str, Tool] = {}
         self._cutoff_idx: int = 0
-        self._meta: Dict[str, Dict[str, Any]] = {}
 
-    def get_meta(self, tool_name: str) -> Dict[str, Any]:
-        return self._meta.setdefault(tool_name, {})
+    # --- building --------------------------------------------------------
 
-    def set_meta(self, tool_name: str, key: str, value: Any):
-        self.get_meta(tool_name)[key] = value
-
-    def clear_meta(self):
-        self._meta.clear()
-
-    def get_permission(self, tool_name: str) -> bool | None:
-        return self.get_meta(tool_name).get("_permission")
-
-    def set_permission(self, tool_name: str, allow: bool | None):
-        if allow is None:
-            self.get_meta(tool_name).pop("_permission", None)
-        else:
-            self.set_meta(tool_name, "_permission", allow)
-
-    def revoke_permission(self, tool_name: str):
-        self.set_permission(tool_name, None)
-
-    def set_system_message(self, content: str):
+    def set_system_message(self, content: str) -> None:
         self._system = content
 
-    def add_user_message(self, content: str):
-        msg = Message(role=Message.Role.user, content=content)
-        self._messages.append(msg)
-        self._token_counts.append(0)
+    def add_user_message(self, content: str, *, context: Optional[str] = None) -> Message:
+        return self._append(Message(role=Message.Role.user, content=content, context=context))
 
-    def add_assistant_message(self, content: str):
-        msg = Message(role=Message.Role.assistant, content=content)
-        self._messages.append(msg)
-        self._token_counts.append(0)
+    def add_assistant_message(self, content: str, *, tool_calls: Iterable[ToolCall] = ()) -> Message:
+        return self._append(Message(role=Message.Role.assistant, content=content, tool_calls=list(tool_calls)))
 
-    def add_tool_message(self, content: str):
-        msg = Message(role=Message.Role.tool, content=content)
-        self._messages.append(msg)
-        self._token_counts.append(0)
+    def add_tool_message(self, content: str, *, tool_call: Optional[ToolCall] = None) -> Message:
+        """Add a tool's answer to ``tool_call``, or, without one, a note to the model."""
+        return self._append(
+            Message(
+                role=Message.Role.tool,
+                content=content,
+                tool_call_id=tool_call.id if tool_call else None,
+                name=tool_call.name if tool_call else None,
+            )
+        )
 
-    def clear(self):
+    def _append(self, message: Message) -> Message:
+        self._messages.append(message)
+        return message
+
+    def discard(self, messages: Iterable[Message]) -> None:
+        """Remove the given messages (matched by identity) from the history."""
+        doomed = {id(m) for m in messages}
+        hidden = sum(1 for m in self._messages[: self._cutoff_idx] if id(m) in doomed)
+        self._messages = [m for m in self._messages if id(m) not in doomed]
+        self._cutoff_idx -= hidden
+
+    def clear(self) -> None:
+        """Forget every message; the system prompt and tools stay."""
         self._messages.clear()
-        self._token_counts.clear()
-        self._meta.clear()
+        self._cutoff_idx = 0
+
+    # --- accessors -------------------------------------------------------
 
     @property
-    def messages(self) -> List[Dict[str, str]]:
-        msgs = []
-        if self._system:
-            msgs.append({"role": "system", "content": self._system})
-        for m in self._messages[self._cutoff_idx :]:
-            msgs.append(m.asdict() if isinstance(m, Message) else m)
-        return msgs
-
-    @property
-    def system(self) -> Message:
-        return Message(role=Message.Role.system, content=self._system)
+    def system_message(self) -> str:
+        return self._system
 
     @property
     def tools(self) -> Dict[str, Tool]:
         return self._tools
 
     @tools.setter
-    def tools(self, tools: Dict[str, Tool] | Iterable[Tool]):
-        if not isinstance(tools, dict):
-            tools = {t.name: t for t in tools}
-        self._tools = tools
+    def tools(self, tools: Dict[str, Tool] | Iterable[Tool]) -> None:
+        self._tools = dict(tools) if isinstance(tools, dict) else {t.name: t for t in tools}
 
-    def to_dict(self) -> Dict:
-        serialized_meta = {}
-        for t_name, meta_dict in self._meta.items():
-            s_meta = {}
-            for k, v in meta_dict.items():
-                if k == "pending" and isinstance(v, dict):
-                    s_pending = {}
-                    for uid, (call, choice) in v.items():
-                        s_pending[uid] = (
-                            {"name": call.name, "arguments": call.arguments},
-                            {
-                                "result": choice.raw_result,
-                                "speech": choice.speech,
-                                "uid": choice.uid,
-                            },
-                        )
-                    s_meta["pending"] = s_pending
+    @property
+    def all_messages(self) -> List[Message]:
+        """Every message still held, hidden ones included."""
+        return list(self._messages)
+
+    @property
+    def visible(self) -> List[Message]:
+        """The messages the model currently sees, oldest first."""
+        return self._messages[self._cutoff_idx :]
+
+    @property
+    def last_message(self) -> Optional[Message]:
+        return self._messages[-1] if self._messages else None
+
+    # --- wire formats ----------------------------------------------------
+
+    @property
+    def messages(self) -> List[Dict[str, str]]:
+        """The visible window as plain role/content turns, for local chat templates.
+
+        Tool results read ``"<tool>: <payload>"``; an assistant turn that only
+        requested tools has nothing to show in this format and is left out.
+        """
+        rendered = [{"role": "system", "content": self._system}] if self._system else []
+        for m in self.visible:
+            if m.role is Message.Role.assistant and m.tool_calls and not m.content:
+                continue
+            content = f"{m.name}: {m.content}" if m.role is Message.Role.tool and m.name else m.rendered
+            rendered.append({"role": m.role.value, "content": content})
+        return rendered
+
+    def to_openai_messages(self) -> List[Dict[str, Any]]:
+        """The visible window in OpenAI chat-completions format, with tool calls paired to results.
+
+        Notes to the model (tool turns answering no call) are folded into the
+        tool result they follow, or sent as a user turn when there is none, since
+        the format admits no free-standing tool message.
+        """
+        rendered: List[Dict[str, Any]] = [{"role": "system", "content": self._system}] if self._system else []
+        for m in self.visible:
+            if m.role is Message.Role.tool and not m.tool_call_id:
+                if rendered and rendered[-1]["role"] == "tool":
+                    rendered[-1]["content"] += f"\n\n{m.content}"
                 else:
-                    s_meta[k] = v
-            serialized_meta[t_name] = s_meta
+                    rendered.append({"role": "user", "content": m.content})
+            elif m.role is Message.Role.tool:
+                rendered.append({"role": "tool", "tool_call_id": m.tool_call_id, "name": m.name, "content": m.content})
+            elif m.tool_calls:
+                rendered.append(
+                    {
+                        "role": "assistant",
+                        "content": m.content,
+                        "tool_calls": [
+                            {
+                                "id": c.id,
+                                "type": "function",
+                                "function": {"name": c.name, "arguments": json.dumps(c.arguments)},
+                            }
+                            for c in m.tool_calls
+                        ],
+                    }
+                )
+            else:
+                rendered.append({"role": m.role.value, "content": m.rendered})
+        return rendered
 
+    # --- context window --------------------------------------------------
+
+    @property
+    def cutoff_idx(self) -> int:
+        """Index of the first visible message."""
+        return self._cutoff_idx
+
+    @cutoff_idx.setter
+    def cutoff_idx(self, value: int) -> None:
+        self._cutoff_idx = max(0, min(int(value), len(self._messages)))
+
+    def visible_count(self) -> int:
+        return len(self._messages) - self._cutoff_idx
+
+    def hide_oldest(self, count: int) -> int:
+        """Hide the ``count`` oldest visible messages, rounded to a turn boundary.
+
+        The window must open on a user turn: starting mid-exchange would strand
+        tool results from the calls they answer.  So the cut moves forward to
+        the next user message, or, when none follows, back to the one opening
+        the current exchange.  Returns how many messages were hidden.
+        """
+        if count <= 0:
+            return 0
+        start = self._cutoff_idx
+        target = min(start + count, len(self._messages))
+
+        def is_user(index: int) -> bool:
+            return self._messages[index].role is Message.Role.user
+
+        forward = next((i for i in range(target, len(self._messages)) if is_user(i)), None)
+        if forward is not None:
+            target = forward
+        else:
+            target = next((i for i in range(target - 1, start - 1, -1) if is_user(i)), start)
+
+        self._cutoff_idx = target
+        return target - start
+
+    def drop_hidden(self) -> List[Message]:
+        """Remove and return the messages behind the cutoff."""
+        dropped, self._messages = self._messages[: self._cutoff_idx], self._messages[self._cutoff_idx :]
+        self._cutoff_idx = 0
+        return dropped
+
+    # --- persistence -----------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "system": self._system,
-            "messages": [m.asdict() for m in list.__iter__(self._messages)],
+            "messages": [m.to_dict() for m in self._messages],
             "cutoff_idx": self._cutoff_idx,
-            "_meta": serialized_meta,
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "Conversation":
+    def from_dict(cls, data: Dict[str, Any]) -> "Conversation":
         conv = cls()
         conv._system = data.get("system", "")
-        for msg_data in data.get("messages", []):
-            conv._messages.append(Message.from_dict(msg_data))
-            conv._token_counts.append(0)
-        conv._cutoff_idx = data.get("cutoff_idx", 0)
-
-        raw_meta = data.get("_meta", {})
-        reconstructed_meta = {}
-        for t_name, meta_dict in raw_meta.items():
-            r_meta = {}
-            for k, v in meta_dict.items():
-                if k == "pending" and isinstance(v, dict):
-                    r_pending = {}
-                    for uid, (call_dict, choice_dict) in v.items():
-                        call_obj = ToolCall(
-                            name=call_dict["name"],
-                            arguments=call_dict.get("arguments", {}),
-                        )
-                        choice_obj = ToolChoice(
-                            result=choice_dict["result"],
-                            speech=choice_dict.get("speech"),
-                            uid=choice_dict.get("uid"),
-                        )
-                        r_pending[uid] = (call_obj, choice_obj)
-                    r_meta["pending"] = r_pending
-                else:
-                    r_meta[k] = v
-            reconstructed_meta[t_name] = r_meta
-
-        conv._meta = reconstructed_meta
+        conv._messages = [Message.from_dict(m) for m in data.get("messages", [])]
+        conv.cutoff_idx = data.get("cutoff_idx", 0)
         return conv
 
-    def save(self, path: str):
+    def save(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
 
     @classmethod
     def load(cls, path: str) -> "Conversation":
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data)
-
-    @property
-    def cutoff_idx(self):
-        if not self._messages or self._cutoff_idx >= len(self._messages):
-            return len(self._messages)
-        return range(len(self._messages))[self._cutoff_idx]
-
-    @cutoff_idx.setter
-    def cutoff_idx(self, value):
-        self._cutoff_idx = value
-
-    def visible_count(self) -> int:
-        return len(self._messages) - self._cutoff_idx
-
-    def _get_raw_message(self, idx: int) -> Message:
-        """Access internal Message object bypassing MessageList's dict-returning __getitem__."""
-        return list.__getitem__(self._messages, idx)
-
-    def get_message_content(self, idx: int) -> str:
-        """Get the content string of a raw message by internal index."""
-        return self._get_raw_message(idx).content
-
-    def get_token_count(self, idx: int) -> int:
-        return self._token_counts[idx]
-
-    def set_token_count(self, idx: int, count: int):
-        self._token_counts[idx] = count
+            return cls.from_dict(json.load(f))

@@ -1,26 +1,87 @@
-from dataclasses import dataclass
-from functools import partial
+"""Session: runs conversation turns against an LLM, executing the tools it calls."""
+
 import asyncio
-import inspect
+import concurrent.futures
 import json
 import os
-from queue import Queue
 import threading
-from typing import Dict, Generator, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
-from ..core.utils import get_logger
 from ..core.exceptions import LLMError, ToolError
-
-from .model import LLM
-from .conversation import Conversation
-from .tools import Tool, ToolCall, ToolResult, ToolChoice
+from ..core.utils import get_logger
 from .context import ContextHandler
+from .conversation import Conversation, Message
+from .model import LLM
+from .state import SessionState
+from .tools import PERMISSION_KEYS, MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult
+
+CONFIRM_TOOL = "_confirm"
+
+_ANSWER_NOTE = "Now, generate an answer based only on the returned responses."
+_FAILURE_NOTE = (
+    "One or more tools failed to execute. Please inform the user of the error and suggest an alternative action."
+)
+_ASK_USER_NOTE = "Ask the user, then call _confirm."
+_PARSE_ERROR = "Could not parse tool call. Please try again with valid JSON."
+_FALLBACK_REPLY = "I encountered a persistent error processing tool calls."
 
 
-from .state import SessionState, SessionStateDictProxy
+@dataclass(frozen=True)
+class TextDelta:
+    """A piece of text for the user, in the order it should be spoken."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolCallEvent:
+    """The model asked for a tool; it is about to run (or be refused)."""
+
+    call: ToolCall
+
+
+@dataclass(frozen=True)
+class ToolResultEvent:
+    """A requested tool finished: exactly one of ``result`` and ``error`` is set."""
+
+    call: ToolCall
+    result: Optional[ToolResult] = None
+    error: Optional[str] = None
+
+
+SessionEvent = Union[TextDelta, ToolCallEvent, ToolResultEvent]
+EventStream = Generator[SessionEvent, None, None]
+
+
+@dataclass
+class ToolExecutionResult:
+    """Outcome of one requested tool call; ``call`` is None when the request itself was unparseable."""
+
+    call: Optional[ToolCall]
+    result: Optional[ToolResult] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class _Turn:
+    """Bookkeeping for one turn in flight."""
+
+    conversation: Conversation
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    added: List[Message] = field(default_factory=list)
+    unrecorded_speech: List[str] = field(default_factory=list)
 
 
 class Session:
+    """A conversation bound to an LLM.
+
+    Calling the session with the user's text runs one turn and streams the
+    reply.  Turns run one at a time; a second caller waits for the first to
+    finish.  :meth:`cancel` and :meth:`reset` never wait: they stop the turn in
+    flight at its next chunk.
+    """
 
     def __init__(
         self,
@@ -29,41 +90,327 @@ class Session:
         max_tool_iterations: int = 1,
         context_handler: Optional[ContextHandler] = None,
         session_id: str = "default",
+        tool_timeout: float = 10.0,
     ):
         self.logger = get_logger(__name__)
         self.llm = llm
         self.session_id = session_id
-        self.conversation = conversation or Conversation()
-        self.tool_caller = ToolCaller()
+        self.conversation = conversation if conversation is not None else Conversation()
         self.max_tool_iterations = max_tool_iterations
         self.context_handler = context_handler
-
+        self.tool_timeout = tool_timeout
         self.state = SessionState()
-        self._session_state = SessionStateDictProxy(self.state)
-        self._lock = threading.Lock()
 
+        self._lock = threading.Lock()  # held for the length of a turn
+        self._active: Optional[_Turn] = None
+        self._turn_number = 0
+
+        self.tool_caller = ToolCaller()
         self.tool_caller.start()
 
-    def _register_confirm(self):
-        if "_confirm" in self.conversation.tools:
+    # --- lifecycle -------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Stop the turn in flight, if any, at its next chunk. What it already said stays in history."""
+        turn = self._active
+        if turn is not None:
+            turn.cancelled.set()
+
+    def reset(self, conversation: Optional[Conversation] = None) -> None:
+        """Start over, cancelling any turn in flight and clearing session state.
+
+        Without an argument the system prompt and tools carry over to a fresh
+        conversation; pass a Conversation to replace them too.
+        """
+        self.cancel()
+        previous = self.conversation
+        if self.context_handler:
+            self.context_handler.finalize(previous)
+        if conversation is None:
+            conversation = Conversation()
+            conversation.set_system_message(previous.system_message)
+            conversation.tools = previous.tools
+        self.conversation = conversation
+        self.state.clear()
+
+    def close(self) -> None:
+        """Stop any turn in flight, flush the context handler and release the tool loop."""
+        self.cancel()
+        if self.context_handler:
+            self.context_handler.finalize(self.conversation)
+        self.tool_caller.stop()
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def save(self, path: str, *, save_kv_cache: bool = False) -> None:
+        """Save the conversation and session state into a directory."""
+        os.makedirs(path, exist_ok=True)
+        self.conversation.save(os.path.join(path, "conversation.json"))
+        self.state.save(path, save_binary=save_kv_cache)
+
+    @classmethod
+    def load(cls, path: str, llm: LLM, **kwargs) -> "Session":
+        """Restore a saved session around ``llm``; keyword arguments go to the constructor.
+
+        Tool callbacks are not persisted: register the tools again before the next turn.
+        """
+        conv_path = os.path.join(path, "conversation.json")
+        conversation = Conversation.load(conv_path) if os.path.exists(conv_path) else Conversation()
+        session = cls(llm=llm, conversation=conversation, **kwargs)
+        session.state.load(path)
+        return session
+
+    # --- running turns ---------------------------------------------------
+
+    def complete_once(self, query: str, *, system: str | None = None, **kwargs) -> str:
+        """Run an isolated completion that neither reads nor changes the conversation."""
+        if not isinstance(query, str) or not query.strip():
+            raise LLMError("One-shot queries must be non-empty strings.")
+
+        conversation = Conversation()
+        if system:
+            conversation.set_system_message(system)
+        conversation.add_user_message(query)
+
+        chunks = []
+        for chunk in self.llm(conversation, session_state=None, tool_choice="none", **kwargs):
+            if isinstance(chunk, str):
+                chunks.append(chunk)
+            else:
+                self.logger.warning("Ignored an unexpected tool call during one-shot inference.")
+        return "".join(chunks).strip()
+
+    def __call__(
+        self, query: str | None = None, *, context: str | None = None, **kwargs
+    ) -> Generator[str, None, None]:
+        """Run a turn and stream the text of the reply. See :meth:`events`."""
+        events = self.events(query, context=context, **kwargs)
+        try:
+            for event in events:
+                if isinstance(event, TextDelta):
+                    yield event.text
+        finally:
+            # Closing this stream must end the turn now, not whenever the inner generator is collected.
+            events.close()
+
+    def events(self, query: str | None = None, *, context: str | None = None, **kwargs) -> EventStream:
+        """Run a turn, streaming text and tool activity as it happens.
+
+        ``query`` is the user's message; omit it to continue from the
+        conversation as it stands.  ``context`` is shown to the model ahead of
+        the query without becoming part of what the user said.  Remaining
+        keyword arguments are generation parameters for the LLM.
+
+        If the LLM fails, the turn's messages are rolled back and LLMError is
+        raised.  Closing the generator early cancels the turn.
+        """
+        with self._lock:
+            turn = _Turn(self.conversation)
+            self._active = turn
+            try:
+                if query:
+                    self._turn_number += 1
+                    self._add_user_message(turn, query, context)
+                    self.logger.info("query=%r", query)
+                self._register_confirm(turn.conversation)
+                if self.context_handler:
+                    self.context_handler.pre_process(turn.conversation)
+
+                yield from self._run(turn, kwargs)
+
+                if self.context_handler and not turn.cancelled.is_set():
+                    self.context_handler.post_process(turn.conversation)
+            except Exception:
+                turn.unrecorded_speech.clear()
+                turn.conversation.discard(turn.added)
+                raise
+            finally:
+                self._flush_speech(turn)
+                if self._active is turn:
+                    self._active = None
+
+    def _add_user_message(self, turn: _Turn, query: str, context: Optional[str]) -> None:
+        """Append the user's message, or extend their previous one if it never got a reply."""
+        last = turn.conversation.last_message
+        if last is not None and last.role is Message.Role.user:
+            last.content = f"{last.content}\n{query}"
+            if context:
+                last.context = f"{last.context}\n{context}" if last.context else context
+        else:
+            turn.added.append(turn.conversation.add_user_message(query, context=context))
+
+    def _run(self, turn: _Turn, llm_kwargs: Dict[str, Any]) -> EventStream:
+        """Alternate model passes and tool execution until the model answers in text."""
+        for index in range(self.max_tool_iterations + 1):
+            final = index == self.max_tool_iterations
+            text: List[str] = []
+            requests: List[Union[ToolCall, MalformedToolCall]] = []
+            interrupted = True
+            try:
+                yield from self._stream_pass(turn, "none" if final else "auto", llm_kwargs, text, requests)
+                interrupted = turn.cancelled.is_set()
+            finally:
+                # Whatever was streamed has been heard; keep it even if the turn stops here.
+                # Only a pass that goes on to run tools records its text with the tool calls instead.
+                reply = "".join(text)
+                if interrupted or final or not requests:
+                    self._record_reply(turn, reply)
+
+            if turn.cancelled.is_set():
+                return
+            if final or not requests:
+                if requests and not reply:
+                    self.logger.warning("Model kept calling tools when asked to answer; giving up on the turn.")
+                    self._record_reply(turn, _FALLBACK_REPLY)
+                    yield TextDelta(_FALLBACK_REPLY)
+                elif requests:
+                    self.logger.warning("Ignored %d tool call(s) made during the answer pass.", len(requests))
+                return
+
+            results = yield from self._execute(turn, requests)
+            if turn.cancelled.is_set():
+                return
+            yield from self._record_tool_round(turn, reply, results)
+            if all(r.result is not None and r.result.speech for r in results):
+                return  # every tool answered the user itself; nothing left for the model to say
+
+    def _stream_pass(
+        self,
+        turn: _Turn,
+        tool_choice: str,
+        llm_kwargs: Dict[str, Any],
+        text: List[str],
+        requests: List[Union[ToolCall, MalformedToolCall]],
+    ) -> EventStream:
+        """Stream one model pass, collecting its text and tool requests into the given lists."""
+        self.logger.debug("Starting LLM pass (tool_choice=%s)", tool_choice)
+        stream = self.llm(turn.conversation, session_state=self.state, tool_choice=tool_choice, **llm_kwargs)
+        try:
+            for item in stream:
+                if turn.cancelled.is_set():
+                    return
+                if isinstance(item, str):
+                    text.append(item)
+                    yield TextDelta(item)
+                else:
+                    requests.append(item)
+        finally:
+            close = getattr(stream, "close", None)
+            if close:
+                close()
+
+    def _execute(
+        self, turn: _Turn, requests: List[Union[ToolCall, MalformedToolCall]]
+    ) -> Generator[SessionEvent, None, List[ToolExecutionResult]]:
+        """Run the requested tools concurrently; returns their results in request order."""
+        results: List[ToolExecutionResult] = []
+        running: List[Tuple[ToolExecutionResult, ToolCall, "concurrent.futures.Future[ToolResult]"]] = []
+        tools = turn.conversation.tools
+
+        for request in requests:
+            if isinstance(request, MalformedToolCall):
+                results.append(ToolExecutionResult(call=None, error=_PARSE_ERROR))
+                continue
+            self.logger.info("ToolCall: %s args=%s", request.name, request.arguments)
+            yield ToolCallEvent(request)
+            outcome = ToolExecutionResult(call=request)
+            tool = tools.get(request.name)
+            if tool is None:
+                outcome.error = f"'{request.name}' is not a recognized tool. Available: {list(tools)}."
+            else:
+                outcome.result = tool.permission_gate(self.state.tools.get_permission(tool.name))
+                if outcome.result is None:
+                    running.append((outcome, request, self.tool_caller.submit(tool, request.arguments)))
+            results.append(outcome)
+
+        deadline = time.monotonic() + self.tool_timeout
+        for outcome, call, future in running:
+            try:
+                outcome.result = future.result(timeout=max(0.0, deadline - time.monotonic()))
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                outcome.error = f"{call.name} timed out"
+                self.logger.error("Tool %s timed out", call.name)
+            except Exception as e:  # noqa: BLE001 - a tool may raise anything; the model is told
+                outcome.error = str(e) or type(e).__name__
+                self.logger.error("Error calling tool %s: %s", call.name, e, exc_info=True)
+
+        for outcome in results:
+            if outcome.call is None:
+                continue
+            if isinstance(outcome.result, ToolChoice):
+                self.state.tools.add_pending(outcome.call, outcome.result, turn=self._turn_number)
+            yield ToolResultEvent(outcome.call, outcome.result, outcome.error)
+        return results
+
+    def _record_tool_round(self, turn: _Turn, reply: str, results: List[ToolExecutionResult]) -> EventStream:
+        """Write a round of tool calls and results to history and speak what the tools said."""
+        conversation = turn.conversation
+        calls = [r.call for r in results if r.call is not None]
+        if calls or reply:
+            turn.added.append(conversation.add_assistant_message(reply, tool_calls=calls))
+
+        notes: Dict[str, None] = {}  # insertion-ordered set
+        for outcome in results:
+            result = outcome.result
+            if result is None:
+                content = f"Tool Error: {outcome.error}"
+                notes.setdefault(_FAILURE_NOTE)
+            else:
+                content = result.result
+                if isinstance(result, ToolChoice):
+                    notes.setdefault(_ASK_USER_NOTE)
+                elif not result.speech:
+                    notes.setdefault(_ANSWER_NOTE)
+            turn.added.append(conversation.add_tool_message(content, tool_call=outcome.call))
+        for note in notes:
+            turn.added.append(conversation.add_tool_message(note))
+
+        if any(isinstance(r.result, ToolChoice) for r in results):
+            self._register_confirm(conversation)
+        for outcome in results:
+            if outcome.result is not None and outcome.result.speech:
+                turn.unrecorded_speech.append(outcome.result.speech)
+                yield TextDelta(outcome.result.speech)
+
+    def _record_reply(self, turn: _Turn, reply: str) -> None:
+        """Record the assistant's spoken reply, led by any tool speech not yet in history."""
+        spoken = " ".join(part for part in (*turn.unrecorded_speech, reply) if part)
+        turn.unrecorded_speech.clear()
+        if spoken:
+            turn.added.append(turn.conversation.add_assistant_message(spoken))
+            self.logger.info("response=%s", spoken)
+
+    def _flush_speech(self, turn: _Turn) -> None:
+        if turn.unrecorded_speech:
+            self._record_reply(turn, "")
+
+    # --- confirmations ---------------------------------------------------
+
+    def _register_confirm(self, conversation: Conversation) -> None:
+        """Offer the model the ``_confirm`` tool once something may need the user's answer."""
+        tools = conversation.tools
+        if CONFIRM_TOOL in tools:
             return
-        if not any(
-            getattr(t, "may_return_choice", False)
-            or getattr(t, "requires_permission", False)
-            for t in self.conversation.tools.values()
-        ) and not any(
-            "pending" in self.conversation.get_meta(tn)
-            for tn in self.conversation.tools
-        ):
+        needs_confirm = self.state.tools.has_pending() or any(
+            t.may_return_choice or t.requires_permission for t in tools.values()
+        )
+        if not needs_confirm:
             return
 
-        self.conversation.tools["_confirm"] = Tool(
-            name="_confirm",
+        tools[CONFIRM_TOOL] = Tool(
+            name=CONFIRM_TOOL,
             description=(
                 "Confirm or resolve a pending ToolChoice or permission request using its unique UID.\n"
-                "Match keys from the ToolChoice payload: pick one item for list options (e.g. choice={'slot': '2'} from {'slot': ['1','2']}), or provide text for open keys (e.g. choice={'answer': 'user response'}).\n"
+                "Match keys from the ToolChoice payload: pick one item for list options (e.g. choice={'slot': '2'} "
+                "from {'slot': ['1','2']}), or provide text for open keys (e.g. choice={'answer': 'user response'}).\n"
                 "Examples:\n"
-                "- Permission: choice={'allow': true, 'remember': false} (set remember=true if user says 'always' or 'remember')\n"
+                "- Permission: choice={'allow': true, 'remember': false} "
+                "(set remember=true if user says 'always' or 'remember')\n"
                 "- Option selection: choice={'slot': '2'}\n"
                 "- Open text choice: choice={'answer': 'user input'}"
             ),
@@ -76,414 +423,117 @@ class Session:
                     ),
                     "choice": Tool.Parameter(
                         type="object",
-                        description="Dictionary payload mapping the selection keys to their values matching the ToolChoice options",
+                        description="Dictionary payload mapping the selection keys to their values "
+                        "matching the ToolChoice options",
                     ),
                 },
                 required=["uid", "choice"],
             ),
             callback=self._on_confirm,
-            instruction="When the user answers a pending ToolChoice prompt, call _confirm with its uid and choice payload.",
+            instruction="When the user answers a pending ToolChoice prompt, "
+            "call _confirm with its uid and choice payload.",
         )
 
-    def _on_confirm(self, uid: str = None, choice: dict = None, **kwargs) -> ToolResult:
-        if kwargs:
-            if not uid and "uid" in kwargs:
-                uid = kwargs["uid"]
-            if not choice:
-                if "choice" in kwargs and isinstance(kwargs["choice"], dict):
-                    choice = kwargs["choice"]
-                else:
-                    choice = {k: v for k, v in kwargs.items() if k != "uid"}
-
-        if not uid:
-            raise ToolError("Missing required parameter 'uid' for _confirm.")
-
-        found_call, found_choice, target_tool_name = None, None, None
-        for t_name in self.conversation.tools:
-            meta = self.conversation.get_meta(t_name)
-            pending = meta.get("pending", {})
-            if uid in pending:
-                target_tool_name = t_name
-                found_call, found_choice = pending[uid]
-                break
-
-        if not found_call:
-            pending_state = self.state.tools.get_all_pending()
-            if uid in pending_state:
-                found_call, found_choice = pending_state[uid]
-                for t_name, tool in self.conversation.tools.items():
-                    target_tool_name = t_name
-
-        if not found_call:
+    async def _on_confirm(self, uid: str, choice: Union[dict, str]) -> ToolResult:
+        """Resolve a pending ToolChoice with the user's answer and run the tool it was holding back."""
+        pending = self.state.tools.get_pending(uid)
+        if pending is None:
             raise ToolError(f"No pending ToolChoice found for UID '{uid}'")
+        if pending.turn == self._turn_number:
+            # The answer must be the user's: a model cannot grant its own request in the same turn.
+            raise ToolError("The user has not answered yet. Ask them, then call _confirm after they reply.")
 
         if isinstance(choice, str):
             try:
                 choice = json.loads(choice)
-            except Exception:
-                raise ToolError("Parameter 'choice' could not be parsed as valid JSON.")
-
-        if choice is None or not isinstance(choice, dict):
+            except json.JSONDecodeError:
+                raise ToolError("Parameter 'choice' could not be parsed as valid JSON.") from None
+        if not isinstance(choice, dict):
             raise ToolError("Parameter 'choice' must be a dictionary.")
 
-        expected_keys = set(found_choice.choices_dict.keys()) - {"uid"}
-        given_keys = set(choice.keys()) - {"uid"}
-
-        if expected_keys == {"allow", "remember"} and "allow" in given_keys:
-            raw_allow = choice["allow"]
-            raw_remember = choice.get("remember", False)
-            allow = (
-                raw_allow
-                if isinstance(raw_allow, bool)
-                else str(raw_allow).lower() in {"true", "1"}
-            )
-            remember = (
-                raw_remember
-                if isinstance(raw_remember, bool)
-                else str(raw_remember).lower() in {"true", "1"}
-            )
-            if remember and target_tool_name:
-                self.state.tools.set_permission(target_tool_name, allow)
-                self.conversation.set_permission(target_tool_name, allow)
-
-            if target_tool_name:
-                self.conversation.get_meta(target_tool_name).get("pending", {}).pop(
-                    uid, None
-                )
-            self.state.tools.remove_pending(uid)
-
-            if allow:
-                tool = self.conversation.tools.get(target_tool_name)
-                if tool is None:
-                    raise ToolError(f"Unknown tool '{target_tool_name}' for _confirm")
-                return tool._execute_direct(**found_call.arguments)
-            else:
-                return ToolResult(
-                    {"status": "cancelled", "action": target_tool_name},
-                    speech=f"Action {target_tool_name} was cancelled.",
-                )
-
-        if expected_keys != given_keys:
-            raise ToolError(
-                f"_confirm choice keys {list(given_keys)} do not match expected keys {list(expected_keys)}"
-            )
-
-        self.conversation.get_meta(target_tool_name).get("pending", {}).pop(uid, None)
-        tool = self.conversation.tools.get(target_tool_name)
+        tool = self.conversation.tools.get(pending.call.name)
         if tool is None:
-            raise ToolError(f"Unknown tool '{target_tool_name}' for _confirm")
-        final_args = dict(found_call.arguments)
-        final_args.update(choice)
-        return tool._execute_direct(**final_args)
+            raise ToolError(f"Unknown tool '{pending.call.name}' for _confirm")
+        expected = set(pending.choice.choices_dict) - {"uid"}
+        given = set(choice) - {"uid"}
 
-    def reset(self, conversation: Optional[Conversation] = None):
-        """Reset conversation and provider state without replacing the session."""
-        with self._lock:
-            self.conversation = conversation or Conversation()
-            self.state.clear()
+        if expected == PERMISSION_KEYS:
+            if "allow" not in given or not given <= PERMISSION_KEYS:
+                raise ToolError(f"_confirm choice keys {sorted(given)} must be 'allow' and optionally 'remember'")
+            allow = _as_bool(choice["allow"])
+            if _as_bool(choice.get("remember", False)):
+                self.state.tools.set_permission(tool.name, allow)
+            self.state.tools.remove_pending(uid)
+            if not allow:
+                return ToolResult(
+                    {"status": "cancelled", "action": tool.name},
+                    speech=f"Action {tool.name} was cancelled.",
+                )
+            return await tool.aexecute(**pending.call.arguments)
 
-    def close(self):
-        """Release the background tool execution loop."""
-        self.tool_caller.stop()
-
-    def save(self, path: str, *, save_kv_cache: bool = False):
-        """Save session to a directory."""
-        os.makedirs(path, exist_ok=True)
-        self.conversation.save(os.path.join(path, "conversation.json"))
-        self.state.save(path, save_binary=save_kv_cache)
-
-    @classmethod
-    def load(cls, path: str, llm: LLM) -> "Session":
-        """Load session from a directory with a fresh LLM instance."""
-        conv_path = os.path.join(path, "conversation.json")
-        conversation = (
-            Conversation.load(conv_path)
-            if os.path.exists(conv_path)
-            else Conversation()
-        )
-        session = cls(llm=llm, conversation=conversation)
-        session.state.load(path)
-        return session
-
-    def complete_once(
-        self,
-        query: str,
-        *,
-        system: str | None = None,
-        **kwargs,
-    ) -> str:
-        """Run an isolated completion without mutating conversation history."""
-        if not isinstance(query, str) or not query.strip():
-            raise LLMError("One-shot queries must be non-empty strings.")
-
-        conversation = Conversation()
-        if system:
-            conversation.set_system_message(system)
-        conversation.add_user_message(query)
-        state = {}
-        response_chunks = []
-
-        # ASVS 15.4.1 / 15.4.3: the shared provider and its model state are
-        # accessed under the Session-owned lock, just like normal completions.
-        with self._lock:
-            for chunk in self.llm(
-                conversation,
-                session_state=state,
-                tool_choice="none",
-                **kwargs,
-            ):
-                if isinstance(chunk, ToolCall):
-                    self.logger.warning(
-                        "Ignored an unexpected tool call during one-shot inference."
-                    )
-                    continue
-                response_chunks.append(chunk)
-        return "".join(response_chunks).strip()
-
-    def __call__(
-        self, query: str | None = None, **kwargs
-    ) -> Generator[str, None, None]:
-        with self._lock:
-            self._register_confirm()
-            if query:
-                self.conversation.add_user_message(query)
-                self.logger.info(f"{query=}")
-
-            if self.context_handler:
-                self.context_handler.pre_process(self.conversation)
-            self.logger.info("Starting LLM call...")
-
-            if self.max_tool_iterations == 0:
-                yield from self._generate_response(tool_choice="none")
-            else:
-                for iteration in range(self.max_tool_iterations + 1):
-                    is_final = iteration == self.max_tool_iterations
-                    tc = "none" if is_final else "auto"
-                    yield from self._generate_response(tool_choice=tc)
-                    results = self.tool_caller.gather(conversation=self.conversation)
-                    if not results:
-                        break
-                    any_error = False
-                    for name, exec_res in results.items():
-                        result = exec_res.result
-                        if isinstance(result, ToolChoice):
-                            self._register_confirm()
-                            self.conversation.add_tool_message(
-                                f"{name}: {result.result}"
-                            )
-                            self.conversation.add_assistant_message(
-                                "Ask the user, then call _confirm."
-                            )
-                            if result.speech:
-                                yield result.speech
-                        elif isinstance(result, ToolResult):
-                            self.conversation.add_tool_message(
-                                f"{name}: {result.result}"
-                            )
-                            if result.speech:
-                                self.conversation.add_assistant_message(result.speech)
-                                yield result.speech
-                            else:
-                                self.conversation.add_tool_message(
-                                    "Now, generate an answer based only on the returned responses."
-                                )
-                        elif isinstance(result, str) and result.startswith(
-                            "Tool Error:"
-                        ):
-                            any_error = True
-                            self.conversation.add_tool_message(f"{name}: {result}")
-                        else:
-                            raise TypeError(
-                                f"Tool '{name}' returned {type(result).__name__}, expected ToolResult"
-                            )
-                    if any_error:
-                        self.conversation.add_tool_message(
-                            "One or more tools failed to execute. Please inform the user of the error and suggest an alternative action."
-                        )
-
-            self.tool_caller.drain()
-            if self.context_handler:
-                self.context_handler.post_process(self.conversation)
-
-    def _generate_response(
-        self, _retry_count: int = 0, **kwargs
-    ) -> Generator[str, None, None]:
-        if _retry_count > 2:
-            self.logger.error("Too many tool parse retries. Aborting.")
-            yield "I encountered a persistent error processing tool calls."
-            return
-
-        response_chunks = []
-        tool_dispatched = False
-        llm_stream = self.llm(
-            self.conversation, session_state=self._session_state, **kwargs
-        )
-        self.logger.debug("_generate_response: starting model stream")
-        for chunk in llm_stream:
-            if isinstance(chunk, ToolCall):
-                self.logger.info("ToolCall: %s args=%s", chunk.name, chunk.arguments)
-                try:
-                    tool_name = chunk.name
-                    tool_args = chunk.arguments
-                except Exception as e:
-                    self.logger.warning(f"Error parsing tool response: {repr(e)}")
-                    self.conversation.add_tool_message(
-                        "Tool Error: Could not parse tool call. Please try again with valid JSON."
-                    )
-                    yield from self._generate_response(
-                        _retry_count=_retry_count + 1, tool_choice="none"
-                    )
-                    return
-                tool = self.conversation.tools.get(tool_name)
-                if tool is None:
-                    self.logger.warning(
-                        f"Tool '{tool_name}' not found in conversation tools."
-                    )
-                    self.conversation.add_tool_message(
-                        f"Tool Error: '{tool_name}' is not a recognized tool. Available: {list(self.conversation.tools.keys())}."
-                    )
-                    yield from self._generate_response(
-                        _retry_count=_retry_count + 1, tool_choice="none"
-                    )
-                    return
-                tool_dispatched = True
-                response_chunks.clear()
-                if kwargs.get("tool_choice") != "none":
-                    self.tool_caller(tool, tool_call=chunk, **tool_args)
-                else:
-                    self.logger.warning(
-                        "Spurious tool call in final pass, ignoring %s", tool_name
-                    )
-            else:
-                response_chunks.append(chunk)
-
-        if not tool_dispatched:
-            final_response = "".join(response_chunks)
-            if final_response:
-                self.conversation.add_assistant_message(final_response)
-                self.logger.info(f"response={final_response}")
-                yield final_response
+        if expected != given:
+            raise ToolError(f"_confirm choice keys {sorted(given)} do not match expected keys {sorted(expected)}")
+        self.state.tools.remove_pending(uid)
+        return await tool.aexecute(**{**pending.call.arguments, **{k: choice[k] for k in given}})
 
 
-@dataclass
-class ToolExecutionResult:
-    tool_call: ToolCall
-    result: ToolResult | ToolChoice | str
+def _as_bool(value: Any) -> bool:
+    return value if isinstance(value, bool) else str(value).lower() in {"true", "1"}
 
 
 class ToolCaller:
+    """Runs tool callbacks on a background asyncio loop, so async and blocking tools share one path."""
 
     def __init__(self):
-        self._loop: asyncio.AbstractEventLoop = None
-        self._loop_thread: threading.Thread = None
-        self._loop_ready_event = threading.Event()
-        self._futures: Queue[Tuple[ToolCall, asyncio.Future]] = None
         self.logger = get_logger(__name__)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
 
-    def __call__(self, tool, tool_call: ToolCall | None = None, **tool_args):
-        if tool_call is None:
-            tool_call = ToolCall(name=tool.name, arguments=tool_args)
-        tool_callable = partial(tool.__call__, **tool_args)
+    def submit(self, tool: Tool, arguments: Dict[str, Any]) -> "concurrent.futures.Future[ToolResult]":
+        """Start ``tool`` with the given arguments; the future resolves to its ToolResult."""
+        if self._loop is None:
+            raise LLMError("ToolCaller is not running.")
+        return asyncio.run_coroutine_threadsafe(tool.aexecute(**arguments), self._loop)
 
-        if inspect.iscoroutinefunction(tool.callback) or inspect.iscoroutinefunction(
-            getattr(tool_callable, "func", None)
-        ):
-            future = asyncio.run_coroutine_threadsafe(tool_callable(), self._loop)
-        else:
-            future = asyncio.run_coroutine_threadsafe(
-                asyncio.to_thread(tool_callable), self._loop
-            )
-        self._futures.put((tool_call, future))
-
-    def gather(
-        self, conversation: Conversation | None = None
-    ) -> Dict[str, ToolExecutionResult]:
-        responses = {}
-        while not self._futures.empty():
-            tool_call, future = self._futures.get()
-            tool_name = tool_call.name
-            try:
-                self.logger.debug("Gathering tool %s ...", tool_name)
-                res = future.result(timeout=10.0)
-                if isinstance(res, ToolChoice) and conversation is not None:
-                    meta = conversation.get_meta(tool_name)
-                    pending_map = meta.setdefault("pending", {})
-                    pending_map[res.uid] = (tool_call, res)
-                responses[tool_name] = ToolExecutionResult(
-                    tool_call=tool_call, result=res
-                )
-                self.logger.debug("Gathered tool %s: %s", tool_name, str(res)[:80])
-            except TimeoutError:
-                err_msg = f"Tool Error: {tool_name} timed out"
-                responses[tool_name] = ToolExecutionResult(
-                    tool_call=tool_call, result=err_msg
-                )
-                self.logger.error(f"Tool {tool_name} timed out")
-            except Exception as e:
-                err_msg = f"Tool Error: {e}"
-                responses[tool_name] = ToolExecutionResult(
-                    tool_call=tool_call, result=err_msg
-                )
-                self.logger.error(f"Error calling tool {tool_name}: {e}", exc_info=True)
-
-        return responses
-
-    def drain(self):
-        """Cancel any leftover tool futures (spurious second-pass calls)."""
-        drained = 0
-        while not self._futures.empty():
-            _, future = self._futures.get()
-            future.cancel()
-            drained += 1
-        if drained:
-            self.logger.debug("Drained %d stale tool future(s)", drained)
-
-    def start(self):
-        """Starts the background asyncio event loop for tool execution."""
+    def start(self) -> None:
+        """Start the background event loop; a no-op if it is already running."""
         if self._loop_thread and self._loop_thread.is_alive():
             return
 
+        ready = threading.Event()
+
         def run_loop():
             loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             self._loop = loop
-            loop.call_soon_threadsafe(self._loop_ready_event.set)
-            loop.run_forever()
-            loop.close()
-            self._loop = None
-            self._loop_ready_event.clear()
+            loop.call_soon(ready.set)
+            try:
+                loop.run_forever()
+            finally:
+                self._loop = None
+                loop.close()
 
-        self._futures = Queue()
-        self._loop_thread = threading.Thread(target=run_loop, daemon=True)
+        self._loop_thread = threading.Thread(target=run_loop, name="voxpipe-tools", daemon=True)
         self._loop_thread.start()
-
-        self._loop_ready_event.wait(timeout=5.0)
-        if not self._loop_ready_event.is_set():
+        if not ready.wait(timeout=5.0):
             raise LLMError("Failed to start background asyncio loop within timeout.")
 
-    def stop(self):
-        """Stops the background asyncio event loop gracefully."""
-        if self._loop:
+    def stop(self) -> None:
+        """Stop the background event loop; tools still running are abandoned."""
+        loop, thread = self._loop, self._loop_thread
+        if loop is not None:
             try:
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                loop.call_soon_threadsafe(loop.stop)
             except RuntimeError:
                 pass  # loop already closed
-            self._loop_thread.join(timeout=5)
-            if self._loop_thread.is_alive():
+        if thread is not None:
+            thread.join(timeout=5)
+            if thread.is_alive():
                 self.logger.warning("Background loop thread did not stop gracefully.")
-            self._loop_thread = None
+        self._loop_thread = None
 
-    def __enter__(self):
+    def __enter__(self) -> "ToolCaller":
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.stop()
-        return False
-
-    def __del__(self):
-        try:
-            self.stop()
-        except Exception:
-            # Destructors may run during interpreter teardown.
-            pass

@@ -1,23 +1,44 @@
-from .conversation import Conversation, Message, MessageList
-from .model import LLMProviders, LiteLLMProvider
-from .session import Session
-from .state import SessionState
+"""LLM layer: conversations, tools, providers, and the session that runs turns."""
+
+from .context import (
+    CompositeStrategy,
+    ContextHandler,
+    EvictionStrategy,
+    MaxTurnsStrategy,
+    MemoryHandler,
+    TokenBudgetStrategy,
+)
+from .conversation import Conversation, Message
+from .model import LLM, GGUFLLM, LiteLLMProvider, LLMProviders
+from .session import Session, SessionEvent, TextDelta, ToolCallEvent, ToolResultEvent
 from .session_manager import SessionManager
-from .context import ContextHandler, MemoryHandler, EvictionStrategy, MaxTurnsStrategy
-from .tools import Tool
+from .state import SessionState
+from .tools import MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult, permission
 
 __all__ = [
-    "LLMProviders",
+    "LLM",
+    "GGUFLLM",
     "LiteLLMProvider",
+    "LLMProviders",
     "Conversation",
     "Message",
-    "MessageList",
     "Session",
+    "SessionEvent",
+    "TextDelta",
+    "ToolCallEvent",
+    "ToolResultEvent",
     "SessionState",
     "SessionManager",
     "ContextHandler",
     "MemoryHandler",
     "EvictionStrategy",
     "MaxTurnsStrategy",
+    "TokenBudgetStrategy",
+    "CompositeStrategy",
     "Tool",
+    "ToolCall",
+    "ToolResult",
+    "ToolChoice",
+    "MalformedToolCall",
+    "permission",
 ]

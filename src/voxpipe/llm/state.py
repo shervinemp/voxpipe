@@ -1,277 +1,198 @@
-"""SessionState manager providing namespaced, thread-safe, auto-saving session state."""
+"""Per-session state: tool permissions and pending choices, user variables, provider caches."""
 
-from dataclasses import dataclass, field
 import json
 import os
+import tempfile
 import threading
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+from .tools import ToolCall, ToolChoice
+
+_STATE_FILE = "state.json"
+_KV_CACHE_FILE = "kv_cache.bin"
+
+# Turn number of a pending choice that did not arise during a live turn (restored from disk, added by hand).
+NO_TURN = -1
+
+
+@dataclass
+class PendingChoice:
+    """A tool call waiting on the user's answer to the ToolChoice it produced."""
+
+    call: ToolCall
+    choice: ToolChoice
+    turn: int = NO_TURN
 
 
 class ToolStateView:
-    """Namespaced view for managing tool permissions, pending choices, and tool metadata."""
+    """Remembered tool permissions and the choices awaiting an answer."""
 
-    def __init__(self, parent: "SessionState"):
-        self._parent = parent
+    def __init__(self, lock: threading.RLock):
+        self._lock = lock
+        self._permissions: Dict[str, bool] = {}
+        self._pending: Dict[str, PendingChoice] = {}
 
-    def get_permission(self, tool_name: str) -> bool | None:
-        with self._parent.atomic():
-            return self._parent._tools_data["permissions"].get(tool_name)
+    def get_permission(self, tool_name: str) -> Optional[bool]:
+        """True or False once the user has decided for good, None while they have not."""
+        with self._lock:
+            return self._permissions.get(tool_name)
 
-    def set_permission(self, tool_name: str, allow: bool | None) -> None:
-        with self._parent.atomic():
-            perms = self._parent._tools_data["permissions"]
+    def set_permission(self, tool_name: str, allow: Optional[bool]) -> None:
+        with self._lock:
             if allow is None:
-                perms.pop(tool_name, None)
+                self._permissions.pop(tool_name, None)
             else:
-                perms[tool_name] = allow
+                self._permissions[tool_name] = allow
 
     def revoke_permission(self, tool_name: str) -> None:
         self.set_permission(tool_name, None)
 
-    def add_pending(self, uid: str, call_obj: Any, choice_obj: Any) -> None:
-        with self._parent.atomic():
-            self._parent._tools_data["pending"][uid] = (call_obj, choice_obj)
+    def add_pending(self, call: ToolCall, choice: ToolChoice, *, turn: int = NO_TURN) -> PendingChoice:
+        pending = PendingChoice(call=call, choice=choice, turn=turn)
+        with self._lock:
+            self._pending[choice.uid] = pending
+        return pending
 
-    def remove_pending(self, uid: str) -> Optional[Tuple[Any, Any]]:
-        with self._parent.atomic():
-            return self._parent._tools_data["pending"].pop(uid, None)
+    def get_pending(self, uid: str) -> Optional[PendingChoice]:
+        with self._lock:
+            return self._pending.get(uid)
 
-    def get_pending(self, uid: str) -> Optional[Tuple[Any, Any]]:
-        with self._parent.atomic():
-            return self._parent._tools_data["pending"].get(uid)
+    def remove_pending(self, uid: str) -> Optional[PendingChoice]:
+        with self._lock:
+            return self._pending.pop(uid, None)
 
-    def get_all_pending(self) -> Dict[str, Tuple[Any, Any]]:
-        with self._parent.atomic():
-            return dict(self._parent._tools_data["pending"])
+    def has_pending(self) -> bool:
+        with self._lock:
+            return bool(self._pending)
+
+    def _clear(self) -> None:
+        self._permissions.clear()
+        self._pending.clear()
+
+    def _dump(self) -> Dict[str, Any]:
+        return {
+            "permissions": dict(self._permissions),
+            "pending": {
+                uid: {
+                    "call": {"id": p.call.id, "name": p.call.name, "arguments": p.call.arguments},
+                    "choice": {"result": p.choice.raw_result, "speech": p.choice.speech},
+                }
+                for uid, p in self._pending.items()
+            },
+        }
+
+    def _restore(self, data: Dict[str, Any]) -> None:
+        self._permissions = {name: bool(allow) for name, allow in data.get("permissions", {}).items()}
+        self._pending = {}
+        for uid, entry in data.get("pending", {}).items():
+            call, choice = entry["call"], entry["choice"]
+            self._pending[uid] = PendingChoice(
+                call=ToolCall(name=call["name"], arguments=call.get("arguments", {}), id=call["id"]),
+                choice=ToolChoice(result=choice.get("result", {}), speech=choice.get("speech"), uid=uid),
+            )
 
 
 class ModelStateView:
-    """Namespaced view for managing LLM provider model state and KV cache buffers."""
+    """Provider state tied to this session: a serialisable KV cache and live runtime objects."""
 
-    def __init__(self, parent: "SessionState"):
-        self._parent = parent
+    def __init__(self, lock: threading.RLock):
+        self._lock = lock
+        self._kv_cache: Optional[bytes] = None
+        # Scratch space for provider objects that live only in this process; never saved.
+        self.runtime: Dict[str, Any] = {}
 
     def set_kv_cache(self, raw_bytes: bytes) -> None:
-        with self._parent.atomic():
-            self._parent._binary_artifacts["kv_cache.bin"] = raw_bytes
+        with self._lock:
+            self._kv_cache = bytes(raw_bytes)
 
     def get_kv_cache(self) -> Optional[bytes]:
-        with self._parent.atomic():
-            return self._parent._binary_artifacts.get("kv_cache.bin")
+        with self._lock:
+            return self._kv_cache
+
+    def _clear(self) -> None:
+        self._kv_cache = None
+        self.runtime.clear()
 
 
 class UserStateView:
-    """Namespaced view for managing user session properties and custom variables."""
+    """Application variables attached to the session; values must be JSON-serialisable to be saved."""
 
-    def __init__(self, parent: "SessionState"):
-        self._parent = parent
+    def __init__(self, lock: threading.RLock):
+        self._lock = lock
+        self._data: Dict[str, Any] = {}
 
     def get(self, key: str, default: Any = None) -> Any:
-        with self._parent.atomic():
-            return self._parent._user_data.get(key, default)
+        with self._lock:
+            return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
-        with self._parent.atomic():
-            self._parent._user_data[key] = value
+        with self._lock:
+            self._data[key] = value
 
     def pop(self, key: str, default: Any = None) -> Any:
-        with self._parent.atomic():
-            return self._parent._user_data.pop(key, default)
+        with self._lock:
+            return self._data.pop(key, default)
 
 
 class SessionState:
-    """Thread-safe, namespaced session state manager with automatic storage routing."""
+    """Thread-safe session state, namespaced as ``tools``, ``model`` and ``user``."""
 
     def __init__(self):
         self._lock = threading.RLock()
-        self._tools_data: Dict[str, Any] = {"permissions": {}, "pending": {}}
-        self._user_data: Dict[str, Any] = {}
-        self._model_data: Dict[str, Any] = {}
-        self._custom_data: Dict[str, Any] = {}
-        self._binary_artifacts: Dict[str, bytes] = {}
-
-        self.tools = ToolStateView(self)
-        self.model = ModelStateView(self)
-        self.user = UserStateView(self)
+        self.tools = ToolStateView(self._lock)
+        self.model = ModelStateView(self._lock)
+        self.user = UserStateView(self._lock)
 
     def atomic(self) -> threading.RLock:
-        """Context manager lock for multi-field atomic mutations."""
+        """Lock to hold (as a context manager) across a multi-step read-modify-write."""
         return self._lock
 
-    @property
-    def _data(self) -> Dict[str, Any]:
-        """Backward compatibility dictionary accessor."""
-        with self._lock:
-            res = dict(self._custom_data)
-            res["tools"] = self._tools_data
-            res["user"] = self._user_data
-            res["model"] = self._model_data
-            return res
-
-    def __getitem__(self, key: str) -> Any:
-        with self._lock:
-            if key in self._custom_data:
-                return self._custom_data[key]
-            if key == "tools":
-                return self._tools_data
-            if key == "user":
-                return self._user_data
-            if key == "model":
-                return self._model_data
-            raise KeyError(key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        with self._lock:
-            if key == "model_state" or isinstance(value, (bytes, bytearray)):
-                b_val = bytes(value) if isinstance(value, (bytes, bytearray)) else value
-                self._binary_artifacts["kv_cache.bin"] = b_val
-                self._binary_artifacts["model_state"] = b_val
-            else:
-                self._custom_data[key] = value
-
-    def __contains__(self, key: str) -> bool:
-        with self._lock:
-            return key in self._custom_data or key in ("tools", "user", "model")
-
-    def get(self, key: str, default: Any = None) -> Any:
-        with self._lock:
-            try:
-                return self[key]
-            except KeyError:
-                return default
-
     def clear(self) -> None:
         with self._lock:
-            self._tools_data["permissions"].clear()
-            self._tools_data["pending"].clear()
-            self._user_data.clear()
-            self._model_data.clear()
-            self._custom_data.clear()
-            self._binary_artifacts.clear()
+            self.tools._clear()
+            self.model._clear()
+            self.user._data.clear()
 
     def save(self, path: str, save_binary: bool = False) -> None:
-        """Persist state cleanly: serializes JSON data to state.json and binary to artifacts."""
+        """Write ``state.json`` into the directory, plus the KV cache when asked and present."""
         os.makedirs(path, exist_ok=True)
         with self._lock:
-            serializable_state = dict(self._custom_data)
-            serializable_state["tools"] = {
-                "permissions": dict(self._tools_data["permissions"]),
-                "pending": {
-                    uid: (
-                        {"name": call.name, "arguments": call.arguments},
-                        {"result": choice.raw_result, "speech": choice.speech, "uid": choice.uid},
-                    )
-                    for uid, (call, choice) in self._tools_data["pending"].items()
-                },
-            }
-            serializable_state["user"] = dict(self._user_data)
-            serializable_state["model"] = dict(self._model_data)
-            serializable_state["custom"] = dict(self._custom_data)
+            payload = json.dumps({"tools": self.tools._dump(), "user": dict(self.user._data)}, indent=2)
+            kv_cache = self.model._kv_cache if save_binary else None
 
-            with open(os.path.join(path, "state.json"), "w") as f:
-                json.dump(serializable_state, f, indent=2)
-
-            if save_binary:
-                for fname, data in self._binary_artifacts.items():
-                    if isinstance(data, (bytes, bytearray)):
-                        with open(os.path.join(path, fname), "wb") as f:
-                            f.write(data)
+        _write_atomically(os.path.join(path, _STATE_FILE), payload.encode("utf-8"))
+        if kv_cache is not None:
+            _write_atomically(os.path.join(path, _KV_CACHE_FILE), kv_cache)
 
     def load(self, path: str) -> None:
-        """Load state from directory."""
-        from .tools import ToolCall, ToolChoice
+        """Replace this state with what :meth:`save` wrote into the directory."""
+        state_file = os.path.join(path, _STATE_FILE)
+        kv_file = os.path.join(path, _KV_CACHE_FILE)
 
-        state_file = os.path.join(path, "state.json")
-        kv_file = os.path.join(path, "kv_cache.bin")
+        data: Dict[str, Any] = {}
+        if os.path.exists(state_file):
+            with open(state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        kv_cache = None
+        if os.path.exists(kv_file):
+            with open(kv_file, "rb") as f:
+                kv_cache = f.read()
 
         with self._lock:
-            if os.path.exists(state_file):
-                with open(state_file) as f:
-                    data = json.load(f)
-
-                if "tools" in data:
-                    self._tools_data["permissions"] = data["tools"].get("permissions", {})
-                    raw_pending = data["tools"].get("pending", {})
-                    reconstructed_pending = {}
-                    for uid, (c_dict, ch_dict) in raw_pending.items():
-                        c_obj = ToolCall(name=c_dict["name"], arguments=c_dict.get("arguments", {}))
-                        ch_obj = ToolChoice(
-                            result=ch_dict.get("result", {}),
-                            speech=ch_dict.get("speech"),
-                            uid=ch_dict.get("uid"),
-                        )
-                        reconstructed_pending[uid] = (c_obj, ch_obj)
-                    self._tools_data["pending"] = reconstructed_pending
-
-                if "user" in data:
-                    self._user_data = data["user"]
-                if "model" in data:
-                    self._model_data = data["model"]
-                if "custom" in data:
-                    self._custom_data.update(data["custom"])
-
-                for k, v in data.items():
-                    if k not in ("tools", "user", "model", "custom"):
-                        self._custom_data[k] = v
-
-            if os.path.exists(kv_file):
-                with open(kv_file, "rb") as f:
-                    b_val = f.read()
-                    self._binary_artifacts["kv_cache.bin"] = b_val
-                    self._binary_artifacts["model_state"] = b_val
+            self.tools._restore(data.get("tools", {}))
+            self.user._data = dict(data.get("user", {}))
+            self.model._clear()
+            self.model._kv_cache = kv_cache
 
 
-class SessionStateDictProxy(dict):
-    """Transparent dict proxy for backward-compatible _session_state dict access."""
-
-    def __init__(self, state: SessionState):
-        super().__init__()
-        self._state = state
-
-    def __getitem__(self, key: str) -> Any:
-        return self._state[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self._state[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        self._state._custom_data.pop(key, None)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._state
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._state.get(key, default)
-
-    def clear(self) -> None:
-        self._state.clear()
-
-    def update(self, *args, **kwargs) -> None:
-        for k, v in dict(*args, **kwargs).items():
-            self[k] = v
-
-    def items(self):
-        return self._state._data.items()
-
-    def keys(self):
-        return self._state._data.keys()
-
-    def values(self):
-        return self._state._data.values()
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, dict):
-            if not other:
-                return (
-                    not self._state._custom_data
-                    and not self._state._tools_data["permissions"]
-                    and not self._state._tools_data["pending"]
-                    and not self._state._user_data
-                    and not self._state._model_data
-                )
-            return dict(self.items()) == other
-        return super().__eq__(other)
-
-    def __repr__(self) -> str:
-        return repr(dict(self.items()))
+def _write_atomically(path: str, data: bytes) -> None:
+    """Write via a temporary sibling so a crash never leaves a truncated file behind."""
+    fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(temp_path, path)
+    except BaseException:
+        os.unlink(temp_path)
+        raise

@@ -1,75 +1,169 @@
+import json
 import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+import zipfile
 
+from voxpipe.core.exceptions import VoxpipeError
 from voxpipe.llm.session import Session
 from voxpipe.llm.session_manager import SessionManager
+from voxpipe.llm.tools import ToolCall, ToolChoice
+
+from ._fakes import ScriptedLLM
 
 
 class TestSessionManager(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
-        self.manager = SessionManager(root_dir=self.tmp_dir)
-        self.mock_llm = MagicMock()
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+        self.manager = SessionManager(root_dir=os.path.join(self.tmp_dir, "root"))
+        self.llm = ScriptedLLM([])
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+    def _session(self, **kwargs):
+        session = Session(llm=self.llm, **kwargs)
+        self.addCleanup(session.close)
+        return session
+
+    def _load(self, session_id, **kwargs):
+        session = self.manager.load_session(session_id, llm=self.llm, **kwargs)
+        self.addCleanup(session.close)
+        return session
 
     def test_save_and_load_session(self):
-        session = Session(llm=self.mock_llm)
+        session = self._session()
         session.conversation.add_user_message("Hello from test!")
         session.state.tools.set_permission("search", True)
 
         path = self.manager.save_session(session, "sess_001", meta={"user": "alice"})
-        self.assertTrue(os.path.exists(path))
-        self.assertTrue(os.path.exists(os.path.join(path, "manifest.json")))
-        self.assertTrue(os.path.exists(os.path.join(path, "conversation.json")))
-        self.assertTrue(os.path.exists(os.path.join(path, "state.json")))
+        for name in ("manifest.json", "conversation.json", "state.json"):
+            self.assertTrue(os.path.exists(os.path.join(path, name)), name)
 
-        loaded = self.manager.load_session("sess_001", llm=self.mock_llm)
-        self.assertEqual(len(loaded.conversation._messages), 1)
+        loaded = self._load("sess_001", max_tool_iterations=4)
         self.assertEqual(loaded.conversation.messages[-1]["content"], "Hello from test!")
         self.assertTrue(loaded.state.tools.get_permission("search"))
+        self.assertEqual(loaded.session_id, "sess_001")
+        self.assertEqual(loaded.max_tool_iterations, 4)
 
-    def test_list_sessions(self):
-        session1 = Session(llm=self.mock_llm)
-        session2 = Session(llm=self.mock_llm)
+    def test_manifest(self):
+        session = self._session()
+        self.manager.save_session(session, "sess", meta={"user": "alice"})
+        first = self.manager.list_sessions()[0]
+        self.manager.save_session(session, "sess")
+        second = self.manager.list_sessions()[0]
 
-        self.manager.save_session(session1, "sess_A")
-        self.manager.save_session(session2, "sess_B")
+        self.assertEqual(first["session_id"], "sess")
+        self.assertEqual(first["llm_provider"], "ScriptedLLM")
+        self.assertEqual(first["custom"], {"user": "alice"})
+        self.assertEqual(second["created_at"], first["created_at"], "re-saving keeps the creation time")
+        self.assertGreaterEqual(second["saved_at"], first["saved_at"])
 
-        sessions = self.manager.list_sessions()
-        session_ids = [s["session_id"] for s in sessions]
-        self.assertIn("sess_A", session_ids)
-        self.assertIn("sess_B", session_ids)
+    def test_list_sessions_flags_broken_entries(self):
+        self.manager.save_session(self._session(), "good")
+        os.makedirs(os.path.join(self.manager.sessions_dir, "no_manifest"))
+        os.makedirs(os.path.join(self.manager.sessions_dir, "corrupt"))
+        with open(os.path.join(self.manager.sessions_dir, "corrupt", "manifest.json"), "w") as f:
+            f.write("{not json")
+
+        by_id = {s["session_id"]: s for s in self.manager.list_sessions()}
+        self.assertEqual(set(by_id), {"good", "no_manifest", "corrupt"})
+        self.assertIs(by_id["no_manifest"]["manifest"], False)
+        self.assertIs(by_id["corrupt"]["corrupted"], True)
 
     def test_delete_session(self):
-        session = Session(llm=self.mock_llm)
-        self.manager.save_session(session, "sess_to_delete")
-
+        self.manager.save_session(self._session(), "sess_to_delete")
         self.assertTrue(self.manager.delete_session("sess_to_delete"))
         self.assertFalse(self.manager.delete_session("sess_to_delete"))
 
+    def test_load_missing_session(self):
+        with self.assertRaises(FileNotFoundError):
+            self.manager.load_session("nope", llm=self.llm)
+
+    def test_session_ids_cannot_escape_the_sessions_directory(self):
+        victim = os.path.join(self.tmp_dir, "victim")
+        os.makedirs(victim)
+        hostile = [
+            os.path.join("..", "..", "victim"),
+            "../../victim",
+            "..",
+            ".",
+            "",
+            os.path.abspath(victim),
+            "a/b",
+            "a\\b",
+            "sess..x",
+            None,
+        ]
+        operations = [
+            self.manager.delete_session,
+            lambda sid: self.manager.load_session(sid, llm=self.llm),
+            lambda sid: self.manager.save_session(self._session(), sid),
+            lambda sid: self.manager.export_zip(sid, os.path.join(self.tmp_dir, "out.zip")),
+        ]
+        for session_id in hostile:
+            for operation in operations:
+                with self.subTest(session_id=session_id), self.assertRaises(VoxpipeError):
+                    operation(session_id)
+        self.assertTrue(os.path.isdir(victim))
+
     def test_export_and_import_zip(self):
-        session = Session(llm=self.mock_llm)
+        session = self._session()
         session.conversation.add_user_message("Zip test message")
         session.state.user.set("zip_var", "zip_val")
         self.manager.save_session(session, "sess_zip")
 
         zip_dest = os.path.join(self.tmp_dir, "exports", "sess_zip.zip")
-        out_path = self.manager.export_zip("sess_zip", zip_dest)
+        self.assertEqual(self.manager.export_zip("sess_zip", zip_dest), zip_dest)
+        self.assertEqual(self.manager.import_zip(zip_dest, session_id="sess_imported"), "sess_imported")
 
-        self.assertTrue(os.path.exists(out_path))
-
-        # Import into a new session ID
-        imported_id = self.manager.import_zip(out_path, session_id="sess_imported")
-        self.assertEqual(imported_id, "sess_imported")
-
-        loaded = self.manager.load_session("sess_imported", llm=self.mock_llm)
+        loaded = self._load("sess_imported")
         self.assertEqual(loaded.conversation.messages[-1]["content"], "Zip test message")
         self.assertEqual(loaded.state.user.get("zip_var"), "zip_val")
+
+    def test_import_defaults_to_the_archive_name_and_replaces_existing(self):
+        stale = self._session()
+        stale.conversation.add_user_message("stale")
+        self.manager.save_session(stale, "trip", save_kv_cache=True)
+
+        fresh = self._session()
+        fresh.conversation.add_user_message("fresh")
+        self.manager.save_session(fresh, "source")
+        archive = self.manager.export_zip("source", os.path.join(self.tmp_dir, "trip.zip"))
+
+        self.assertEqual(self.manager.import_zip(archive), "trip")
+        self.assertEqual(self._load("trip").conversation.messages[-1]["content"], "fresh")
+
+    def test_import_drops_permissions_and_pending_calls(self):
+        """An archive from elsewhere must not arrive with consent already given."""
+        session = self._session()
+        session.state.tools.set_permission("delete_files", True)
+        session.state.tools.add_pending(ToolCall(name="delete_files"), ToolChoice(result={"allow": [True, False]}))
+        session.state.user.set("name", "mallory")
+        self.manager.save_session(session, "source")
+        archive = self.manager.export_zip("source", os.path.join(self.tmp_dir, "a.zip"))
+
+        self.manager.import_zip(archive, session_id="imported")
+        loaded = self._load("imported")
+
+        self.assertIsNone(loaded.state.tools.get_permission("delete_files"))
+        self.assertFalse(loaded.state.tools.has_pending())
+        self.assertEqual(loaded.state.user.get("name"), "mallory")
+
+    def test_import_rejects_unexpected_members(self):
+        archive = os.path.join(self.tmp_dir, "evil.zip")
+        for member in ("../outside.txt", "nested/state.json", "payload.py"):
+            with self.subTest(member=member):
+                with zipfile.ZipFile(archive, "w") as zf:
+                    zf.writestr("conversation.json", json.dumps({"messages": []}))
+                    zf.writestr(member, "x")
+                with self.assertRaises(VoxpipeError):
+                    self.manager.import_zip(archive, session_id="evil")
+                self.assertFalse(os.path.exists(os.path.join(self.manager.sessions_dir, "evil")))
+        self.assertFalse(os.path.exists(os.path.join(self.manager.root_dir, "outside.txt")))
+
+    def test_import_missing_archive(self):
+        with self.assertRaises(FileNotFoundError):
+            self.manager.import_zip(os.path.join(self.tmp_dir, "missing.zip"))
 
 
 if __name__ == "__main__":
