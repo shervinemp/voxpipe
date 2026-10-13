@@ -1,13 +1,13 @@
 """Universal record container for retrieved and stored memory items."""
 
-from dataclasses import dataclass, field
 import json
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict
 
 
 @dataclass
 class Record:
-    """Universal record payload returned by any storage, search, or retrieval component."""
+    """Payload returned by any storage, search, or retrieval component."""
 
     content: Any
     source: str = "global"
@@ -23,26 +23,26 @@ class Record:
 
     @property
     def text(self) -> str:
-        """Convenience property returning string representation of content."""
+        """The content rendered as a string."""
         return str(self)
 
     def __getitem__(self, key: str) -> Any:
-        """Dual-access support: record['content'] or record.content."""
-        if isinstance(key, str) and hasattr(self, key):
+        """Mapping-style access to the record's fields, then to its metadata."""
+        if key in _FIELD_NAMES:
             return getattr(self, key)
-        if isinstance(key, str) and key in self.meta:
+        try:
             return self.meta[key]
-        raise KeyError(key)
+        except (KeyError, TypeError):
+            raise KeyError(key) from None
 
     def __contains__(self, key: object) -> bool:
-        """Support 'key in record' syntax."""
-        if isinstance(key, str):
-            return hasattr(self, key) or key in self.meta
-        return False
+        return isinstance(key, str) and (key in _FIELD_NAMES or key in self.meta)
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Dict-like get access for backward compatibility."""
         try:
             return self[key]
-        except (KeyError, TypeError):
+        except KeyError:
             return default
+
+
+_FIELD_NAMES = frozenset(f.name for f in fields(Record))

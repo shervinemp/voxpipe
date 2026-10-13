@@ -1,78 +1,76 @@
-"""Ephemeral in-memory storage engine implementing Storage protocol."""
+"""Ephemeral in-memory storage engine implementing the Storage protocol."""
 
-from collections import defaultdict
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
-from .protocols import QueryInput, Storage
+from .protocols import QueryInput, keywords, search_banks, store_bank, unpack_query
 from .record import Record
 
 
-class RAMStorage(Storage):
-    """In-memory (RAM-backed) storage engine for transient sessions and unit tests."""
+class RAMStorage:
+    """RAM-backed storage for transient sessions and tests.
+
+    Matches a record when any query keyword occurs in its text, ranking by how
+    many keywords matched and then by recency.
+    """
 
     def __init__(self, max_entries: int = 1000):
         self.max_entries = max_entries
-        self._banks: Dict[str, List[Record]] = defaultdict(list)
+        self._entries: Deque[Tuple[str, Record]] = deque(maxlen=max_entries)
         self._lock = threading.Lock()
 
-    def store(self, content: Any, bank: str = "global", **kwargs) -> Any:
-        role = kwargs.get("role", "user")
-        meta = kwargs.get("meta") or {}
+    def store(
+        self,
+        content: Any,
+        *,
+        bank: Optional[str] = None,
+        role: str = "user",
+        meta: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> Record:
+        bank = store_bank(bank, session_id)
         record = Record(
             content=content,
             source=f"ram:{bank}",
-            score=1.0,
-            meta={"role": role, "created_at": time.time(), **meta},
+            meta={**(meta or {}), "role": role, "created_at": time.time(), "bank": bank},
         )
         with self._lock:
-            entries = self._banks[bank]
-            entries.append(record)
-            if len(entries) > self.max_entries:
-                self._banks[bank] = entries[-self.max_entries:]
+            self._entries.append((bank, record))
         return record
 
     def retrieve(
         self,
         query: QueryInput,
-        banks: Optional[List[str] | str] = "global",
+        *,
+        banks: Union[str, Iterable[str], None] = None,
         top_k: int = 3,
-        **kwargs,
+        role: Optional[str] = None,
+        session_id: Optional[str] = None,
+        include_global: bool = True,
     ) -> List[Record]:
-        from .protocols import Query
-        if isinstance(query, Query):
-            query_str = (query.text or "").lower()
-            top_k = query.top_k or top_k
-        else:
-            query_str = str(query).lower()
-
-        keywords = [w for w in query_str.split() if len(w) > 2]
-        if not keywords and query_str:
-            keywords = [query_str]
-
-        if isinstance(banks, str):
-            target_banks = [banks]
-        elif isinstance(banks, list):
-            target_banks = banks
-        else:
-            target_banks = ["global"]
-
-        role_filter = kwargs.get("role")
-        results: List[Record] = []
-        seen_content = set()
+        text, top_k = unpack_query(query, top_k)
+        terms = keywords(text)
+        if not terms or top_k <= 0:
+            return []
+        targets = set(search_banks(banks, session_id, include_global))
 
         with self._lock:
-            for b in target_banks:
-                for record in reversed(self._banks.get(b, [])):
-                    rec_content_str = str(record).lower()
-                    rec_role = record.meta.get("role")
-                    if role_filter and rec_role != role_filter:
-                        continue
-                    if any(kw in rec_content_str for kw in keywords) or not keywords:
-                        if record.content not in seen_content:
-                            seen_content.add(record.content)
-                            results.append(record)
-                            if len(results) >= top_k:
-                                return results
-        return results
+            candidates = [record for bank, record in self._entries if bank in targets]
+
+        scored: Dict[str, Tuple[float, int, Record]] = {}
+        for age, record in enumerate(reversed(candidates)):
+            if role and record.meta.get("role") != role:
+                continue
+            haystack = record.text.lower()
+            hits = sum(term in haystack for term in terms)
+            # Newest copy of a repeated text wins: it is visited first.
+            if hits and record.text not in scored:
+                scored[record.text] = (hits / len(terms), -age, record)
+
+        ranked = sorted(scored.values(), key=lambda item: item[:2], reverse=True)[:top_k]
+        return [
+            Record(content=record.content, source=record.source, score=score, meta=dict(record.meta))
+            for score, _, record in ranked
+        ]

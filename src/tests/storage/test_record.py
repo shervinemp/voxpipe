@@ -24,6 +24,16 @@ class TestRecord(unittest.TestCase):
         self.assertEqual(rec["content"], "Content val")
         self.assertEqual(rec["source"], "src1")
         self.assertEqual(rec["extra"], 123)
+        self.assertEqual(rec.get("missing", "fallback"), "fallback")
+        self.assertIn("extra", rec)
+
+    def test_indexing_does_not_expose_attributes(self):
+        rec = Record(content="x")
+        for name in ("text", "get", "__class__"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, rec)
+                with self.assertRaises(KeyError):
+                    rec[name]
 
 
 if __name__ == "__main__":

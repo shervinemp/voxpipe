@@ -1,5 +1,5 @@
 """
-Integration benchmarks for Memory using an LLM as a verifier.
+Integration benchmarks for conversation memory using an LLM as a verifier.
 
 Requires a real GGUF model to be downloaded. Skipped if absent.
 
@@ -8,39 +8,16 @@ history and reports recall, precision, and F1.
 """
 
 import json
-import logging
 import os
 import tempfile
 import unittest
 
-import pytest
+from voxpipe.core.config import get_config
+from voxpipe.storage import SQLiteStorage
 
+from .._integration import requires_configured_llm
 
-# ---------------------------------------------------------------------------
-# Model detection (lazy -- runs on first test, not at module import)
-# ---------------------------------------------------------------------------
-
-
-def _model_key() -> str:
-    from voxpipe.core.config import config
-    return config.get("llm.model", "Gemma4E4B")
-
-
-def _has_model() -> bool:
-    try:
-        from voxpipe.storage.manager import is_downloaded
-        return is_downloaded(_model_key())
-    except Exception:
-        return False
-
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not _has_model(),
-        reason="GGUF model not downloaded -- run python -m voxpipe.llm.download first",
-    ),
-]
+pytestmark = requires_configured_llm()
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +84,12 @@ class MemoryBenchmark:
 
     def run(self, history: list[str], question: str, threshold: float = 0.3) -> dict:
         from voxpipe.llm.conversation import Conversation
-        from voxpipe.storage.memory import Memory
 
         fd, db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
 
+        memory = SQLiteStorage(db_path=db_path, max_entries=50, ttl_days=1)
         try:
-            memory = Memory(db_path=db_path, max_entries=50, ttl_days=1)
             for turn in history:
                 memory.store(turn, role="user")
                 memory.store(turn, role="assistant")
@@ -140,14 +116,8 @@ class MemoryBenchmark:
                 "passed": scores["f1"] >= threshold,
             }
         finally:
-            try:
-                memory.close()
-            except Exception:
-                pass
-            try:
-                os.unlink(db_path)
-            except Exception:
-                pass
+            memory.close()
+            os.unlink(db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +133,9 @@ class TestMemoryBenchmark(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from voxpipe.llm.model import LLMProviders
-        from voxpipe.core.config import config
-        cls._model = LLMProviders.create(config.get("llm.backend", "local"), _model_key())
-        cls._model.logger = logging.getLogger("benchmark")
+
+        llm_config = get_config().llm
+        cls._model = LLMProviders.create(llm_config.backend, llm_config.model)
 
     def _check(self, result: dict, label: str):
         cls = result["classification"]

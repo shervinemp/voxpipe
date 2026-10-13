@@ -1,206 +1,174 @@
-"""SQLite-backed storage engine with FTS5 keyword search implementing Storage protocol."""
+"""SQLite-backed storage engine with FTS5 keyword search implementing the Storage protocol."""
 
-import hashlib
 import json
 import os
 import sqlite3
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
 
-from voxpipe.core.utils import get_logger
-from .protocols import QueryInput, Storage
+from ..core.exceptions import StorageError
+from ..core.utils import get_logger
+from .protocols import QueryInput, keywords, search_banks, store_bank, unpack_query
 from .record import Record
 
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bank TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    meta TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_records_bank ON records(bank);
+CREATE INDEX IF NOT EXISTS idx_records_created ON records(created_at);
+CREATE VIRTUAL TABLE IF NOT EXISTS records_fts
+    USING fts5(content, content='records', content_rowid='id', tokenize='porter');
+CREATE TRIGGER IF NOT EXISTS records_fts_insert AFTER INSERT ON records BEGIN
+    INSERT INTO records_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS records_fts_delete AFTER DELETE ON records BEGIN
+    INSERT INTO records_fts(records_fts, rowid, content) VALUES ('delete', old.id, old.content);
+END;
+"""
 
-class SQLiteStorage(Storage):
-    """Production SQLite storage engine with WAL mode and multi-bank support."""
+# Rows fetched per requested result, so duplicates can be dropped without a second query.
+_OVERFETCH = 4
 
-    def __init__(self, db_path: str, max_entries: int = 1000, ttl_days: int = 30):
+
+class SQLiteStorage:
+    """Persistent storage with multi-bank scoping, BM25-ranked recall, and TTL/count eviction."""
+
+    def __init__(self, db_path: str, max_entries: int = 1000, ttl_days: Optional[float] = 30):
+        """``ttl_days`` of None or 0 keeps entries until ``max_entries`` pushes them out."""
         self.logger = get_logger(__name__)
         self.db_path = db_path
         self.max_entries = max_entries
-        self.ttl_seconds = ttl_days * 86400
+        self.ttl_seconds = ttl_days * 86400 if ttl_days else None
         self._lock = threading.Lock()
 
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._init_schema()
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(_SCHEMA)
+            self._migrate_legacy_tables()
+        except sqlite3.OperationalError as e:
+            self._conn.close()
+            raise StorageError(f"Could not initialise {db_path} (FTS5 support is required): {e}") from e
 
-    def _init_schema(self):
+    def _migrate_legacy_tables(self) -> None:
+        """Carry rows over from the pre-0.2 ``conversations`` table, then drop it."""
+        tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "conversations" not in tables:
+            return
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(conversations)")}
+        bank = "COALESCE(session_id, 'global')" if "session_id" in columns else "'global'"
         with self._conn:
-            self._conn.executescript("""
-                CREATE TABLE IF NOT EXISTS conversations (
-                    id TEXT PRIMARY KEY,
-                    session_id TEXT,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    meta TEXT DEFAULT '{}',
-                    created_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_conv_created ON conversations(created_at);
-                CREATE INDEX IF NOT EXISTS idx_conv_role ON conversations(role);
-                CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
-            """)
-            cur = self._conn.execute("PRAGMA table_info(conversations)")
-            cols = [row[1] for row in cur.fetchall()]
-            if "session_id" not in cols:
-                self._conn.execute("ALTER TABLE conversations ADD COLUMN session_id TEXT")
-                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)")
+            self._conn.execute(
+                "INSERT INTO records (bank, role, content, meta, created_at) "
+                f"SELECT {bank}, role, content, COALESCE(meta, '{{}}'), created_at "
+                "FROM conversations ORDER BY created_at"
+            )
+            self._conn.execute("DROP TABLE conversations")
+            self._conn.execute("DROP TABLE IF EXISTS conv_fts")
+        self.logger.info("Migrated legacy conversation history in %s", self.db_path)
 
-            try:
-                self._conn.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS conv_fts "
-                    "USING fts5(content, tokenize='porter')"
-                )
-                self._conn.execute(
-                    "CREATE TRIGGER IF NOT EXISTS conv_fts_del "
-                    "AFTER DELETE ON conversations BEGIN "
-                    "DELETE FROM conv_fts WHERE rowid = old.rowid; END;"
-                )
-            except sqlite3.OperationalError:
-                pass
-
-    def store(self, content: Any, bank: str = "global", **kwargs) -> Record:
-        session_id = kwargs.get("session_id")
-        if session_id and bank == "global":
-            bank = f"session:{session_id}" if not str(session_id).startswith("session:") else session_id
-
-        role = kwargs.get("role", "user")
-        meta = kwargs.get("meta") or {}
-        if "bank" not in meta:
-            meta["bank"] = bank
-
-        content_str = json.dumps(content) if isinstance(content, dict) else str(content)
-        entry_id = hashlib.md5(f"{role}:{content_str}:{time.time()}".encode()).hexdigest()[:16]
-        meta_str = json.dumps(meta)
+    def store(
+        self,
+        content: Any,
+        *,
+        bank: Optional[str] = None,
+        role: str = "user",
+        meta: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> Record:
+        bank = store_bank(bank, session_id)
+        text = json.dumps(content) if isinstance(content, dict) else str(content)
         now = time.time()
 
-        record = Record(
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO records (bank, role, content, meta, created_at) VALUES (?, ?, ?, ?, ?)",
+                (bank, role, text, json.dumps(meta or {}), now),
+            )
+            self._evict()
+
+        return Record(
             content=content,
             source=f"sqlite:{bank}",
-            score=1.0,
-            meta={"role": role, "created_at": now, "bank": bank, **meta},
+            meta={**(meta or {}), "role": role, "created_at": now, "bank": bank},
         )
-
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO conversations "
-                "(id, session_id, role, content, meta, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (entry_id, bank, role, content_str, meta_str, now),
-            )
-            try:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO conv_fts (rowid, content) "
-                    "VALUES (last_insert_rowid(), ?)", (content_str,),
-                )
-            except sqlite3.OperationalError:
-                pass
-            self._evict_old()
-
-        return record
 
     def retrieve(
         self,
         query: QueryInput,
-        banks: Optional[List[str] | str] = "global",
+        *,
+        banks: Union[str, Iterable[str], None] = None,
         top_k: int = 3,
-        **kwargs,
+        role: Optional[str] = None,
+        session_id: Optional[str] = None,
+        include_global: bool = True,
     ) -> List[Record]:
-        from .protocols import Query
-        if isinstance(query, Query):
-            query_str = query.text or ""
-            top_k = query.top_k or top_k
-        else:
-            query_str = str(query)
-
-        role = kwargs.get("role")
-        keywords = [w for w in query_str.lower().split() if len(w) > 2]
-        if not keywords:
+        """Return up to ``top_k`` records matching any query keyword, best BM25 match first."""
+        text, top_k = unpack_query(query, top_k)
+        terms = keywords(text)
+        if not terms or top_k <= 0:
             return []
+        targets = search_banks(banks, session_id, include_global)
 
-        session_id = kwargs.get("session_id")
-        include_global = kwargs.get("include_global", True)
+        # Each term is quoted so FTS5 reads it as a phrase, never as query syntax.
+        match = " OR ".join('"{}"'.format(term.replace('"', '""')) for term in terms)
+        sql = (
+            "SELECT r.content, r.role, r.created_at, r.bank, r.meta, bm25(records_fts) AS rank "
+            "FROM records_fts JOIN records r ON r.id = records_fts.rowid "
+            f"WHERE records_fts MATCH ? AND r.bank IN ({', '.join('?' * len(targets))})"
+        )
+        params: List[Any] = [match, *targets]
+        if role:
+            sql += " AND r.role = ?"
+            params.append(role)
+        sql += " ORDER BY rank, r.id DESC LIMIT ?"
+        params.append(top_k * _OVERFETCH)
 
-        if isinstance(banks, str):
-            target_banks = [banks]
-        elif isinstance(banks, list):
-            target_banks = list(banks)
-        else:
-            target_banks = ["global"]
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
 
-        if session_id:
-            s_bank = f"session:{session_id}" if not session_id.startswith("session:") else session_id
-            target_banks = [s_bank, session_id]
-            if include_global:
-                target_banks.append("global")
+        records: Dict[str, Record] = {}
+        for content, row_role, created_at, bank, meta_json, rank in rows:
+            if content in records:
+                continue
+            try:
+                meta = json.loads(meta_json) if meta_json else {}
+            except json.JSONDecodeError:
+                meta = {}
+            records[content] = Record(
+                content=content,
+                source=f"sqlite:{bank}",
+                score=-rank,  # bm25() is negative; closer to zero means a weaker match
+                meta={**meta, "role": row_role, "created_at": created_at, "bank": bank},
+            )
+            if len(records) >= top_k:
+                break
+        return list(records.values())
 
-        placeholders = ",".join("?" for _ in target_banks)
-        sess_clause = f" AND (c.session_id IN ({placeholders})) " if target_banks else ""
-
-        results: List[Record] = []
-        seen = set()
-
-        try:
-            for kw in keywords[:5]:
-                sql_params = [f'"{kw}"']
-                if role:
-                    sql_params.append(role)
-                    sql_params.extend(target_banks)
-                    sql_params.append(top_k)
-                    cur = self._conn.execute(
-                        "SELECT c.content, c.role, c.created_at, c.session_id, c.meta "
-                        "FROM conversations c WHERE c.rowid IN ("
-                        "SELECT rowid FROM conv_fts WHERE conv_fts MATCH ?)"
-                        f"AND c.role = ? {sess_clause} ORDER BY c.created_at DESC LIMIT ?",
-                        tuple(sql_params),
-                    )
-                else:
-                    sql_params.extend(target_banks)
-                    sql_params.append(top_k)
-                    cur = self._conn.execute(
-                        "SELECT c.content, c.role, c.created_at, c.session_id, c.meta "
-                        "FROM conversations c WHERE c.rowid IN ("
-                        "SELECT rowid FROM conv_fts WHERE conv_fts MATCH ?)"
-                        f"{sess_clause} ORDER BY c.created_at DESC LIMIT ?",
-                        tuple(sql_params),
-                    )
-
-                for row in cur.fetchall():
-                    c_text, c_role, c_time, c_bank, c_meta_raw = row
-                    if c_text not in seen:
-                        seen.add(c_text)
-                        try:
-                            c_meta = json.loads(c_meta_raw) if c_meta_raw else {}
-                        except Exception:
-                            c_meta = {}
-
-                        rec = Record(
-                            content=c_text,
-                            source=f"sqlite:{c_bank or 'global'}",
-                            score=1.0,
-                            meta={"role": c_role, "created_at": c_time, "bank": c_bank, **c_meta},
-                        )
-                        results.append(rec)
-                        if len(results) >= top_k:
-                            return results
-            return results
-        except sqlite3.OperationalError:
-            return []
-
-    def _evict_old(self):
-        cutoff = time.time() - (self.ttl_seconds if self.ttl_seconds > 0 else 1.0)
-        self._conn.execute("DELETE FROM conversations WHERE created_at < ?", (cutoff,))
-        count = self._conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-        if count > self.max_entries:
-            to_remove = count - self.max_entries
+    def _evict(self) -> None:
+        """Drop expired rows, then the oldest rows beyond ``max_entries``. Caller holds the lock."""
+        if self.ttl_seconds is not None:
+            self._conn.execute("DELETE FROM records WHERE created_at < ?", (time.time() - self.ttl_seconds,))
+        surplus = self._conn.execute("SELECT COUNT(*) FROM records").fetchone()[0] - self.max_entries
+        if surplus > 0:
             self._conn.execute(
-                "DELETE FROM conversations WHERE rowid IN ("
-                "SELECT rowid FROM conversations ORDER BY created_at ASC LIMIT ?)",
-                (to_remove,),
+                "DELETE FROM records WHERE id IN (SELECT id FROM records ORDER BY id ASC LIMIT ?)", (surplus,)
             )
 
-    def close(self):
-        self._conn.close()
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> "SQLiteStorage":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()

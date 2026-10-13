@@ -1,13 +1,10 @@
-"""Public exports for voxpipe storage module."""
+"""Public exports for the voxpipe storage package."""
 
-from .record import Record
-from .protocols import Query, QueryInput, Retriever, Storer, Storage
+from .memory import MemoryStore
+from .protocols import Query, QueryInput, Retriever, Storage, Storer
 from .ram import RAMStorage
+from .record import Record
 from .sqlite import SQLiteStorage
-from .base import MemoryStore
-
-# Backward compatibility alias
-Memory = SQLiteStorage
 
 __all__ = [
     "Record",
@@ -19,5 +16,4 @@ __all__ = [
     "RAMStorage",
     "SQLiteStorage",
     "MemoryStore",
-    "Memory",
 ]
