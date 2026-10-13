@@ -1,9 +1,9 @@
 """Context window management: eviction strategies and the memory-backed context handler."""
 
 import json
-from abc import ABC
+import threading
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, Iterable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Protocol, runtime_checkable
 
 from ..core.utils import get_logger
 from ..storage.protocols import Storage
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 _ARCHIVED_ROLES = (Message.Role.user, Message.Role.assistant)
 _MIN_RECALL_QUERY_CHARS = 4
 _MAX_SNIPPET_CHARS = 200
+_MAX_ARCHIVE_BACKLOG = 200  # messages kept for another try while the memory backend is failing
 # How far below its limit a strategy cuts by default.  Cutting to the limit itself would move the
 # start of the prompt on every turn, and a model that caches its prompt prefix would re-read it all.
 _TRIM_FRACTION = 0.6
@@ -38,12 +39,16 @@ class MaxTurnsStrategy:
     """
 
     def __init__(self, max_turns: int = 10, *, trim_to: Optional[int] = None):
+        if trim_to is None:
+            trim_to = max(1, round(max_turns * _TRIM_FRACTION))
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in (max_turns, trim_to)):
+            raise TypeError("max_turns and trim_to must be whole numbers.")
         if max_turns < 1:
             raise ValueError("max_turns must be at least 1.")
-        self.max_turns = max_turns
-        self.trim_to = max(1, round(max_turns * _TRIM_FRACTION)) if trim_to is None else trim_to
-        if not 1 <= self.trim_to <= max_turns:
+        if not 1 <= trim_to <= max_turns:
             raise ValueError("trim_to must be between 1 and max_turns.")
+        self.max_turns = max_turns
+        self.trim_to = trim_to
 
     def __call__(self, conversation: "Conversation") -> int:
         turn_starts = [i for i, m in enumerate(conversation.history) if m.role is Message.Role.user]
@@ -69,6 +74,8 @@ class TokenBudgetStrategy:
         *,
         trim_to: Optional[int] = None,
     ):
+        if budget < 1:
+            raise ValueError("budget must be positive.")
         if trim_to is not None and not 0 <= trim_to <= budget:
             raise ValueError("trim_to must be between 0 and the budget.")
         self.budget = budget
@@ -77,7 +84,7 @@ class TokenBudgetStrategy:
         self._count = lru_cache(maxsize=4096)(count_tokens)
 
     def __call__(self, conversation: "Conversation") -> int:
-        costs = [self._count(m.rendered) + self.per_message_overhead for m in conversation.history]
+        costs = [self._count(_sent_text(m)) + self.per_message_overhead for m in conversation.history]
         fixed = self._count(conversation.system_prompt)
         if conversation.tools:
             fixed += self._count(json.dumps([t.to_dict() for t in conversation.tools.values()]))
@@ -97,6 +104,15 @@ class TokenBudgetStrategy:
         return evict
 
 
+def _sent_text(message: Message) -> str:
+    """Everything of a message that reaches the model: its text, and the tool calls or tool name it carries."""
+    parts = [message.rendered]
+    if message.name:
+        parts.append(message.name)
+    parts.extend(f"{call.name}{json.dumps(call.arguments, default=str)}" for call in message.tool_calls)
+    return "".join(parts)
+
+
 class CompositeStrategy:
     """Evicts as many messages as the most demanding of several strategies asks for."""
 
@@ -107,8 +123,11 @@ class CompositeStrategy:
         return max((strategy(conversation) for strategy in self.strategies), default=0)
 
 
-class ContextHandler(ABC):
-    """Hooks a Session calls around each turn to manage the conversation's context."""
+class ContextHandler:
+    """Hooks a Session calls around each turn to manage the conversation's context.
+
+    Every hook does nothing by default; override the ones you need.
+    """
 
     def pre_process(self, conversation: "Conversation") -> bool:
         """Runs before generation. Returns True if the context was modified."""
@@ -128,7 +147,8 @@ class MemoryHandler(ContextHandler):
     Each turn it evicts the messages the strategy no longer wants.  Given a
     ``memory`` (anything with ``store`` and ``retrieve``) it archives what it
     evicts (``auto_archive``) and prefixes the newest user message with up to
-    ``recall_top_k`` related memories.
+    ``recall_top_k`` related memories.  Messages the memory fails to take are
+    kept and offered again the next time anything is archived.
     """
 
     def __init__(
@@ -145,6 +165,8 @@ class MemoryHandler(ContextHandler):
         self.auto_archive = auto_archive
         self.recall_top_k = recall_top_k
         self._recalled_for: Optional[Message] = None
+        self._backlog: List[Message] = []  # evicted, but the memory would not take them
+        self._archive_lock = threading.Lock()  # finalize() can arrive from reset() while a turn winds down
 
     def pre_process(self, conversation: "Conversation") -> bool:
         trimmed = self._trim(conversation)
@@ -164,16 +186,28 @@ class MemoryHandler(ContextHandler):
     def _archive(self, messages: Iterable[Message]) -> None:
         if self.memory is None or not self.auto_archive:
             return
-        pending = [m for m in messages if m.role in _ARCHIVED_ROLES and m.content.strip() and not m.archived]
-        try:
-            for message in pending:
-                self.memory.store(message.content, role=message.role.value)
-                message.archived = True
-        except Exception:  # noqa: BLE001 - a failing memory backend must not break the conversation
-            self.logger.warning("Could not archive conversation turns to memory.", exc_info=True)
-            return
-        if pending:
-            self.logger.info("Archived %d messages to memory.", len(pending))
+        with self._archive_lock:
+            queued = {id(m) for m in self._backlog}
+            pending = self._backlog + [
+                m
+                for m in messages
+                if m.role in _ARCHIVED_ROLES and m.content.strip() and not m.archived and id(m) not in queued
+            ]
+            stored = 0
+            try:
+                for message in pending:
+                    self.memory.store(message.content, role=message.role.value)
+                    message.archived = True
+                    stored += 1
+            except Exception:  # noqa: BLE001 - a failing memory backend must not break the conversation
+                self.logger.warning(
+                    "Could not archive %d message(s) to memory; they will be offered again.",
+                    len(pending) - stored,
+                    exc_info=True,
+                )
+            self._backlog = pending[stored:][-_MAX_ARCHIVE_BACKLOG:]
+            if stored:
+                self.logger.info("Archived %d messages to memory.", stored)
 
     def _recall(self, conversation: "Conversation") -> bool:
         """Attach related memories to the newest user message, once per message."""

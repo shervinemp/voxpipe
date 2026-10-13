@@ -2,7 +2,9 @@
 
 import json
 import logging
+import os
 import re
+import tempfile
 from typing import Any
 
 _JSON_VALUE_RE = re.compile(r"(\[.*\]|\{.*\})", re.DOTALL)
@@ -37,6 +39,18 @@ def safe_json_loads(text: str, fallback: Any = None) -> Any:
             except json.JSONDecodeError:
                 continue
     return fallback if fallback is not None else []
+
+
+def write_atomically(path: str, data: bytes) -> None:
+    """Write via a temporary sibling so a crash or a full disk never leaves a truncated file behind."""
+    fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(temp_path, path)
+    except BaseException:
+        os.unlink(temp_path)
+        raise
 
 
 def load_specs(specs_path: str) -> Any:

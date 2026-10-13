@@ -281,5 +281,19 @@ class TestEviction(unittest.TestCase):
         self.assertEqual(len(conv.history), 1)
 
 
+class TestSaving(unittest.TestCase):
+    def test_a_failed_save_keeps_the_previous_file(self):
+        conv = Conversation()
+        conv.add_user_message("first")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "conversation.json")
+            conv.save(path)
+            conv.add_assistant_message("", tool_calls=[ToolCall(name="t", arguments={"when": object()})])
+            with self.assertRaises(TypeError):
+                conv.save(path)
+            self.assertEqual([m.content for m in Conversation.load(path).history], ["first"])
+            self.assertEqual(os.listdir(tmp), ["conversation.json"])
+
+
 if __name__ == "__main__":
     unittest.main()

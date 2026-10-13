@@ -18,6 +18,9 @@ from .state import SessionState
 from .tools import PERMISSION_KEYS, MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult, ToolSet
 
 CONFIRM_TOOL = "_confirm"
+CONVERSATION_FILE = "conversation.json"
+
+_CANCEL_POLL_SECONDS = 0.05  # how often a wait on running tools checks whether the turn was cancelled
 
 _ANSWER_NOTE = "Now, generate an answer based only on the returned responses."
 _FAILURE_NOTE = (
@@ -64,6 +67,9 @@ class ToolExecutionResult:
     error: Optional[str] = None
 
 
+_Running = Tuple[ToolExecutionResult, "concurrent.futures.Future[ToolResult]"]
+
+
 @dataclass
 class _Turn:
     """Bookkeeping for one turn in flight."""
@@ -71,7 +77,18 @@ class _Turn:
     conversation: Conversation
     cancelled: threading.Event = field(default_factory=threading.Event)
     added: List[Message] = field(default_factory=list)
+    # The unanswered user message this turn's query was merged into, with what it held before.
+    extended: Optional[Tuple[Message, str, Optional[str]]] = None
     unrecorded_speech: List[str] = field(default_factory=list)
+    asked: List[str] = field(default_factory=list)  # uids of the questions this turn left for the user
+
+    def roll_back(self) -> None:
+        """Undo everything the turn wrote to its conversation."""
+        self.unrecorded_speech.clear()
+        self.conversation.discard(self.added)
+        if self.extended is not None:
+            message, content, context = self.extended
+            message.content, message.context = content, context
 
 
 class Session:
@@ -107,9 +124,11 @@ class Session:
         if instructions is not None:
             self.instructions = instructions
         if rules is not None:
-            self.rules.extend(rules)
+            # A rule the conversation already carries (a saved session being reloaded) is not repeated.
+            new_rules = [rules] if isinstance(rules, str) else rules
+            self.rules.extend(rule for rule in new_rules if rule not in self.rules)
         if tools is not None:
-            self.tools.add(*tools)
+            self.tools.update(ToolSet(tools))
         self.max_tool_iterations = max_tool_iterations
         self.context_handler = context_handler
         self.tool_timeout = tool_timeout
@@ -118,6 +137,7 @@ class Session:
         self._lock = threading.Lock()  # held for the length of a turn
         self._active: Optional[_Turn] = None
         self._turn_number = 0
+        self._closed = False
 
         self.tool_caller = ToolCaller()
         self.tool_caller.start()
@@ -172,16 +192,18 @@ class Session:
         """
         self.cancel()
         previous = self.conversation
-        if self.context_handler:
+        if self.context_handler is not None:
             self.context_handler.finalize(previous)
-        # A new object rather than a cleared one: a cancelled turn may still be writing to the old.
-        self.conversation = conversation if conversation is not None else previous.blank_copy()
-        self.state.clear()
+        with self.state.atomic():  # a turn still winding down must see the swap and the clearing as one step
+            # A new object rather than a cleared one: that turn may still be writing to the old.
+            self.conversation = conversation if conversation is not None else previous.blank_copy()
+            self.state.clear()
 
     def close(self) -> None:
         """Stop any turn in flight, flush the context handler and release the tool loop."""
+        self._closed = True
         self.cancel()
-        if self.context_handler:
+        if self.context_handler is not None:
             self.context_handler.finalize(self.conversation)
         self.tool_caller.stop()
 
@@ -194,8 +216,10 @@ class Session:
     def save(self, path: str) -> None:
         """Save the conversation and session state into a directory."""
         os.makedirs(path, exist_ok=True)
-        self.conversation.save(os.path.join(path, "conversation.json"))
+        # State first: it is the one that can refuse (a user value that is not JSON), and it must
+        # not leave a new conversation next to the old state.
         self.state.save(path)
+        self.conversation.save(os.path.join(path, CONVERSATION_FILE))
 
     @classmethod
     def load(cls, path: str, llm: LLM, **kwargs) -> "Session":
@@ -203,10 +227,12 @@ class Session:
 
         Tools are not persisted: pass ``tools=`` again.
         """
-        conv_path = os.path.join(path, "conversation.json")
+        conv_path = os.path.join(path, CONVERSATION_FILE)
         conversation = Conversation.load(conv_path) if os.path.exists(conv_path) else Conversation()
+        state = SessionState()
+        state.load(path)  # before the session exists, so a bad file leaves no tool loop running
         session = cls(llm=llm, conversation=conversation, **kwargs)
-        session.state.load(path)
+        session.state = state
         return session
 
     # --- running turns ---------------------------------------------------
@@ -224,17 +250,28 @@ class Session:
             # Closing this stream must end the turn now, not whenever the inner generator is collected.
             events.close()
 
-    def events(self, query: str | None = None, *, context: str | None = None, **kwargs) -> EventStream:
+    def events(
+        self,
+        query: str | None = None,
+        *,
+        context: str | None = None,
+        tool_choice: Union[str, Dict[str, Any]] = "auto",
+        **kwargs,
+    ) -> EventStream:
         """Run a turn, streaming text and tool activity as it happens.
 
         ``query`` is the user's message; omit it to continue from the
         conversation as it stands.  ``context`` is shown to the model ahead of
-        the query without becoming part of what the user said.  Remaining
-        keyword arguments are generation parameters for the LLM.
+        the query without becoming part of what the user said.  ``tool_choice``
+        governs the passes in which the model may call tools; the last pass
+        always answers in text.  Remaining keyword arguments are generation
+        parameters for the LLM.
 
-        If the LLM fails, the turn's messages are rolled back and LLMError is
-        raised.  Closing the generator early cancels the turn.
+        If the LLM fails, everything the turn wrote is rolled back and LLMError
+        is raised.  Closing the generator early cancels the turn.
         """
+        if context and not query:
+            raise ValueError("context is attached to the query: pass one, or drop the context.")
         with self._lock:
             turn = _Turn(self.conversation)
             self._active = turn
@@ -244,71 +281,80 @@ class Session:
                     self._add_user_message(turn, query, context)
                     self.logger.info("query=%r", query)
                 self._register_confirm(turn.conversation)
-                if self.context_handler:
+                if self.context_handler is not None:
                     self.context_handler.pre_process(turn.conversation)
 
-                yield from self._run(turn, kwargs)
+                yield from self._run(turn, tool_choice, kwargs)
 
-                if self.context_handler and not turn.cancelled.is_set():
+                if self.context_handler is not None and not turn.cancelled.is_set():
                     self.context_handler.post_process(turn.conversation)
             except Exception:
-                turn.unrecorded_speech.clear()
-                turn.conversation.discard(turn.added)
+                turn.roll_back()
+                for uid in turn.asked:
+                    self.state.tools.remove_pending(uid)
                 raise
             finally:
                 self._flush_speech(turn)
                 if self._active is turn:
                     self._active = None
+                if self.context_handler is not None and (self._closed or turn.conversation is not self.conversation):
+                    # reset() or close() archived this conversation while the turn was still writing to it.
+                    self.context_handler.finalize(turn.conversation)
 
     def _add_user_message(self, turn: _Turn, query: str, context: Optional[str]) -> None:
         """Append the user's message, or extend their previous one if it never got a reply."""
         last = turn.conversation.last_message
         if last is not None and last.role is Message.Role.user:
+            turn.extended = (last, last.content, last.context)
             last.content = f"{last.content}\n{query}"
             if context:
                 last.context = f"{last.context}\n{context}" if last.context else context
         else:
             turn.added.append(turn.conversation.add_user_message(query, context=context))
 
-    def _run(self, turn: _Turn, llm_kwargs: Dict[str, Any]) -> EventStream:
-        """Alternate model passes and tool execution until the model answers in text."""
+    def _run(self, turn: _Turn, tool_choice: Union[str, Dict[str, Any]], llm_kwargs: Dict[str, Any]) -> EventStream:
+        """Alternate model passes and tool rounds until the model answers in text."""
         for index in range(self.max_tool_iterations + 1):
             final = index == self.max_tool_iterations
             text: List[str] = []
             requests: List[Union[ToolCall, MalformedToolCall]] = []
             interrupted = True
+            gave_up = False
             try:
-                yield from self._stream_pass(turn, "none" if final else "auto", llm_kwargs, text, requests)
+                yield from self._stream_pass(turn, "none" if final else tool_choice, llm_kwargs, text, requests)
                 interrupted = turn.cancelled.is_set()
             finally:
                 # Whatever was streamed has been heard; keep it even if the turn stops here.
                 # Only a pass that goes on to run tools records its text with the tool calls instead.
                 reply = "".join(text)
+                gave_up = not interrupted and final and bool(requests) and not reply
                 if interrupted or final or not requests:
-                    self._record_reply(turn, reply)
+                    self._record_reply(turn, _FALLBACK_REPLY if gave_up else reply)
 
-            if turn.cancelled.is_set():
+            if interrupted:
                 return
             if final or not requests:
-                if requests and not reply:
+                if gave_up:
                     self.logger.warning("Model kept calling tools when asked to answer; giving up on the turn.")
-                    self._record_reply(turn, _FALLBACK_REPLY)
                     yield TextDelta(_FALLBACK_REPLY)
                 elif requests:
                     self.logger.warning("Ignored %d tool call(s) made during the answer pass.", len(requests))
                 return
 
-            results = yield from self._execute(turn, requests)
+            outcomes = yield from self._tool_round(turn, reply, requests)
             if turn.cancelled.is_set():
                 return
-            yield from self._record_tool_round(turn, reply, results)
-            if all(r.result is not None and r.result.speech for r in results):
+            for outcome in outcomes:
+                if outcome.result is not None and outcome.result.speech:
+                    turn.unrecorded_speech.append(outcome.result.speech)
+                    yield TextDelta(outcome.result.speech)
+            if all(o.result is not None and o.result.speech for o in outcomes):
                 return  # every tool answered the user itself; nothing left for the model to say
 
     def _stream_pass(
         self,
         turn: _Turn,
-        tool_choice: str,
+        tool_choice: Union[str, Dict[str, Any]],
         llm_kwargs: Dict[str, Any],
         text: List[str],
         requests: List[Union[ToolCall, MalformedToolCall]],
@@ -330,59 +376,96 @@ class Session:
             if close:
                 close()
 
-    def _execute(
-        self, turn: _Turn, requests: List[Union[ToolCall, MalformedToolCall]]
+    def _tool_round(
+        self, turn: _Turn, reply: str, requests: List[Union[ToolCall, MalformedToolCall]]
     ) -> Generator[SessionEvent, None, List[ToolExecutionResult]]:
-        """Run the requested tools concurrently; returns their results in request order."""
-        results: List[ToolExecutionResult] = []
-        running: List[Tuple[ToolExecutionResult, ToolCall, "concurrent.futures.Future[ToolResult]"]] = []
+        """Run the requested tools concurrently and write the round to history.
+
+        Returns the outcomes in request order.  Once a tool has been started
+        its effects are real, so the round reaches history however the turn
+        ends: a tool still running when the turn is cancelled, or when its
+        consumer goes away, is recorded as interrupted, and one announced but
+        not yet started as not run.
+        """
+        outcomes: List[ToolExecutionResult] = []
+        running: List[_Running] = []
+        waited = False
+        try:
+            for request in requests:
+                outcome, tool = self._admit(turn, request)
+                outcomes.append(outcome)
+                if outcome.call is None:
+                    continue
+                yield ToolCallEvent(outcome.call)
+                if tool is not None:
+                    running.append((outcome, self.tool_caller.submit(tool, outcome.call.arguments)))
+            self._await_tools(turn, running)
+            waited = True
+        finally:
+            self._settle(outcomes, running, interrupted=not waited or turn.cancelled.is_set())
+            self._record_tool_round(turn, reply, outcomes)
+        for outcome in outcomes:
+            if outcome.call is not None:
+                yield ToolResultEvent(outcome.call, outcome.result, outcome.error)
+        return outcomes
+
+    def _admit(
+        self, turn: _Turn, request: Union[ToolCall, MalformedToolCall]
+    ) -> Tuple[ToolExecutionResult, Optional[Tool]]:
+        """Decide a request's fate: the tool to run, or the outcome that stands in for running it."""
+        if isinstance(request, MalformedToolCall):
+            return ToolExecutionResult(call=None, error=_PARSE_ERROR), None
+        self.logger.info("ToolCall: %s args=%s", request.name, request.arguments)
+        outcome = ToolExecutionResult(call=request)
         tools = turn.conversation.tools
+        tool = tools.get(request.name)
+        if tool is None:
+            outcome.error = f"'{request.name}' is not a recognized tool. Available: {list(tools)}."
+            return outcome, None
+        outcome.result = tool.permission_gate(self.state.tools.get_permission(tool.name))
+        return outcome, tool if outcome.result is None else None
 
-        for request in requests:
-            if isinstance(request, MalformedToolCall):
-                results.append(ToolExecutionResult(call=None, error=_PARSE_ERROR))
-                continue
-            self.logger.info("ToolCall: %s args=%s", request.name, request.arguments)
-            yield ToolCallEvent(request)
-            outcome = ToolExecutionResult(call=request)
-            tool = tools.get(request.name)
-            if tool is None:
-                outcome.error = f"'{request.name}' is not a recognized tool. Available: {list(tools)}."
-            else:
-                outcome.result = tool.permission_gate(self.state.tools.get_permission(tool.name))
-                if outcome.result is None:
-                    running.append((outcome, request, self.tool_caller.submit(tool, request.arguments)))
-            results.append(outcome)
-
+    def _await_tools(self, turn: _Turn, running: List[_Running]) -> None:
+        """Wait until the tools finish, the timeout passes, or the turn is cancelled."""
         deadline = time.monotonic() + self.tool_timeout
-        for outcome, call, future in running:
-            try:
-                outcome.result = future.result(timeout=max(0.0, deadline - time.monotonic()))
-            except concurrent.futures.TimeoutError:
+        waiting = {future for _, future in running}
+        while waiting and not turn.cancelled.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            _, waiting = concurrent.futures.wait(waiting, timeout=min(remaining, _CANCEL_POLL_SECONDS))
+
+    def _settle(self, outcomes: List[ToolExecutionResult], running: List[_Running], *, interrupted: bool) -> None:
+        """Give every announced tool its outcome: a result, an error, or why there is neither."""
+        for outcome, future in running:
+            name = outcome.call.name if outcome.call is not None else "tool"
+            if not future.done():
                 future.cancel()
-                outcome.error = f"{call.name} timed out"
-                self.logger.error("Tool %s timed out", call.name)
+                if interrupted:
+                    outcome.error = f"{name} was interrupted before it finished; whether it took effect is unknown"
+                else:
+                    outcome.error = f"{name} timed out"
+                    self.logger.error("Tool %s timed out", name)
+                continue
+            try:
+                outcome.result = future.result()
             except Exception as e:  # noqa: BLE001 - a tool may raise anything; the model is told
                 outcome.error = str(e) or type(e).__name__
-                self.logger.error("Error calling tool %s: %s", call.name, e, exc_info=True)
+                self.logger.error("Error calling tool %s: %s", name, e, exc_info=True)
+        for outcome in outcomes:
+            if outcome.call is not None and outcome.result is None and outcome.error is None:
+                outcome.error = f"{outcome.call.name} was not run: the turn ended first"
 
-        for outcome in results:
-            if outcome.call is None:
-                continue
-            if isinstance(outcome.result, ToolChoice):
-                self.state.tools.add_pending(outcome.call, outcome.result, turn=self._turn_number)
-            yield ToolResultEvent(outcome.call, outcome.result, outcome.error)
-        return results
-
-    def _record_tool_round(self, turn: _Turn, reply: str, results: List[ToolExecutionResult]) -> EventStream:
-        """Write a round of tool calls and results to history and speak what the tools said."""
+    def _record_tool_round(self, turn: _Turn, reply: str, outcomes: List[ToolExecutionResult]) -> None:
+        """Write a round of tool calls and their results to history, and note the questions it left open."""
         conversation = turn.conversation
-        calls = [r.call for r in results if r.call is not None]
+        calls = [o.call for o in outcomes if o.call is not None]
         if calls or reply:
             turn.added.append(conversation.add_assistant_message(reply, tool_calls=calls))
 
         notes: Dict[str, None] = {}  # insertion-ordered set
-        for outcome in results:
+        # Results first, in call order: a provider expects each call answered before anything else is said.
+        for outcome in sorted(outcomes, key=lambda o: o.call is None):
             result = outcome.result
             if result is None:
                 content = f"Tool Error: {outcome.error}"
@@ -397,12 +480,19 @@ class Session:
         for note in notes:
             turn.added.append(conversation.add_tool_message(note))
 
-        if any(isinstance(r.result, ToolChoice) for r in results):
-            self._register_confirm(conversation)
-        for outcome in results:
-            if outcome.result is not None and outcome.result.speech:
-                turn.unrecorded_speech.append(outcome.result.speech)
-                yield TextDelta(outcome.result.speech)
+        with self.state.atomic():
+            if conversation is not self.conversation:
+                return  # reset() replaced the conversation and cleared the state this round belonged to
+            asked = False
+            for outcome in outcomes:
+                if isinstance(outcome.result, ToolChoice) and outcome.call is not None:
+                    asked = True
+                    turn.asked.append(outcome.result.uid)
+                    # A follow-up question raised while answering another is already registered by _resume.
+                    if self.state.tools.get_pending(outcome.result.uid) is None:
+                        self.state.tools.add_pending(outcome.call, outcome.result, turn=self._turn_number)
+            if asked:
+                self._register_confirm(conversation)
 
     def _record_reply(self, turn: _Turn, reply: str) -> None:
         """Record the assistant's spoken reply, led by any tool speech not yet in history."""
@@ -421,12 +511,16 @@ class Session:
     def _register_confirm(self, conversation: Conversation) -> None:
         """Offer the model the ``_confirm`` tool once something may need the user's answer."""
         tools = conversation.tools
-        if CONFIRM_TOOL in tools:
-            return
-        needs_confirm = self.state.tools.has_pending() or any(
-            t.may_return_choice or t.requires_permission for t in tools.values()
-        )
-        if not needs_confirm:
+        existing = tools.get(CONFIRM_TOOL)
+        if existing is not None:
+            owner = getattr(existing.callback, "__self__", None)
+            if not isinstance(owner, Session) or owner is self:
+                return  # ours already, or one the application supplied
+            # Otherwise it answers to another session that used this conversation: take it over.
+        elif not (
+            self.state.tools.has_pending()
+            or any(t.may_return_choice or t.requires_permission for t in tools.values())
+        ):
             return
 
         tools[CONFIRM_TOOL] = Tool(
@@ -494,12 +588,21 @@ class Session:
                     {"status": "cancelled", "action": tool.name},
                     speech=f"Action {tool.name} was cancelled.",
                 )
-            return await tool.aexecute(**pending.call.arguments)
+            return await self._resume(tool, pending.call, pending.call.arguments)
 
         if expected != given:
             raise ToolError(f"_confirm choice keys {sorted(given)} do not match expected keys {sorted(expected)}")
         self.state.tools.remove_pending(uid)
-        return await tool.aexecute(**{**pending.call.arguments, **{k: choice[k] for k in given}})
+        return await self._resume(tool, pending.call, {**pending.call.arguments, **{k: choice[k] for k in given}})
+
+    async def _resume(self, tool: Tool, call: ToolCall, arguments: Dict[str, Any]) -> ToolResult:
+        """Run a tool that was waiting on the user; a further question it asks stays the tool's own."""
+        result = await tool.aexecute(**arguments)
+        if isinstance(result, ToolChoice):
+            # Registered against the tool with the answers so far, not against the _confirm call that got us here.
+            follow_up = ToolCall(name=call.name, arguments=arguments, id=call.id)
+            self.state.tools.add_pending(follow_up, result, turn=self._turn_number)
+        return result
 
 
 def _as_bool(value: Any) -> bool:
@@ -507,7 +610,11 @@ def _as_bool(value: Any) -> bool:
 
 
 class ToolCaller:
-    """Runs tool callbacks on a background asyncio loop, so async and blocking tools share one path."""
+    """Runs tool callbacks on a background asyncio loop, so async and blocking tools share one path.
+
+    Blocking callbacks each get a thread of their own.  Async ones share the
+    loop: one that blocks instead of awaiting holds up every other tool.
+    """
 
     def __init__(self):
         self.logger = get_logger(__name__)

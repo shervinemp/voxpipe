@@ -10,7 +10,7 @@ from voxpipe.core.exceptions import LLMError, ToolError
 from voxpipe.llm.conversation import Conversation
 from voxpipe.llm.decoders import GeneralDecoder
 from voxpipe.llm.session import Session, TextDelta, ToolCallEvent, ToolCaller, ToolResultEvent
-from voxpipe.llm.tools import Tool, ToolCall, ToolChoice, ToolResult, permission
+from voxpipe.llm.tools import MalformedToolCall, Tool, ToolCall, ToolChoice, ToolResult, permission
 
 from ._fakes import ScriptedLLM
 
@@ -691,6 +691,212 @@ class TestSessionContextHandler(SessionCase):
         previous = session.conversation
         session.reset()
         handler.finalize.assert_called_once_with(previous)
+
+
+class TestToolRounds(SessionCase):
+    """A round of tool calls reaches history whole, however the turn ends."""
+
+    @staticmethod
+    def history(session):
+        return [(m.role.value, m.content) for m in session.conversation.history]
+
+    def blocking_tool(self, name="slow", result=None):
+        """A tool that reports when it starts and then waits to be released."""
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def run():
+            started.set()
+            release.wait(timeout=3)
+            return result or {"ok": True}
+
+        return Tool.from_callable(name, run), started, release
+
+    def test_cancel_while_a_tool_runs_keeps_what_was_said_and_what_was_asked(self):
+        tool, started, release = self.blocking_tool()
+        session, llm = self.make(["On it. ", ToolCall("slow", {})], ["Done."], tools=[tool], tool_timeout=3)
+        heard = []
+        worker = threading.Thread(target=lambda: heard.extend(session("go")), daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(timeout=2))
+
+        session.cancel()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive(), "cancel() must not wait for the tool to finish")
+
+        self.assertEqual(heard, ["On it. "])
+        history = self.history(session)
+        self.assertEqual(history[:2], [("user", "go"), ("assistant", "On it. ")])
+        self.assertIn("slow was interrupted before it finished", history[2][1])
+
+        release.set()
+        list(session("next"))
+        self.assertEqual(llm.calls[-1].messages[-1], {"role": "user", "content": "next"}, "not merged into 'go'")
+
+    def test_closing_the_stream_at_a_tool_call_does_not_run_the_tool(self):
+        ran = []
+        session, _ = self.make([ToolCall("act", {})], tools=[Tool.from_callable("act", lambda: ran.append(1))])
+        events = session.events("go")
+        self.assertIsInstance(next(events), ToolCallEvent)
+        events.close()
+
+        self.assertEqual(ran, [])
+        self.assertIn("act was not run", self.history(session)[2][1])
+        self.assertFalse(session._lock.locked())
+
+    def test_reset_during_a_tool_round_leaves_no_question_behind(self):
+        gated = Tool.from_callable("unlock", lambda: {"unlocked": True})
+        gated.requires_permission = True
+        slow, started, release = self.blocking_tool()
+        session, _ = self.make([ToolCall("unlock", {}), ToolCall("slow", {})], tools=[gated, slow], tool_timeout=3)
+        worker = threading.Thread(target=lambda: list(session("go")), daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(timeout=2))
+
+        session.reset()
+        worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(session.state.tools.has_pending(), "the permission request died with its conversation")
+        self.assertEqual(session.conversation.history, [])
+
+    def test_results_come_before_the_errors_of_unparseable_calls(self):
+        lookup = Tool.from_callable("lookup", lambda: {"answer": 42})
+        session, llm = self.make([MalformedToolCall(raw="{"), ToolCall("lookup", {})], ["done"], tools=[lookup])
+        list(session("go"))
+        sent = llm.calls[1].openai_messages
+        self.assertEqual([m["role"] for m in sent], ["user", "assistant", "tool"], "each call is answered first")
+        self.assertIn("Could not parse tool call", sent[2]["content"])
+
+    def test_giving_up_after_a_tool_spoke_is_recorded_as_one_reply(self):
+        speaks = Tool.from_callable("speaks", lambda: ({"ok": True}, "Lights are on."))
+        quiet = Tool.from_callable("quiet", lambda: {"sky": "clear"})
+        session, _ = self.make(
+            [ToolCall("speaks", {}), ToolCall("quiet", {})], [ToolCall("quiet", {})], tools=[speaks, quiet]
+        )
+        with self.assertLogs("voxpipe.llm.session", level="WARNING"):
+            heard = list(session("go"))
+
+        self.assertEqual(heard[0], "Lights are on.")
+        roles = [role for role, _ in self.history(session)]
+        self.assertEqual(roles[-2:], ["tool", "assistant"], "two assistant messages in a row break chat templates")
+        self.assertTrue(session.conversation.last_message.content.startswith("Lights are on. "))
+
+    def test_a_failed_turn_restores_the_unanswered_message_it_extended(self):
+        def backend_down(conversation):
+            raise RuntimeError("backend down")
+
+        session, _ = self.make([], backend_down, ["ok"])
+        list(session("one"))  # no reply: the next query extends this message
+        with self.assertRaises(LLMError):
+            list(session("two", context="(User interrupted you.)"))
+
+        unanswered = session.conversation.last_message
+        self.assertEqual((unanswered.content, unanswered.context), ("one", None))
+        self.assertEqual("".join(session("two")), "ok")
+        self.assertEqual(self.history(session)[0], ("user", "one\ntwo"))
+
+    def test_tool_choice_governs_the_tool_passes_only(self):
+        tool = Tool.from_callable("lookup", lambda: {"answer": 42})
+        session, llm = self.make([ToolCall("lookup", {})], ["done"], tools=[tool])
+        list(session("go", tool_choice="required"))
+        self.assertEqual([call.tool_choice for call in llm.calls], ["required", "none"])
+
+    def test_context_needs_a_query(self):
+        session, _ = self.make(["ok"])
+        with self.assertRaises(ValueError):
+            list(session(context="(User interrupted you.)"))
+        self.assertFalse(session._lock.locked())
+
+
+class TestFollowUpQuestions(SessionCase):
+    def test_a_question_asked_while_answering_another_belongs_to_the_tool(self):
+        sent = []
+
+        def send(to: str, body: str = ""):
+            if not body:
+                return ToolChoice({"body": "What should the message say?"}, speech="What should it say?")
+            sent.append((to, body))
+            return {"sent": to}
+
+        tool = Tool.from_callable("send", send)
+        tool.requires_permission = True
+        confirm = TestSessionConfirm.confirm
+        session, _ = self.make(
+            [ToolCall("send", {"to": "bob"})],
+            confirm("send", {"allow": True}),
+            confirm("_confirm", {"body": "hi bob"}),
+            ["Sent."],
+            tools=[tool],
+        )
+
+        self.assertEqual(list(session("message bob")), ["Permission requested to run send."])
+        self.assertEqual(list(session("yes")), ["What should it say?"])
+        self.assertEqual("".join(session("say hi bob")), "Sent.")
+
+        self.assertEqual(sent, [("bob", "hi bob")])
+        self.assertFalse(session.state.tools.has_pending())
+
+    def test_confirm_answers_to_the_session_now_running_the_conversation(self):
+        gated = Tool.from_callable("unlock", lambda: {"unlocked": True})
+        gated.requires_permission = True
+        first, _ = self.make([], tools=[gated])
+        list(first("hello"))
+        self.assertIs(first.tools["_confirm"].callback.__self__, first)
+
+        second = Session(llm=ScriptedLLM([]), conversation=first.conversation)
+        self.addCleanup(second.close)
+        list(second("hello again"))
+        self.assertIs(second.tools["_confirm"].callback.__self__, second)
+
+    def test_a_confirm_tool_supplied_by_the_application_is_left_alone(self):
+        own = Tool.from_callable("_confirm", lambda uid, choice: {"ok": True})
+        gated = Tool.from_callable("unlock", lambda: {"unlocked": True})
+        gated.requires_permission = True
+        session, _ = self.make([], tools=[own, gated])
+        list(session("hello"))
+        self.assertIs(session.tools["_confirm"], own)
+
+
+class TestSessionConstruction(SessionCase):
+    def test_rules_are_not_repeated_when_a_saved_session_is_reloaded_with_them(self):
+        session, llm = self.make([], rules=["Be brief."])
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(3):
+                session.save(tmp)
+                session = Session.load(tmp, llm=llm, rules=["Be brief."])
+                self.addCleanup(session.close)
+        self.assertEqual(session.rules, ["Be brief."])
+
+    def test_a_single_rule_may_be_given_as_a_string(self):
+        session, _ = self.make([], rules="Be brief.")
+        self.assertEqual(session.rules, ["Be brief."])
+
+    def test_tools_may_be_given_as_a_mapping(self):
+        tool = Tool(name="lights", description="")
+        session = Session(llm=ScriptedLLM([]), tools={"lights": tool})
+        self.addCleanup(session.close)
+        self.assertEqual(dict(session.tools), {"lights": tool})
+
+    def test_a_failed_load_leaves_no_tool_loop_running(self):
+        before = {t for t in threading.enumerate() if t.name == "voxpipe-tools"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "state.json"), "w", encoding="utf-8") as f:
+                f.write("{not json")
+            with self.assertRaises(ValueError):
+                Session.load(tmp, llm=ScriptedLLM([]))
+        self.assertEqual({t for t in threading.enumerate() if t.name == "voxpipe-tools"}, before)
+
+    def test_state_that_cannot_be_saved_leaves_the_saved_conversation_untouched(self):
+        session, _ = self.make([])
+        session.conversation.add_user_message("first")
+        with tempfile.TemporaryDirectory() as tmp:
+            session.save(tmp)
+            session.conversation.add_user_message("second")
+            session.state.user.set("not json", object())
+            with self.assertRaises(TypeError):
+                session.save(tmp)
+            self.assertEqual(len(Conversation.load(os.path.join(tmp, "conversation.json")).history), 1)
 
 
 if __name__ == "__main__":

@@ -2,14 +2,14 @@
 
 import json
 import os
-import tempfile
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from ..core.utils import write_atomically
 from .tools import ToolCall, ToolChoice
 
-_STATE_FILE = "state.json"
+STATE_FILE = "state.json"
 
 # Turn number of a pending choice that did not arise during a live turn (restored from disk, added by hand).
 NO_TURN = -1
@@ -75,7 +75,8 @@ class ToolStateView:
             "pending": {
                 uid: {
                     "call": {"id": p.call.id, "name": p.call.name, "arguments": p.call.arguments},
-                    "choice": {"result": p.choice.raw_result, "speech": p.choice.speech},
+                    # Saved as the model saw it: a payload may hold values (dates, ...) JSON has no type for.
+                    "choice": {"result": json.loads(p.choice.result_json), "speech": p.choice.speech},
                 }
                 for uid, p in self._pending.items()
             },
@@ -150,11 +151,11 @@ class SessionState:
         os.makedirs(path, exist_ok=True)
         with self._lock:
             payload = json.dumps({"tools": self.tools._dump(), "user": dict(self.user._data)}, indent=2)
-        _write_atomically(os.path.join(path, _STATE_FILE), payload.encode("utf-8"))
+        write_atomically(os.path.join(path, STATE_FILE), payload.encode("utf-8"))
 
     def load(self, path: str) -> None:
         """Replace this state with what :meth:`save` wrote into the directory."""
-        state_file = os.path.join(path, _STATE_FILE)
+        state_file = os.path.join(path, STATE_FILE)
         data: Dict[str, Any] = {}
         if os.path.exists(state_file):
             with open(state_file, "r", encoding="utf-8") as f:
@@ -165,14 +166,3 @@ class SessionState:
             self.user._data = dict(data.get("user", {}))
             self.model._clear()
 
-
-def _write_atomically(path: str, data: bytes) -> None:
-    """Write via a temporary sibling so a crash never leaves a truncated file behind."""
-    fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(temp_path, path)
-    except BaseException:
-        os.unlink(temp_path)
-        raise

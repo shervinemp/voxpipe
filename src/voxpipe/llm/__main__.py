@@ -44,7 +44,8 @@ def main() -> None:
 
     prompt = "What is the weather like in Beijing now and what's the stock price of NVDA?"
     logger.info("Prompt: %s", prompt)
-    with Session(llm=llm, conversation=conversation) as session:
+    # A text-decoded model calls one tool per pass, and the prompt needs two.
+    with Session(llm=llm, conversation=conversation, max_tool_iterations=2) as session:
         logger.info("Response: %s", "".join(session(prompt)))
 
 

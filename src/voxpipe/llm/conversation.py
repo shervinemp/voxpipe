@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from ..core.utils import write_atomically
 from .tools import Tool, ToolCall, ToolSet
 
 
@@ -259,8 +260,7 @@ class Conversation:
         return conv
 
     def save(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+        write_atomically(path, json.dumps(self.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"))
 
     @classmethod
     def load(cls, path: str) -> "Conversation":

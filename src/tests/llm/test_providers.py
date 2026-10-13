@@ -360,5 +360,62 @@ class TestLLMProviders(unittest.TestCase):
                 LLMProviders.create(backend, "Qwen3", config=self._config())
 
 
+class TestProviderEdgeCases(unittest.TestCase):
+    def _decode(self, chunks):
+        llm = LiteLLMProvider(completion_fn=MagicMock(return_value=iter(chunks)), model="test", provider="ollama")
+        return list(llm(Conversation()))
+
+    def test_calls_sharing_an_index_are_told_apart_by_their_ids(self):
+        items = self._decode([
+            tool_chunk(index=0, name="get_weather", arguments='{"city": "Oslo"}', call_id="call_1"),
+            tool_chunk(index=0, name="get_time", arguments='{"zone": "CET"}', call_id="call_2"),
+        ])
+        self.assertEqual(
+            items, [ToolCall("get_weather", {"city": "Oslo"}), ToolCall("get_time", {"zone": "CET"})]
+        )
+        self.assertEqual([item.id for item in items], ["call_1", "call_2"])
+
+    def test_a_missing_index_and_a_repeated_name_are_tolerated(self):
+        no_index = {"choices": [{"delta": {"tool_calls": [{"index": None, "function": {"name": "ping"}}]}}]}
+        self.assertEqual(self._decode([no_index]), [ToolCall("ping", {})])
+
+        repeated = [
+            tool_chunk(name="get_weather", arguments='{"city":', call_id="call_1"),
+            tool_chunk(name="get_weather", arguments=' "Oslo"}'),
+        ]
+        self.assertEqual(self._decode(repeated), [ToolCall("get_weather", {"city": "Oslo"})])
+
+    def test_gguf_accepts_a_per_call_token_limit(self):
+        model = FakeLlama()
+        llm = GGUFLLM(model, n_ctx=4096, max_tokens=128)
+        list(llm(Conversation(), max_tokens=32))
+        list(llm(Conversation()))
+        self.assertEqual([request["max_tokens"] for request in model.requests], [32, 128])
+
+    def test_local_openai_servers_get_the_bare_model_id_and_their_own_path(self):
+        cases = [
+            ("openai/qwen/qwen3-8b", "http://localhost:1234", "qwen/qwen3-8b", "http://localhost:1234/v1"),
+            ("local-model", "http://localhost:1234/", "local-model", "http://localhost:1234/v1"),
+            ("local-model", "http://localhost:1234/api/v1beta", "local-model", "http://localhost:1234/api/v1beta"),
+        ]
+        for configured, api_base, asked_for, base_url in cases:
+            with self.subTest(configured=configured, api_base=api_base):
+                client = MagicMock()
+                client.chat.completions.create.return_value = iter([text_chunk("hi")])
+                fake_openai = types.ModuleType("openai")
+                fake_openai.OpenAI = MagicMock(return_value=client)
+                with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, {"openai": fake_openai}):
+                    llm = LiteLLMProvider(model=configured, provider="openai", api_base=api_base)
+                    list(llm(Conversation()))
+                self.assertEqual(fake_openai.OpenAI.call_args.kwargs["base_url"], base_url)
+                self.assertEqual(client.chat.completions.create.call_args.kwargs["model"], asked_for)
+
+    def test_an_explicit_config_is_not_topped_up_from_the_global_one(self):
+        config = load_config()
+        empty = config.model_copy(update={"llm": config.llm.model_copy(update={"local": {}})})
+        with self.assertRaisesRegex(ProviderError, "Missing local model config"):
+            LLMProviders.create("local", "Gemma4E2B", empty)
+
+
 if __name__ == "__main__":
     unittest.main()

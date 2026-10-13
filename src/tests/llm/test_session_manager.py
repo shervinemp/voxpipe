@@ -165,5 +165,56 @@ class TestSessionManager(unittest.TestCase):
             self.manager.import_zip(os.path.join(self.tmp_dir, "missing.zip"))
 
 
+class TestImportSafety(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+        self.manager = SessionManager(root_dir=os.path.join(self.tmp_dir, "root"))
+        self.llm = ScriptedLLM([])
+
+    def _saved(self, session_id, text):
+        session = Session(llm=self.llm)
+        self.addCleanup(session.close)
+        session.conversation.add_user_message(text)
+        self.manager.save_session(session, session_id)
+
+    def _history(self, session_id):
+        session = self.manager.load_session(session_id, llm=self.llm)
+        self.addCleanup(session.close)
+        return [m.content for m in session.conversation.history]
+
+    def test_a_damaged_archive_does_not_cost_the_session_it_would_replace(self):
+        self._saved("trip", "precious history")
+        archive = os.path.join(self.tmp_dir, "trip.zip")
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("conversation.json", json.dumps({"messages": []}))
+            zf.writestr("state.json", "{not json")
+
+        with self.assertRaisesRegex(VoxpipeError, "damaged"):
+            self.manager.import_zip(archive)
+
+        self.assertEqual(self._history("trip"), ["precious history"])
+        self.assertEqual(os.listdir(self.manager.sessions_dir), ["trip"], "nothing half-unpacked is left behind")
+
+    def test_an_imported_session_is_listed_under_its_new_id(self):
+        self._saved("source", "hello")
+        archive = self.manager.export_zip("source", os.path.join(self.tmp_dir, "source.zip"))
+        self.manager.import_zip(archive, session_id="backup")
+        self.assertEqual([s["session_id"] for s in self.manager.list_sessions()], ["backup", "source"])
+
+    def test_ids_the_file_system_would_alias_or_refuse_are_rejected(self):
+        session = Session(llm=self.llm)
+        self.addCleanup(session.close)
+        for session_id in ("notes.", "nul", "CON", "aux.txt", "com1"):
+            with self.subTest(session_id=session_id), self.assertRaises(VoxpipeError):
+                self.manager.save_session(session, session_id)
+        self.assertEqual(os.listdir(self.manager.sessions_dir), [])
+
+    def test_stray_entries_are_not_listed_as_sessions(self):
+        self._saved("real", "hello")
+        os.makedirs(os.path.join(self.manager.sessions_dir, ".import-leftover"))
+        self.assertEqual([s["session_id"] for s in self.manager.list_sessions()], ["real"])
+
+
 if __name__ == "__main__":
     unittest.main()

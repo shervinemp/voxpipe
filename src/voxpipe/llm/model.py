@@ -6,7 +6,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional
 from urllib.parse import urlparse
 
 from ..core.config import get_config
@@ -193,12 +193,8 @@ class GGUFLLM(LLM):
             else:
                 request["tool_choice"] = "none"
 
-            stream = self.model.create_chat_completion(
-                messages=conversation.messages,
-                max_tokens=self.max_tokens,
-                stream=True,
-                **request,
-            )
+            request.setdefault("max_tokens", self.max_tokens)
+            stream = self.model.create_chat_completion(messages=conversation.messages, stream=True, **request)
             for chunk in stream:
                 content = chunk["choices"][0]["delta"].get("content")
                 if content:
@@ -290,9 +286,14 @@ class LiteLLMProvider(LLM):
             # synchronous iteration on Windows.
             from openai import OpenAI
 
-            base_url = local_openai_base if "/v1" in local_openai_base else local_openai_base.rstrip("/") + "/v1"
+            # A bare host gets the conventional /v1; a base that names a path is used as given.
+            base_url = local_openai_base.rstrip("/")
+            if not urlparse(base_url).path:
+                base_url += "/v1"
             client = OpenAI(base_url=base_url, api_key=self.api_key)
-            return lambda **request: client.chat.completions.create(model=self.model, **request)
+            # The "openai/" routing prefix is LiteLLM's; the server knows the model by its own id.
+            model = self.model.removeprefix(f"{self.provider}/")
+            return lambda **request: client.chat.completions.create(model=model, **request)
 
         os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
         from litellm import completion
@@ -376,7 +377,8 @@ class LiteLLMProvider(LLM):
 
     def _decode_stream(self, stream: Iterable[Any]) -> Iterator[StreamItem]:
         """Yield text as it streams, then the tool calls reassembled from their fragments."""
-        fragments: Dict[int, Dict[str, Any]] = {}
+        calls: List[Dict[str, Any]] = []  # in order of arrival
+        current: Dict[int, Dict[str, Any]] = {}  # the call each index is still adding to
         for chunk in stream:
             choices = self._field(chunk, "choices") or ()
             delta = self._field(choices[0], "delta") if choices else None
@@ -389,17 +391,27 @@ class LiteLLMProvider(LLM):
             # Reasoning (``reasoning_content``) is the model thinking, not its reply: it is not spoken.
 
             for part in self._field(delta, "tool_calls") or ():
-                index = self._field(part, "index", 0)
-                if not isinstance(index, int) or not 0 <= index <= self._MAX_TOOL_CALL_INDEX:
+                index = self._field(part, "index")
+                if index is None:
+                    index = 0
+                if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index <= self._MAX_TOOL_CALL_INDEX:
                     raise LLMError("Provider returned an invalid tool call index.")
-                entry = fragments.setdefault(index, {"id": None, "name": "", "arguments": "", "object": None})
                 call_id = self._field(part, "id")
-                if isinstance(call_id, str) and call_id:
+                call_id = call_id if isinstance(call_id, str) and call_id else None
+                entry = current.get(index)
+                # Some providers number every call 0: a different id means another call, not more of this one.
+                if entry is None or (call_id and entry["id"] and call_id != entry["id"]):
+                    if len(calls) > self._MAX_TOOL_CALL_INDEX:
+                        raise LLMError("Provider returned too many tool calls.")
+                    entry = {"id": None, "name": "", "arguments": "", "object": None}
+                    calls.append(entry)
+                    current[index] = entry
+                if call_id:
                     entry["id"] = call_id
                 function = self._field(part, "function") or {}
                 name = self._field(function, "name")
                 arguments = self._field(function, "arguments")
-                if isinstance(name, str):
+                if isinstance(name, str) and name != entry["name"]:  # a provider may repeat the name on every delta
                     entry["name"] += name
                     if len(entry["name"]) > self._MAX_TOOL_NAME_CHARS:
                         raise LLMError(f"Tool name exceeds {self._MAX_TOOL_NAME_CHARS} characters.")
@@ -411,7 +423,7 @@ class LiteLLMProvider(LLM):
                     if len(entry["arguments"]) > self._MAX_TOOL_ARGUMENT_CHARS:
                         raise LLMError(f"Tool arguments exceed {self._MAX_TOOL_ARGUMENT_CHARS} characters.")
 
-        for _, entry in sorted(fragments.items()):
+        for entry in calls:
             if entry["name"]:
                 yield self._assemble_call(entry)
 
@@ -445,7 +457,10 @@ class LLMProviders:
         """
         llm_config = (config or get_config()).llm
         if backend == "local":
-            return GGUFLLM.from_config(model, llm_config.local.get(model))
+            entry = llm_config.local.get(model)
+            if entry is None:
+                raise ProviderError(f"Missing local model config for '{model}'.")
+            return GGUFLLM.from_config(model, entry)
         if backend == "litellm":
             if llm_config.litellm is None:
                 raise ProviderError("The litellm backend needs an `llm.litellm` configuration section.")

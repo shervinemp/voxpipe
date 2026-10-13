@@ -495,3 +495,215 @@ class TestFromClassAndRegistry(unittest.TestCase):
         with self.assertRaises(ToolError):
             Tool.register(42)
 
+
+class TestArgumentHandling(unittest.TestCase):
+    """What the model sends against what the callback was declared to take."""
+
+    @staticmethod
+    def forecast_tool():
+        from typing import Literal, Optional
+
+        from voxpipe.llm.tools import Tool
+
+        def forecast(
+            city: str,
+            unit: Literal["celsius", "fahrenheit"] = "celsius",
+            days: Optional[int] = None,
+            places: Optional[list] = None,
+            options: Optional[dict] = None,
+        ):
+            return {"city": city, "unit": unit, "days": days, "places": places, "options": options}
+
+        return Tool.from_callable("forecast", forecast)
+
+    def test_null_for_an_optional_argument_means_not_given(self):
+        result = self.forecast_tool().execute(city="Oslo", unit=None, days=None).raw_result
+        self.assertEqual((result["unit"], result["days"]), ("celsius", None))
+
+    def test_null_for_a_required_argument_is_refused(self):
+        from voxpipe.core.exceptions import ToolError
+
+        with self.assertRaisesRegex(ToolError, "'city' is required"):
+            self.forecast_tool().execute(city=None)
+
+    def test_enum_values_are_enforced(self):
+        from voxpipe.core.exceptions import ToolError
+
+        with self.assertRaisesRegex(ToolError, "must be one of: 'celsius', 'fahrenheit'"):
+            self.forecast_tool().execute(city="Oslo", unit="kelvin")
+
+    def test_arrays_and_objects_are_checked_and_accepted_as_json_text(self):
+        from voxpipe.core.exceptions import ToolError
+
+        tool = self.forecast_tool()
+        result = tool.execute(city="Oslo", places='["a", "b"]', options='{"wind": true}').raw_result
+        self.assertEqual((result["places"], result["options"]), (["a", "b"], {"wind": True}))
+        for bad in (dict(places="abc"), dict(options=5), dict(city=["Oslo", "Bergen"])):
+            with self.subTest(bad), self.assertRaises(ToolError):
+                tool.execute(**{"city": "Oslo", **bad})
+
+    def test_an_argument_named_self_is_just_another_unexpected_argument(self):
+        import asyncio
+
+        from voxpipe.core.exceptions import ToolError
+
+        tool = self.forecast_tool()
+        for call in (tool.execute, tool, lambda **kw: asyncio.run(tool.aexecute(**kw))):
+            with self.assertRaisesRegex(ToolError, "Unexpected tool arguments: self"):
+                call(city="Oslo", self="x")
+
+
+class TestSchemaEdgeCases(unittest.TestCase):
+    def test_annotated_hints_are_unwrapped(self):
+        from typing import Annotated, Optional
+
+        from voxpipe.llm.tools import Tool
+
+        def count(n: Annotated[int, "how many"], scale: Optional[Annotated[float, "factor"]] = None):
+            return {"n": n}
+
+        properties = Tool.from_callable("count", count).parameters.properties
+        self.assertEqual((properties["n"].type, properties["scale"].type), ("integer", "number"))
+
+    def test_one_unresolvable_hint_does_not_cost_the_others_their_types(self):
+        from voxpipe.llm.tools import Tool
+
+        def schedule(count: "int", when: "NotImportedAtRuntime" = None):  # noqa: F821
+            return {"count": count}
+
+        tool = Tool.from_callable("schedule", schedule)
+        self.assertEqual(tool.parameters.properties["count"].type, "integer")
+        self.assertEqual(tool.execute(count="3").raw_result, {"count": 3})
+
+    def test_arguments_bound_by_a_partial_are_hidden_from_the_model(self):
+        import functools
+
+        from voxpipe.core.exceptions import ToolError
+        from voxpipe.llm.tools import Tool
+
+        def query(sql: str, db: str = "main"):
+            """Run a query.
+
+            Args:
+                sql: The statement.
+            """
+            return {"db": db, "sql": sql}
+
+        tool = Tool.from_callable("query", functools.partial(query, db="private"))
+        self.assertEqual(tool.description, "Run a query.")
+        self.assertEqual(list(tool.parameters.properties), ["sql"])
+        self.assertEqual(tool.execute(sql="select 1").raw_result["db"], "private")
+        with self.assertRaises(ToolError):
+            tool.execute(sql="select 1", db="someone-else")
+
+    def test_names_must_be_identifiers(self):
+        from voxpipe.core.exceptions import ToolError
+        from voxpipe.llm.tools import Tool
+
+        with self.assertRaises(ToolError):
+            Tool.from_callable("has space!", lambda: None)
+        with self.assertRaises(ToolError):
+            Tool.from_dict({"name": "t", "parameters": {"type": "string"}})
+
+    def test_docstring_entries_for_typed_and_starred_parameters(self):
+        from voxpipe.llm.tools import _parse_docstring
+
+        rst = _parse_docstring("Look up weather.\n\n:param str city: City name.\n:returns: The weather.")
+        self.assertEqual((rst.description, rst.params), ("Look up weather.", {"city": "City name."}))
+
+        google = _parse_docstring("Look up.\n\nArgs:\n    city: City name.\n    **extra: Passed through.")
+        self.assertEqual(google.params, {"city": "City name.", "extra": "Passed through."})
+
+    def test_from_class_takes_static_and_class_methods_and_leaves_properties_alone(self):
+        from voxpipe.llm.tools import Tool
+
+        touched = []
+
+        @Tool.from_class
+        class Lamp:
+            def on(self):
+                return {"on": True}
+
+            @staticmethod
+            def brands():
+                return {"brands": ["a"]}
+
+            @classmethod
+            def kind(cls):
+                return {"kind": cls.__name__}
+
+            @property
+            def temperature(self):
+                touched.append("read")
+                return 20
+
+        tools = {tool.name: tool for tool in Lamp()}
+        self.assertEqual(sorted(tools), ["brands", "kind", "on"])
+        self.assertEqual(tools["kind"].execute().raw_result, {"kind": "Lamp"})
+        self.assertEqual(touched, [])
+
+
+class TestToolBehaviour(unittest.TestCase):
+    def test_permission_marks_a_tool_as_well_as_a_function(self):
+        from voxpipe.llm.tools import Tool, ToolChoice, permission
+
+        @permission
+        @Tool.register(name="guarded_by_decorator_order")
+        def wipe():
+            return {"wiped": True}
+
+        self.addCleanup(Tool.clear_registry)
+        self.assertTrue(wipe.requires_permission)
+        self.assertIsInstance(wipe.permission_gate(None), ToolChoice)
+        self.assertTrue(permission(Tool(name="t", description="")).requires_permission)
+
+    def test_results_are_equal_by_content(self):
+        from voxpipe.llm.tools import ToolResult
+
+        self.assertEqual(ToolResult({"a": 1}), ToolResult({"a": 1}))
+        self.assertNotEqual(ToolResult({"a": 1}), ToolResult({"a": 2}))
+
+    def test_a_scalar_spoken_result_keeps_its_type(self):
+        from voxpipe.llm.tools import Tool
+
+        result = Tool.from_callable("five", lambda: (5, "It is five.")).execute()
+        self.assertEqual((result.raw_result, result.speech), ({"result": 5}, "It is five."))
+
+    def test_an_object_with_an_async_call_is_awaited(self):
+        from voxpipe.llm.tools import Tool
+
+        class Lookup:
+            async def __call__(self, q: str):
+                return {"q": q}
+
+        tool = Tool(name="lookup", description="", callback=Lookup())
+        self.assertTrue(tool.is_async)
+        self.assertEqual(tool.execute(q="x").raw_result, {"q": "x"})
+
+    def test_a_blocking_callback_runs_on_a_daemon_thread_of_its_own(self):
+        """So one that never returns cannot keep the interpreter alive or use up a shared pool."""
+        import asyncio
+        import threading
+
+        from voxpipe.llm.tools import Tool
+
+        seen = {}
+
+        def where():
+            thread = threading.current_thread()
+            seen.update(name=thread.name, daemon=thread.daemon)
+            return {"ok": True}
+
+        self.assertEqual(asyncio.run(Tool.from_callable("where", where).aexecute()).raw_result, {"ok": True})
+        self.assertEqual(seen, {"name": "voxpipe-tool-call", "daemon": True})
+
+    def test_a_callback_that_exits_the_interpreter_is_reported_not_obeyed(self):
+        import asyncio
+
+        from voxpipe.llm.tools import Tool
+
+        def quits():
+            raise SystemExit(3)
+
+        with self.assertRaisesRegex(RuntimeError, "SystemExit"):
+            asyncio.run(Tool.from_callable("quits", quits).aexecute())

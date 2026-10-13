@@ -1,13 +1,16 @@
 """Tool definitions: schema, argument validation, execution, and the result types tools return."""
 
 import asyncio
+import functools
 import inspect
 import json
 import re
+import threading
 import types
 import uuid
 from dataclasses import dataclass, field
 from typing import (
+    Annotated,
     Any,
     Callable,
     ClassVar,
@@ -30,6 +33,7 @@ _JSON_TYPES = frozenset({"array", "boolean", "integer", "number", "object", "str
 _PERMISSION_MARKER = "__voxpipe_requires_permission__"
 _UNION_ORIGINS = (Union, types.UnionType)
 _ARRAY_TYPES = (list, tuple, set, frozenset)
+_CONTAINER_TYPES: Dict[str, tuple] = {"array": (list, tuple), "object": (dict,)}
 
 PERMISSION_KEYS = frozenset({"allow", "remember"})
 
@@ -57,7 +61,7 @@ class ToolResult:
 
     _result: dict
     speech: str | None = None
-    uid: str = ""
+    uid: str = field(default="", compare=False)  # random per result; two results are equal by content
 
     def __init__(self, result: dict, speech: str | None = None, uid: str | None = None):
         if not isinstance(result, dict):
@@ -71,9 +75,14 @@ class ToolResult:
         return self._result
 
     @property
-    def result(self) -> str:
-        """The payload serialised for the model."""
+    def result_json(self) -> str:
+        """The payload as JSON; values JSON has no type for are written as strings."""
         return json.dumps(self._result, default=str)
+
+    @property
+    def result(self) -> str:
+        """The payload as the model is shown it."""
+        return self.result_json
 
 
 @dataclass(init=False)
@@ -97,19 +106,23 @@ class ToolChoice(ToolResult):
 
     @property
     def result(self) -> str:
-        return f"Available options: {super().result}"
+        return f"Available options: {self.result_json}"
 
 
 def permission(fn: Callable | None = None):
     """Mark a function as needing the user's permission before it runs as a tool.
 
-    Usable bare (``@permission``) or called (``@permission()``).  The mark is
-    picked up by :meth:`Tool.from_callable`; whoever dispatches the tool
-    enforces it via :meth:`Tool.permission_gate`.
+    Usable bare (``@permission``) or called (``@permission()``), on a function
+    or on a Tool already built from one.  On a function the mark is picked up
+    by :meth:`Tool.from_callable`; whoever dispatches the tool enforces it via
+    :meth:`Tool.permission_gate`.
     """
 
-    def mark(f: Callable) -> Callable:
-        setattr(f, _PERMISSION_MARKER, True)
+    def mark(f: Any) -> Any:
+        if isinstance(f, Tool):
+            f.requires_permission = True
+        else:
+            setattr(f, _PERMISSION_MARKER, True)
         return f
 
     return mark if fn is None else mark(fn)
@@ -189,12 +202,16 @@ class Tool:
 
     @property
     def is_async(self) -> bool:
-        return inspect.iscoroutinefunction(self.callback)
+        """Whether the callback is a coroutine function, or an object whose ``__call__`` is one."""
+        callback = self.callback
+        return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
 
-    def __call__(self, **kwargs) -> ToolResult:
+    # ``self`` is positional-only below: the keywords are the model's, and it may name one "self".
+
+    def __call__(self, /, **kwargs) -> ToolResult:
         return self.execute(**kwargs)
 
-    def execute(self, **kwargs) -> ToolResult:
+    def execute(self, /, **kwargs) -> ToolResult:
         """Validate the arguments, run the callback, and normalise what it returns.
 
         This does not consult :attr:`requires_permission`; consent belongs to
@@ -205,13 +222,17 @@ class Tool:
         callback = self._require_callback()
         return self._normalize(callback(**self._coerce_arguments(kwargs)))
 
-    async def aexecute(self, **kwargs) -> ToolResult:
-        """Like :meth:`execute`, awaiting async callbacks and running blocking ones in a thread."""
+    async def aexecute(self, /, **kwargs) -> ToolResult:
+        """Like :meth:`execute`, awaiting async callbacks and running blocking ones in a thread.
+
+        An async callback runs on the caller's event loop: one that blocks
+        instead of awaiting holds up everything else on that loop.
+        """
         callback = self._require_callback()
         arguments = self._coerce_arguments(kwargs)
         if self.is_async:
             return self._normalize(await callback(**arguments))
-        return self._normalize(await asyncio.to_thread(callback, **arguments))
+        return self._normalize(await _call_in_thread(callback, arguments))
 
     def permission_gate(self, granted: Optional[bool]) -> Optional[ToolResult]:
         """Return what to answer instead of running the tool, or None when it may run.
@@ -246,7 +267,7 @@ class Tool:
         if isinstance(result, (str, int, float, bool)):
             return ToolResult(result={"result": result})
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], str):
-            payload = result[0] if isinstance(result[0], dict) else {"result": str(result[0])}
+            payload = result[0] if isinstance(result[0], dict) else {"result": result[0]}
             return ToolResult(result=payload, speech=result[1])
         raise TypeError(
             f"Tool '{self.name}' callback returned {type(result).__name__}; "
@@ -263,25 +284,44 @@ class Tool:
             unexpected = set(arguments) - set(properties)
             if unexpected:
                 raise ToolError(f"Unexpected tool arguments: {', '.join(sorted(unexpected))}")
-        missing = set(self.parameters.required or ()) - set(arguments)
+        required = set(self.parameters.required or ())
+        missing = required - set(arguments)
         if missing:
             raise ToolError(f"Missing required tool arguments: {', '.join(sorted(missing))}")
 
-        return {
-            name: _cast(name, value, properties[name].type) if name in properties else value
-            for name, value in arguments.items()
-        }
+        coerced: Dict[str, Any] = {}
+        for name, value in arguments.items():
+            parameter = properties.get(name)
+            if parameter is None:
+                coerced[name] = value
+            elif value is None:
+                # JSON null for an optional parameter means "not given": the callback's default applies.
+                if name in required:
+                    raise ToolError(f"Tool argument '{name}' is required and must not be null.")
+            else:
+                value = _cast(name, value, parameter.type)
+                if parameter.enum and value not in parameter.enum:
+                    allowed = ", ".join(repr(option) for option in parameter.enum)
+                    raise ToolError(f"Tool argument '{name}' must be one of: {allowed}.")
+                coerced[name] = value
+        return coerced
 
     # --- construction ----------------------------------------------------
 
     @staticmethod
     def from_callable(name: str, fn: Callable, *, may_return_choice: Optional[bool] = None) -> "Tool":
-        """Build a Tool from a function: schema from its signature, descriptions from its docstring."""
-        doc = _parse_docstring(inspect.getdoc(fn))
-        try:
-            signature = inspect.signature(fn, eval_str=True)
-        except (NameError, TypeError):
-            signature = inspect.signature(fn)
+        """Build a Tool from a function: schema from its signature, descriptions from its docstring.
+
+        A parameter without a type hint is declared, and passed on, as a
+        string.  Arguments a ``functools.partial`` has already bound by keyword
+        are left out of the schema, so the model can neither see nor override them.
+        """
+        if not isinstance(name, str) or not _IDENTIFIER_RE.fullmatch(name):
+            raise ToolError("Tool name must be a valid 1-64 character identifier.")
+        bound = set(fn.keywords) if isinstance(fn, functools.partial) else set()
+        doc = _parse_docstring(inspect.getdoc(fn.func if isinstance(fn, functools.partial) else fn))
+        signature = inspect.signature(fn)
+        hints = _resolve_hints(fn, signature)
 
         properties: Dict[str, Tool.Parameter] = {}
         required: List[str] = []
@@ -290,13 +330,13 @@ class Tool:
             if param.kind is inspect.Parameter.VAR_KEYWORD:
                 allow_extra = True
                 continue
-            if param_name == "self" or param.kind is inspect.Parameter.VAR_POSITIONAL:
+            if param_name == "self" or param_name in bound or param.kind is inspect.Parameter.VAR_POSITIONAL:
                 continue
-            properties[param_name] = _parameter_for(param.annotation, doc.params.get(param_name))
+            properties[param_name] = _parameter_for(hints[param_name], doc.params.get(param_name))
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
-        if may_return_choice is None and _returns_choice(signature.return_annotation):
+        if may_return_choice is None and _returns_choice(hints["return"]):
             may_return_choice = True
 
         return Tool(
@@ -313,24 +353,26 @@ class Tool:
         )
 
     @staticmethod
-    def from_class(cls: Type) -> Callable[..., List["Tool"]]:
+    def from_class(klass: Type) -> Callable[..., List["Tool"]]:
         """Class decorator turning a class into a factory of tools.
 
         Calling the decorated name builds an instance (forwarding the
-        arguments) and returns one Tool per public method, bound to it.
+        arguments) and returns one Tool per public method (instance, class or
+        static), bound to it.  Properties are not touched.
         """
+        methods = [
+            name
+            for name, member in inspect.getmembers_static(klass)
+            if not name.startswith("_") and isinstance(member, (types.FunctionType, classmethod, staticmethod))
+        ]
 
         def factory(*args, **kwargs) -> List["Tool"]:
-            instance = cls(*args, **kwargs)
-            return [
-                Tool.from_callable(name, method)
-                for name, method in inspect.getmembers(instance, predicate=inspect.ismethod)
-                if not name.startswith("_")
-            ]
+            instance = klass(*args, **kwargs)
+            return [Tool.from_callable(name, getattr(instance, name)) for name in methods]
 
-        factory.__name__ = cls.__name__
-        factory.__qualname__ = cls.__qualname__
-        factory.__doc__ = cls.__doc__
+        factory.__name__ = klass.__name__
+        factory.__qualname__ = klass.__qualname__
+        factory.__doc__ = klass.__doc__
         return factory
 
     def to_dict(self) -> Dict[str, Any]:
@@ -374,10 +416,13 @@ class Tool:
                 "required": list(legacy_params),
             }
 
+        parameters = cls.Parameter.from_dict(parameters_data) if parameters_data else None
+        if parameters is not None and parameters.type != "object":
+            raise ToolError("Tool parameters must be described by an object schema.")
         return cls(
             name=name,
             description=function_data.get("description") or "No description provided.",
-            parameters=cls.Parameter.from_dict(parameters_data) if parameters_data else None,
+            parameters=parameters,
             instruction=function_data.get("instruction"),
         )
 
@@ -420,6 +465,41 @@ class ToolSet(Dict[str, Tool]):
             self[tool.name] = tool
 
 
+async def _call_in_thread(callback: Callable, arguments: Dict[str, Any]) -> Any:
+    """Run a blocking callback off the event loop and await what it returns.
+
+    Each call gets its own daemon thread rather than a slot in the loop's
+    executor: a callback that never returns then neither uses up a shared
+    worker pool nor keeps the interpreter from exiting.
+    """
+    loop = asyncio.get_running_loop()
+    future: "asyncio.Future[Any]" = loop.create_future()
+
+    def deliver(error: Optional[BaseException], result: Any) -> None:
+        if future.done():  # the caller stopped waiting
+            return
+        if error is None:
+            future.set_result(result)
+        else:
+            future.set_exception(error)
+
+    def run() -> None:
+        error, result = None, None
+        try:
+            result = callback(**arguments)
+        except Exception as e:  # noqa: BLE001 - whatever the callback raises belongs to the awaiting caller
+            error = e
+        except BaseException as e:  # noqa: BLE001 - SystemExit and the like must not take the loop down
+            error = RuntimeError(f"tool callback exited with {type(e).__name__}")
+        try:
+            loop.call_soon_threadsafe(deliver, error, result)
+        except RuntimeError:
+            pass  # the loop has closed; nobody is waiting any more
+
+    threading.Thread(target=run, name="voxpipe-tool-call", daemon=True).start()
+    return await future
+
+
 # --- argument casting -------------------------------------------------------
 
 
@@ -445,18 +525,52 @@ def _cast(name: str, value: Any, json_type: str) -> Any:
             return value.lower() == "true"
         raise ToolError(f"Tool argument '{name}' must be a boolean.")
     if json_type == "string":
+        if isinstance(value, (dict, list)):
+            raise ToolError(f"Tool argument '{name}' must be a string.")
         return str(value)
+    if json_type in _CONTAINER_TYPES:
+        if isinstance(value, str):  # models often send nested JSON as a string
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        if not isinstance(value, _CONTAINER_TYPES[json_type]):
+            raise ToolError(f"Tool argument '{name}' must be an {json_type}.")
     return value
 
 
 # --- type hints to JSON schema ----------------------------------------------
 
 
+def _resolve_hints(fn: Callable, signature: inspect.Signature) -> Dict[str, Any]:
+    """The type hint of each parameter and of the return value (under "return").
+
+    Hints written as strings (``from __future__ import annotations``) are
+    evaluated one at a time, so one that cannot be resolved, such as a name
+    imported only for type checking, does not cost the others their types.
+    """
+    namespace = getattr(inspect.unwrap(fn.func if isinstance(fn, functools.partial) else fn), "__globals__", {})
+
+    def resolve(annotation: Any) -> Any:
+        if not isinstance(annotation, str):
+            return annotation
+        try:
+            return eval(annotation, namespace)  # noqa: S307 - the function's own annotation, as inspect does
+        except Exception:  # noqa: BLE001 - an unresolvable hint is treated as no hint
+            return inspect.Parameter.empty
+
+    hints = {name: resolve(param.annotation) for name, param in signature.parameters.items()}
+    hints["return"] = resolve(signature.return_annotation)
+    return hints
+
+
 def _strip_optional(annotation: Any) -> Any:
-    """``Optional[X]`` / ``X | None`` → ``X``; other unions resolve to their first member."""
+    """``Optional[X]`` / ``X | None`` / ``Annotated[X, ...]`` → ``X``; other unions resolve to their first member."""
+    if get_origin(annotation) is Annotated:
+        return _strip_optional(get_args(annotation)[0])
     if get_origin(annotation) in _UNION_ORIGINS:
         members = [a for a in get_args(annotation) if a is not type(None)]
-        return members[0] if members else str
+        return _strip_optional(members[0]) if members else str
     return annotation
 
 
@@ -525,8 +639,10 @@ _SECTIONS = {
     "instruction": "instruction",
 }
 _SECTION_RE = re.compile(r"^(\w+):\s*$")
-_RST_FIELD_RE = re.compile(r"^:(param\s+\w+|returns?|instruction|raises\s+\w+|rtype|type\s+\w+):\s*(.*)$")
-_GOOGLE_PARAM_RE = re.compile(r"^(\w+)\s*(?:\([^)]*\))?:\s*(.*)$")
+_RST_FIELD_RE = re.compile(
+    r"^:(param\s+(?:[\w\[\], |.]+\s+)?\w+|returns?|instruction|raises\s+\w+|rtype|type\s+\w+):\s*(.*)$"
+)
+_GOOGLE_PARAM_RE = re.compile(r"^\*{0,2}(\w+)\s*(?:\([^)]*\))?:\s*(.*)$")
 
 
 def _parse_docstring(docstring: Optional[str]) -> _DocInfo:
@@ -560,7 +676,7 @@ def _parse_docstring(docstring: Optional[str]) -> _DocInfo:
             kind, text = rst.group(1).split()[0], rst.group(2).strip()
             section, item_indent = "rst", indent
             if kind == "param":
-                target = rst.group(1).split()[1]
+                target = rst.group(1).split()[-1]  # ":param city:" or ":param str city:"
                 info.params[target] = text
             elif kind == "instruction":
                 target = "instruction"

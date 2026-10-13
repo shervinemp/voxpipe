@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 from voxpipe.llm.context import (
@@ -362,6 +363,102 @@ class TestMemoryAcrossSessions(unittest.TestCase):
             [("user", "fact number 0"), ("assistant", "Noted."), ("user", "fact number 1"), ("assistant", "Noted.")],
         )
         self.assertEqual([m["content"] for m in llm.calls[-1].messages], ["fact number 2"])
+
+
+class TestArchivingUnderFailure(unittest.TestCase):
+    def test_messages_a_failing_memory_refused_are_offered_again(self):
+        storage = RAMStorage()
+
+        class Flaky:
+            down = True
+
+            def store(self, content, **kwargs):
+                if self.down:
+                    raise OSError("database is locked")
+                return storage.store(content, **kwargs)
+
+            def retrieve(self, query, **kwargs):
+                return []
+
+        memory = Flaky()
+        handler = MemoryHandler(MaxTurnsStrategy(1), memory, recall_top_k=0)
+        conv = conversation_of(2)
+        with self.assertLogs("voxpipe.llm.context", level="WARNING"):
+            handler.pre_process(conv)
+        self.assertEqual(archived(storage), [], "the backend was down when q0 and a0 were evicted")
+
+        memory.down = False
+        conv.add_user_message("q2")
+        handler.pre_process(conv)
+        self.assertEqual(
+            archived(storage), [("user", "q0"), ("assistant", "a0"), ("user", "q1"), ("assistant", "a1")]
+        )
+
+    def test_a_failed_finalize_is_retried_without_duplicates(self):
+        storage = RAMStorage()
+        attempts = []
+
+        class FailsOnce:
+            def store(self, content, **kwargs):
+                attempts.append(content)
+                if len(attempts) == 2:
+                    raise OSError("disk full")
+                return storage.store(content, **kwargs)
+
+            def retrieve(self, query, **kwargs):
+                return []
+
+        handler = MemoryHandler(MaxTurnsStrategy(20), FailsOnce())
+        conv = conversation_of(2)
+        with self.assertLogs("voxpipe.llm.context", level="WARNING"):
+            handler.finalize(conv)
+        handler.finalize(conv)
+        self.assertEqual(
+            archived(storage), [("user", "q0"), ("assistant", "a0"), ("user", "q1"), ("assistant", "a1")]
+        )
+
+    def test_reset_mid_reply_still_archives_what_was_heard(self):
+        storage = RAMStorage()
+        resume = threading.Event()
+
+        def script(conversation):
+            yield "The capital "
+            resume.wait(timeout=2)
+            yield "is Paris."
+
+        session = Session(llm=ScriptedLLM(script), context_handler=MemoryHandler(MaxTurnsStrategy(20), storage))
+        self.addCleanup(session.close)
+        stream = session("what is the capital of France")
+        self.assertEqual(next(stream), "The capital ")
+
+        session.reset()  # archives the conversation while the turn has yet to record its partial reply
+        resume.set()
+        self.assertEqual(list(stream), [])
+
+        self.assertEqual(
+            archived(storage), [("user", "what is the capital of France"), ("assistant", "The capital ")]
+        )
+
+
+class TestStrategyArguments(unittest.TestCase):
+    def test_token_budget_counts_tool_calls_and_their_arguments(self):
+        conv = Conversation()
+        conv.add_user_message("q")
+        call = ToolCall(name="save", arguments={"text": "x" * 100})
+        conv.add_assistant_message("", tool_calls=[call])
+        conv.add_tool_message("{}", tool_call=call)
+        conv.add_user_message("next")
+        self.assertGreater(TokenBudgetStrategy(len, budget=50, per_message_overhead=0, trim_to=50)(conv), 0)
+
+    def test_a_budget_must_be_positive(self):
+        for budget in (0, -5):
+            with self.subTest(budget=budget), self.assertRaises(ValueError):
+                TokenBudgetStrategy(len, budget=budget)
+
+    def test_turn_limits_must_be_whole_numbers(self):
+        for arguments in [dict(max_turns=2.5), dict(max_turns=True), dict(max_turns=10, trim_to=2.5)]:
+            with self.subTest(arguments), self.assertRaises(TypeError):
+                MaxTurnsStrategy(**arguments)
 
 
 if __name__ == "__main__":

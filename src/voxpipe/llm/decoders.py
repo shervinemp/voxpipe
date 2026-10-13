@@ -17,6 +17,7 @@ StreamItem = Union[str, ToolCall, MalformedToolCall]
 _GEMMA_STRING_DELIMITER = '<|"|>'
 _GEMMA_CALL_RE = re.compile(r"call:([A-Za-z0-9_]+)(.*)", re.DOTALL)
 _BARE_KEY_RE = re.compile(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)")
+_JSON_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
 class StreamDecoder(ABC):
@@ -173,7 +174,13 @@ def _parse_call(fmt: TagFormat, body: str) -> Union[ToolCall, MalformedToolCall]
             payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("tool call must be a JSON object")
-            name, arguments = payload.get("name") or payload.get("function"), payload.get("arguments", {})
+            name = payload.get("name") or payload.get("function")
+            # Some models write "parameters" where the format says "arguments".
+            arguments = payload.get("arguments", payload.get("parameters"))
+            if arguments is None:
+                arguments = {}
+            elif isinstance(arguments, str):  # the OpenAI habit of sending the arguments as a JSON string
+                arguments = json.loads(arguments)
         if not isinstance(name, str) or not name:
             raise ValueError("tool call has no name")
         if not isinstance(arguments, dict):
@@ -193,10 +200,21 @@ def _parse_gemma_arguments(text: str) -> dict:
         raise ValueError("unbalanced string delimiter")
     # Even segments are structure, whose bare keys need quoting; odd ones are string literals.
     rebuilt = "".join(
-        _json_string(segment) if index % 2 else _BARE_KEY_RE.sub(r'\1"\2"\3', segment)
-        for index, segment in enumerate(segments)
+        _json_string(segment) if index % 2 else _quote_bare_keys(segment) for index, segment in enumerate(segments)
     )
     return json.loads(rebuilt)
+
+
+def _quote_bare_keys(structure: str) -> str:
+    """Quote unquoted object keys, leaving the insides of ordinary JSON strings alone."""
+    parts: List[str] = []
+    position = 0
+    for string in _JSON_STRING_RE.finditer(structure):
+        parts.append(_BARE_KEY_RE.sub(r'\1"\2"\3', structure[position : string.start()]))
+        parts.append(string.group(0))
+        position = string.end()
+    parts.append(_BARE_KEY_RE.sub(r'\1"\2"\3', structure[position:]))
+    return "".join(parts)
 
 
 def _json_string(literal: str) -> str:

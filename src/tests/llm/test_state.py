@@ -98,5 +98,31 @@ class TestSessionState(unittest.TestCase):
         self.assertIsNone(state.tools.get_permission("t"))
 
 
+class TestSavingAwkwardValues(unittest.TestCase):
+    def test_a_pending_choice_is_saved_as_the_model_saw_it(self):
+        import datetime
+
+        choice = ToolChoice(result={"when": [datetime.date(2026, 1, 1), datetime.date(2026, 1, 2)]})
+        state = SessionState()
+        state.tools.add_pending(ToolCall(name="book"), choice)
+        with tempfile.TemporaryDirectory() as tmp:
+            state.save(tmp)
+            restored = SessionState()
+            restored.load(tmp)
+        self.assertEqual(restored.tools.get_pending(choice.uid).choice.raw_result["when"], ["2026-01-01", "2026-01-02"])
+
+    def test_a_failed_save_keeps_the_previous_file(self):
+        state = SessionState()
+        state.user.set("note", "kept")
+        with tempfile.TemporaryDirectory() as tmp:
+            state.save(tmp)
+            state.user.set("bad", object())
+            with self.assertRaises(TypeError):
+                state.save(tmp)
+            with open(os.path.join(tmp, "state.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["user"], {"note": "kept"})
+            self.assertEqual(os.listdir(tmp), ["state.json"], "no temporary file is left behind")
+
+
 if __name__ == "__main__":
     unittest.main()

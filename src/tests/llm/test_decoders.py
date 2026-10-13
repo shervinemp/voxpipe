@@ -497,3 +497,47 @@ class TestStreamDecoders(unittest.TestCase):
         result = list(d(iter([tc])))
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].name, "direct")
+
+
+class TestArgumentVariants(unittest.TestCase):
+    """Shapes models actually write that differ from the format's letter."""
+
+    @staticmethod
+    def decode(decoder, text):
+        return list(decoder([text]))
+
+    def test_gemma_calls_with_ordinary_json_strings(self):
+        from voxpipe.llm.decoders import GemmaE2BDecoder
+
+        cases = {
+            '{"query": "weather, city: Oslo"}': {"query": "weather, city: Oslo"},
+            '{query:"remind me: milk, eggs: 12"}': {"query": "remind me: milk, eggs: 12"},
+            '{a:"x", b:{c:"y, z: 1"}}': {"a": "x", "b": {"c": "y, z: 1"}},
+            '{query:<|"|>plain, old: style<|"|>,n:2}': {"query": "plain, old: style", "n": 2},
+        }
+        for arguments, expected in cases.items():
+            with self.subTest(arguments):
+                items = self.decode(GemmaE2BDecoder(), f"<|tool_call>call:t{arguments}<tool_call|>")
+                self.assertEqual(items, [ToolCall(name="t", arguments=expected)])
+
+    def test_json_calls_with_parameters_stringified_or_null_arguments(self):
+        from voxpipe.llm.decoders import LegacyXMLDecoder
+
+        cases = {
+            '{"name": "t", "parameters": {"q": 1}}': {"q": 1},
+            '{"name": "t", "arguments": "{\\"q\\": 1}"}': {"q": 1},
+            '{"name": "t", "arguments": null}': {},
+            '{"name": "t"}': {},
+        }
+        for body, expected in cases.items():
+            with self.subTest(body):
+                items = self.decode(LegacyXMLDecoder(), f"<tool_call>{body}</tool_call>")
+                self.assertEqual(items, [ToolCall(name="t", arguments=expected)])
+
+    def test_arguments_that_are_not_an_object_stay_malformed(self):
+        from voxpipe.llm.decoders import LegacyXMLDecoder
+
+        for body in ('{"name": "t", "arguments": "not json"}', '{"name": "t", "arguments": [1]}'):
+            with self.subTest(body), self.assertLogs("voxpipe.llm.decoders", level="WARNING"):
+                items = self.decode(LegacyXMLDecoder(), f"<tool_call>{body}</tool_call>")
+                self.assertIsInstance(items[0], MalformedToolCall)
