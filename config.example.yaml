@@ -60,6 +60,7 @@ conversation_history:
 # attention:
 #   busy_mode: true
 #   examples_path: "data/addressee_examples.jsonl"  # corrections accumulate here
+#   decision_log_path: "data/attention_decisions.jsonl"  # replay in shadow mode
 #   shadow: false          # true = decide but never speak; collect labels first
 #   defer_ms: null         # null = 400 ms in busy mode
 #   speak_threshold: null  # null = 0.70

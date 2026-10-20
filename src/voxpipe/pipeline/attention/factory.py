@@ -5,6 +5,7 @@ from ...core.models import AttentionConfig, TopicTrackingConfig
 from ...core.utils import get_logger
 from .addressee import AddresseeGate, AddresseeModel
 from .embeddings import create_embedder
+from .logging import DecisionLog
 from .protocols import RelatednessScorer
 from .scorers import EmbeddingScorer, LayaScorer, LexicalScorer
 from .tracker import TopicTracker
@@ -50,6 +51,10 @@ def create_addressee_gate(config: AttentionConfig) -> AddresseeGate:
         k_neighbors=config.k_neighbors,
         max_examples=config.max_examples,
     )
+    log_path = config.decision_log_path
+    if log_path is None and config.shadow:
+        log_path = "data/attention_decisions.jsonl"
+    log = DecisionLog(log_path) if log_path else None
     gate = AddresseeGate(
         model,
         # The tracker is a context store here: main is the AI thread, customer
@@ -61,6 +66,7 @@ def create_addressee_gate(config: AttentionConfig) -> AddresseeGate:
         shadow=config.shadow,
         customer_ttl_sentences=config.customer_ttl_sentences,
         background_ttl_sentences=config.background_ttl_sentences,
+        decision_log=log,
     )
     get_logger(__name__).info(
         "Addressee gate enabled (busy_mode=%s, defer=%dms, speak=%.2f, silence=%.2f, shadow=%s).",

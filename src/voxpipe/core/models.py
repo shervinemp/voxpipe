@@ -115,6 +115,7 @@ class AttentionConfig(_Section):
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_cache_dir: Optional[str] = None
     examples_path: Optional[str] = "data/addressee_examples.jsonl"
+    decision_log_path: Optional[str] = None
     shadow: bool = Field(default=False, description="Decide but never speak; collect labels first.")
     customer_ttl_sentences: int = Field(default=50, ge=1)
     background_ttl_sentences: int = Field(default=10, ge=1)

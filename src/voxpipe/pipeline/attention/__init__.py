@@ -1,9 +1,11 @@
 """Pluggable attention layer: gates, buffers and relevance scorers."""
 
-from .addressee import AddresseeGate, AddresseeModel, Example, FloorState
+from .addressee import AddresseeGate, AddresseeModel, Example
 from .factory import create_addressee_gate, create_tracker
 from .gates import PassThroughGate
-from .models import GateDecision, RouteKind, TopicBuffer, TopicDecision, Utterance
+from .logging import DecisionLog
+from .models import FloorState, GateDecision, RouteKind, TopicBuffer, TopicDecision, Utterance
+from .orders import Menu, MenuItem, Order, OrderBook, OrderItem
 from .policies import (
     DefaultFollowUpPolicy,
     KeywordFollowUpPolicy,
@@ -11,6 +13,7 @@ from .policies import (
     QuestionReplyPolicy,
 )
 from .protocols import ConversationGate, FollowUpPolicy, RelatednessScorer
+from .replay import Metrics, best_under_false_positive_rate, load_records, paired_labels, summarize, sweep
 from .scorers import EmbeddingScorer, LayaScorer, LexicalScorer
 from .tracker import TopicTracker
 
@@ -23,12 +26,18 @@ __all__ = [
     "AddresseeModel",
     "FloorState",
     "Example",
+    "DecisionLog",
     "PassThroughGate",
     "TopicBuffer",
     "TopicDecision",
     "GateDecision",
     "RouteKind",
     "Utterance",
+    "Menu",
+    "MenuItem",
+    "Order",
+    "OrderBook",
+    "OrderItem",
     "LexicalScorer",
     "EmbeddingScorer",
     "LayaScorer",
@@ -38,4 +47,10 @@ __all__ = [
     "NoFollowUpPolicy",
     "create_tracker",
     "create_addressee_gate",
+    "Metrics",
+    "load_records",
+    "paired_labels",
+    "sweep",
+    "best_under_false_positive_rate",
+    "summarize",
 ]

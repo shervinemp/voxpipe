@@ -29,6 +29,14 @@
   with explicit settings, and `voxpipe --busy` enables the preset for one run.
   This adds `AddresseeGate`, `AddresseeModel`, `GateDecision.defer_ms`, the
   `attention` configuration section, and pipeline deferral handling.
+- **Shadow logging and replay.** Attention decisions and corrections are
+  appended to `attention.decision_log_path`; `scripts/replay_addressee.py`
+  pairs them and sweeps speak/silence thresholds under a configurable
+  false-positive budget. `AddresseeModel.clear()` removes learned examples.
+- **Optional order intake.** `Menu`, `MenuItem`, `Order`, `OrderItem` and
+  `OrderBook` provide a domain-neutral structured order model with menu/alias
+  matching, quantity and simple modifier parsing, summaries and confirmation.
+  It is not wired into the pipeline; applications choose whether to use it.
 
 ### Changed
 

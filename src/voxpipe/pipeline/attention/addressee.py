@@ -19,7 +19,8 @@ import numpy as np
 
 from ...core.utils import get_logger, write_atomically
 from .embeddings import TextEmbedder
-from .models import GateDecision, TopicBuffer
+from .logging import DecisionLog
+from .models import FloorState, GateDecision, TopicBuffer
 from .scorers import LexicalScorer
 from .text import normalize_phrase, words
 from .tracker import TopicTracker
@@ -56,16 +57,6 @@ _CUSTOMER_RE = re.compile(
     r"|anything else|that'?ll be|your total|cash or card|here you go|thank you|have a (nice|good)|next)\b",
     re.IGNORECASE,
 )
-
-
-@dataclass
-class FloorState:
-    """The cheap conversational state used by the addressee model."""
-
-    last_speaker: str = "assistant"
-    awaiting_reply: bool = False
-    customer_present: bool = False
-    order_phase: Optional[str] = None
 
 
 @dataclass
@@ -125,6 +116,18 @@ class AddresseeModel:
             self._embed_failed = False
             self._save()
 
+    def clear(self) -> None:
+        """Forget every learned example and remove the examples file."""
+        with self._lock:
+            self._examples = []
+            self._vectors = None
+            self._embed_failed = False
+            if self.examples_path:
+                try:
+                    Path(self.examples_path).unlink(missing_ok=True)
+                except OSError as e:
+                    self.logger.warning("Could not remove addressee examples %s: %s", self.examples_path, e)
+
     def score(self, text: str, state: FloorState) -> float:
         """P(addressed to the assistant), with a rules-based fallback."""
         heuristic = self._heuristic(text, state)
@@ -160,6 +163,8 @@ class AddresseeModel:
             score = max(score, 0.80)
         if state.customer_present and not ai:
             score = min(score, 0.40)
+        if state.order_phase in {"order", "upsell", "confirm", "payment"} and not ai:
+            score = min(score, 0.30)
         return max(0.0, min(1.0, score))
 
     def _embed(self, texts: Sequence[str]) -> Optional[np.ndarray]:
@@ -248,6 +253,7 @@ class AddresseeGate:
         shadow: bool = False,
         customer_ttl_sentences: int = 50,
         background_ttl_sentences: int = 10,
+        decision_log: Optional[DecisionLog] = None,
     ):
         if not 0.0 <= silence_threshold < speak_threshold <= 1.0:
             raise ValueError("thresholds must satisfy 0 <= silence_threshold < speak_threshold <= 1.")
@@ -263,6 +269,7 @@ class AddresseeGate:
         self.background_ttl_sentences = background_ttl_sentences
         self.state = FloorState()
         self._last_text: Optional[str] = None
+        self._log = decision_log
         self._lock = threading.RLock()
         self._closed = False
 
@@ -271,6 +278,12 @@ class AddresseeGate:
         return self.model.examples
 
     def evaluate(self, text: str, *, explicit: bool = False) -> GateDecision:
+        decision = self._evaluate(text, explicit=explicit)
+        if self._log is not None:
+            self._log.write((text or "").strip(), decision, self.state)
+        return decision
+
+    def _evaluate(self, text: str, *, explicit: bool = False) -> GateDecision:
         with self._lock:
             if self._closed:
                 return GateDecision(answer=False, reason="closed")
@@ -343,6 +356,13 @@ class AddresseeGate:
         with self._lock:
             if not self._closed and self._last_text:
                 self.model.learn(self._last_text, addressed)
+                if self._log is not None:
+                    self._log.correction(self._last_text, addressed)
+
+    def clear_examples(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self.model.clear()
 
     def set_customer_present(self, present: bool) -> None:
         with self._lock:

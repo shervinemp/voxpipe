@@ -22,6 +22,16 @@ class Utterance:
 
 
 @dataclass
+class FloorState:
+    """Cheap conversational state used by the addressee model."""
+
+    last_speaker: str = "assistant"
+    awaiting_reply: bool = False
+    customer_present: bool = False
+    order_phase: Optional[str] = None
+
+
+@dataclass
 class TopicBuffer:
     """A run of utterances, with its lifecycle state.
 

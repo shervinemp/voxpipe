@@ -10,6 +10,7 @@ from voxpipe.pipeline.attention.embeddings import HashingEmbedder
 from voxpipe.pipeline.topics import (
     AddresseeGate,
     AddresseeModel,
+    DecisionLog,
     FloorState,
     create_addressee_gate,
 )
@@ -32,6 +33,20 @@ class TestAddresseeModel(unittest.TestCase):
     def test_a_short_answer_after_a_question_scores_high(self):
         model = self.make()
         self.assertGreater(model.score("Paris", FloorState(awaiting_reply=True)), 0.7)
+
+    def test_an_open_order_phase_biases_ambiguous_speech_to_customer(self):
+        model = self.make()
+        self.assertLessEqual(model.score("the sky is blue", FloorState(order_phase="order")), 0.30)
+
+    def test_clear_removes_examples_and_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "examples.jsonl")
+            model = self.make(path)
+            model.learn("alpha beta", True)
+            self.assertTrue(os.path.exists(path))
+            model.clear()
+            self.assertEqual(model.examples, [])
+            self.assertFalse(os.path.exists(path))
 
     def test_learning_a_positive_example_raises_the_score(self):
         model = self.make()
@@ -148,6 +163,25 @@ class TestAddresseeGate(unittest.TestCase):
         gate.set_order_phase("order")
         self.assertTrue(gate.state.customer_present)
         self.assertEqual(gate.state.order_phase, "order")
+
+    def test_decision_log_records_decisions_and_corrections(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "decisions.jsonl")
+            gate = AddresseeGate(
+                AddresseeModel(HashingEmbedder(), examples_path=None),
+                decision_log=DecisionLog(path),
+            )
+            self.addCleanup(gate.close)
+            gate.evaluate("add two burgers")
+            gate.evaluate("not you")
+            with open(path, encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual([record["type"] for record in records], ["decision", "correction", "decision"])
+        correction = next(record for record in records if record["type"] == "correction")
+        self.assertEqual(correction["text"], "add two burgers")
+        self.assertFalse(correction["addressed"])
 
 
 class TestBusyPreset(unittest.TestCase):

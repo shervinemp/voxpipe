@@ -236,12 +236,22 @@ or start with `voxpipe --busy`. It automatically:
   hashing fallback otherwise,
 - learns from corrections. Say “not you” or “that was me” after an utterance to
   label it and improve the next decision; examples are stored in
-  `attention.examples_path` (`data/addressee_examples.jsonl` by default).
+  `attention.examples_path` (`data/addressee_examples.jsonl` by default). Call
+  `gate.clear_examples()` or delete that file to remove them. Customer and
+  background buffers stay in memory and expire; only corrections are persisted.
 
 `attention.shadow: true` runs the gate without ever speaking, so you can collect
-labels before letting it answer. `attention.enabled: true` turns on the
-addressee gate with explicit settings but without the busy preset. The two
-overrides work as expected:
+labels before letting it answer. In shadow mode, decisions are appended to
+`attention.decision_log_path` (default `data/attention_decisions.jsonl`), and
+the replay script pairs them with your corrections to show the
+false-positive/false-negative trade-off:
+
+```bash
+uv run python scripts/replay_addressee.py --decisions data/attention_decisions.jsonl
+```
+
+`attention.enabled: true` turns on the addressee gate with explicit settings but
+without the busy preset. The two overrides work as expected:
 
 ```yaml
 attention:
@@ -255,6 +265,42 @@ attention:
 If both `attention` and `topic_tracking` are enabled, the addressee gate wins.
 Use topic tracking when you want one speaker’s conversation split into topics;
 use busy mode when the hard problem is deciding who the speaker is talking to.
+
+### Order intake
+
+`voxpipe.pipeline.attention` also ships an optional, domain-neutral order model.
+It is not wired into the pipeline automatically; an application can feed it
+customer text or structured items:
+
+```python
+from voxpipe.pipeline.attention import Menu, OrderBook
+
+menu = Menu.from_file("menu.yaml")
+orders = OrderBook(menu)
+
+orders.add_text("4", "two cheeseburgers no pickles and a coke")
+print(orders.summary("4"))
+# Table 4: 2 x Cheeseburger (no pickles), 1 x Coke — total 21.00
+
+orders.confirm("4")
+orders.close("4")
+```
+
+`menu.yaml` is a simple list:
+
+```yaml
+items:
+  - name: Cheeseburger
+    aliases: ["burger", "cheese burger"]
+    price: 9.50
+  - name: Coke
+    aliases: ["cola"]
+    price: 2.00
+```
+
+`add_text` is a deterministic convenience parser for clean menu-matched speech.
+For messy language, extract items with the LLM and call `add_item(table, name,
+quantity, modifiers)` directly. Always confirm before submitting to a POS.
 
 ### Using the pieces directly
 
