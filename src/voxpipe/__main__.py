@@ -41,6 +41,11 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         default=None,
         help="Key combination that clears the conversation, e.g. '<ctrl_l>+<ctrl_r>'. Overrides the configuration.",
     )
+    parser.add_argument(
+        "--busy",
+        action="store_true",
+        help="Enable busy mode: an addressee gate with deferred, silence-biased replies for shared spaces.",
+    )
     return parser.parse_args(argv)
 
 
@@ -63,7 +68,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     from .pipeline.pipeline import Pipeline
 
     try:
-        set_config(load_config(args.config))
+        config = load_config(args.config)
+        if args.busy:
+            config = config.model_copy(
+                update={"attention": config.attention.model_copy(update={"busy_mode": True})}
+            )
+        set_config(config)
         tools = _load_tools(args.specs_path) if args.specs_path else []
         pipeline = Pipeline.from_config(push_to_talk=args.push_to_talk, press_to_reset=args.press_to_reset)
     except ImportError as e:

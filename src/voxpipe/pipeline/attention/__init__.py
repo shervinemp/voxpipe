@@ -1,6 +1,7 @@
 """Pluggable attention layer: gates, buffers and relevance scorers."""
 
-from .factory import create_tracker
+from .addressee import AddresseeGate, AddresseeModel, Example, FloorState
+from .factory import create_addressee_gate, create_tracker
 from .gates import PassThroughGate
 from .models import GateDecision, RouteKind, TopicBuffer, TopicDecision, Utterance
 from .policies import (
@@ -18,6 +19,10 @@ __all__ = [
     "FollowUpPolicy",
     "RelatednessScorer",
     "TopicTracker",
+    "AddresseeGate",
+    "AddresseeModel",
+    "FloorState",
+    "Example",
     "PassThroughGate",
     "TopicBuffer",
     "TopicDecision",
@@ -32,4 +37,5 @@ __all__ = [
     "QuestionReplyPolicy",
     "NoFollowUpPolicy",
     "create_tracker",
+    "create_addressee_gate",
 ]

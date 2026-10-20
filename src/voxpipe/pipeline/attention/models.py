@@ -157,6 +157,7 @@ class GateDecision:
     confidence: float = 1.0
     reason: str = ""
     detail: Any = None
+    defer_ms: int = 0
 
     @property
     def route(self) -> Optional[TopicDecision]:

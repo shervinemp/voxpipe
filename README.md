@@ -58,6 +58,7 @@ uv run voxpipe
 | **Tools** | Tool calling with streaming decoders, chaining, async tools, and user-confirmed permissions |
 | **Memory** | Conversation history in SQLite + FTS5; relevant past turns are recalled into context |
 | **Topic tracking** | Keeps unrelated speech in bounded side buffers so it does not reach the LLM or speakers |
+| **Busy mode** | Addressee-aware silence bias, deferred replies and personal corrections for shared spaces |
 | **Hotkeys** | Push-to-talk and conversation reset |
 
 ## Configuration
@@ -124,8 +125,9 @@ src/
 1. **ASR** captures audio on its own thread; the VAD segments speech, and
    push-to-talk mutes the microphone between presses
 2. **Transcript gate** drops noise before it reaches the LLM
-3. **Topic tracking** (when enabled) routes an utterance to the active
-   conversation or to a side buffer; side speech is not answered
+3. **Attention gate** (when enabled) decides whether an utterance is for the
+   assistant and routes it to the active conversation, a side topic, or a
+   customer/background buffer; non-addressed speech is not answered
 4. **Memory** attaches relevant past turns to the new message as
    `(Earlier: ...)` context
 5. **LLM** answers, calling tools when it needs to
@@ -208,6 +210,51 @@ Barge-in is decided when speech starts, before ASR has produced text, so a
 background utterance can still cut a reply short. The gate decides whether the
 transcript is answered; it cannot undo an interruption that has already
 happened.
+
+### Busy mode
+
+For a shared space — a restaurant counter, an open office, a workshop — the
+problem is usually not “is this related?” but “is this addressed to me?”. Busy
+mode is the one-switch preset for that:
+
+```yaml
+attention:
+  busy_mode: true
+```
+
+or start with `voxpipe --busy`. It automatically:
+
+- enables an **addressee gate** instead of topic tracking,
+- waits **400 ms** for a possible customer reply before speaking; any new
+  utterance in that window cancels the reply,
+- uses silence-biased thresholds (**0.70** to speak, **0.35** to treat speech
+  as customer/background),
+- keeps customer speech in a named `customer` buffer and ambiguous speech in
+  `background`, never in the AI thread,
+- uses a small embedding model to compare the utterance with your own labeled
+  examples; fastembed is used when installed, with a deterministic lexical
+  hashing fallback otherwise,
+- learns from corrections. Say “not you” or “that was me” after an utterance to
+  label it and improve the next decision; examples are stored in
+  `attention.examples_path` (`data/addressee_examples.jsonl` by default).
+
+`attention.shadow: true` runs the gate without ever speaking, so you can collect
+labels before letting it answer. `attention.enabled: true` turns on the
+addressee gate with explicit settings but without the busy preset. The two
+overrides work as expected:
+
+```yaml
+attention:
+  busy_mode: true
+  defer_ms: 250
+  speak_threshold: 0.80
+  silence_threshold: 0.40
+  shadow: false
+```
+
+If both `attention` and `topic_tracking` are enabled, the addressee gate wins.
+Use topic tracking when you want one speaker’s conversation split into topics;
+use busy mode when the hard problem is deciding who the speaker is talking to.
 
 ### Using the pieces directly
 

@@ -20,6 +20,15 @@
   `gate:decided` reports every decision. Trackers can also route explicitly to
   a named buffer (`route_to("table_4", ...)`), so workflow contexts do not have
   to be inferred from topic similarity.
+- **Busy mode / addressee gate.** `attention.busy_mode: true` enables a
+  silence-biased gate for shared spaces: an addressee classifier over your own
+  labeled examples, a short deferral that cancels the reply if someone keeps
+  talking, named customer/background buffers, “not you” / “that was me”
+  corrections, and a shadow mode. Embeddings use fastembed when installed and
+  fall back to deterministic hashing. `attention.enabled` turns the gate on
+  with explicit settings, and `voxpipe --busy` enables the preset for one run.
+  This adds `AddresseeGate`, `AddresseeModel`, `GateDecision.defer_ms`, the
+  `attention` configuration section, and pipeline deferral handling.
 
 ### Changed
 

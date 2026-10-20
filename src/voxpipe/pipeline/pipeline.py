@@ -19,7 +19,7 @@ from ..storage import SQLiteStorage
 from ..streaming.splitter import stream_splitter
 from .events import EventEmitter
 from .transcript import qualify_transcript
-from .topics import ConversationGate, TopicTracker, create_tracker
+from .topics import ConversationGate, TopicTracker, create_addressee_gate, create_tracker
 
 if TYPE_CHECKING:
     from .hotkeys import HotkeyDispatcher
@@ -125,6 +125,7 @@ class Pipeline:
         self._press_to_reset: Optional[str] = None
         self._commands: Dict[str, Tuple[Callable[[str], Any], Callable[[], None]]] = {}
         self._transcripts: "queue.Queue[Any]" = queue.Queue()
+        self._speech_event = threading.Event()  # set whenever another utterance is queued
         self._interrupt = threading.Event()
         self._stopping = threading.Event()
         self._running = False
@@ -209,7 +210,7 @@ class Pipeline:
                 push_to_talk=push_to_talk or (hotkeys.push_to_talk if hotkeys.enable else None),
                 press_to_reset=press_to_reset or (hotkeys.press_to_reset if hotkeys.enable else None),
                 memory=memory,
-                gate=cls._topic_tracker(config),
+                gate=cls._gate(config),
             )
         except BaseException:
             # Don't leave a microphone stream or worker threads behind a pipeline that never came to be.
@@ -242,17 +243,19 @@ class Pipeline:
             return None
 
     @staticmethod
-    def _topic_tracker(config: AppConfig) -> Optional[TopicTracker]:
-        """Build the optional topic gate; a configured but unavailable backend is fatal."""
-        if not config.topic_tracking.enabled:
-            return None
-        tracker = create_tracker(config.topic_tracking)
-        get_logger(__name__).info(
-            "Topic tracking enabled (backend=%s, threshold=%.2f).",
-            config.topic_tracking.backend,
-            tracker.threshold,
-        )
-        return tracker
+    def _gate(config: AppConfig) -> Optional[ConversationGate]:
+        """Build the configured gate; the addressee gate wins over topic tracking."""
+        if config.attention.busy_mode or config.attention.enabled:
+            return create_addressee_gate(config.attention)
+        if config.topic_tracking.enabled:
+            tracker = create_tracker(config.topic_tracking)
+            get_logger(__name__).info(
+                "Topic tracking enabled (backend=%s, threshold=%.2f).",
+                config.topic_tracking.backend,
+                tracker.threshold,
+            )
+            return tracker
+        return None
 
     @staticmethod
     def _context_handler(llm: LLM, config: AppConfig, memory: Optional[SQLiteStorage]) -> MemoryHandler:
@@ -397,6 +400,7 @@ class Pipeline:
         """Ask :meth:`run` to return, leaving unanswered whatever was still waiting. Safe from any thread."""
         self._stopping.set()
         self._transcripts.put(_STOP)
+        self._speech_event.set()
         self.interrupt()
 
     def submit(self, text: str) -> None:
@@ -406,9 +410,11 @@ class Pipeline:
         call :meth:`handle_transcript` instead.
         """
         self._transcripts.put((text, None))
+        self._speech_event.set()
 
     def _on_speech_onset(self) -> None:
         """The user started talking (called on the ASR thread). If we are mid-reply, yield the floor."""
+        self._speech_event.set()  # also cancels a reply waiting in its deferral window
         self._onsets += 1  # a reply that has not started yet learns from this that it must wait
         speaking = self._responding or (self.tts is not None and self.tts.is_speaking)
         if not speaking:
@@ -462,6 +468,7 @@ class Pipeline:
                 # Stamped with the number of speech onsets so far: if the user has started speaking
                 # again by the time this is answered, the count will have moved on.
                 self._transcripts.put((transcript, self._onsets))
+                self._speech_event.set()
         except Exception as e:  # noqa: BLE001 - report and shut the pipeline down cleanly
             self._listen_error = e
             self.events.emit("pipeline:error", e)
@@ -491,6 +498,11 @@ class Pipeline:
             return
 
         topic_context = None
+        defer_ms = 0
+        if not explicit:
+            # Any speech queued from here until the deferral ends means someone
+            # else kept talking, so the reply should stay silent.
+            self._speech_event.clear()
         gate = self.gate
         if gate is not None:
             decision = gate.evaluate(text, explicit=explicit)
@@ -511,10 +523,15 @@ class Pipeline:
                     )
                 return
             topic_context = decision.context
+            defer_ms = decision.defer_ms
 
         if not explicit and self._run_command(text):
             # A command heard through the gate is only run after the gate accepted it.
             self._interrupted_at = None
+            return
+
+        if not explicit and defer_ms > 0 and self._wait_for_speech(defer_ms):
+            self.logger.info("Deferred reply cancelled: another utterance arrived.")
             return
 
         interrupted_at, self._interrupted_at = self._interrupted_at, None
@@ -527,6 +544,12 @@ class Pipeline:
     def _should_gate(self, heard_at: Optional[int]) -> bool:
         """Only audio from an always-on microphone is gated; typed input and push-to-talk are explicit."""
         return self.gate is not None and heard_at is not None and not self._push_to_talk
+
+    def _wait_for_speech(self, milliseconds: int) -> bool:
+        """Wait for another utterance; True means the reply should stay silent."""
+        if self._transcripts.qsize() > 0:
+            return True
+        return self._speech_event.wait(milliseconds / 1000.0)
 
     def _respond(self, text: Optional[str], context: Optional[str], baseline: int) -> None:
         """Answer ``text`` (and anything held back before it) aloud, unless the user is speaking again.

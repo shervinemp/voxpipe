@@ -14,7 +14,7 @@ from voxpipe.llm.context import MemoryHandler
 from voxpipe.llm.session import Session
 from voxpipe.llm.tools import Tool, ToolCall
 from voxpipe.pipeline.pipeline import Pipeline
-from voxpipe.pipeline.topics import PassThroughGate, TopicTracker
+from voxpipe.pipeline.topics import AddresseeGate, GateDecision, PassThroughGate, TopicTracker
 from voxpipe.storage import RAMStorage, SQLiteStorage
 
 from ..llm._fakes import ScriptedLLM
@@ -578,6 +578,29 @@ class TestTopicGating(PipelineCase):
         self.assertIsNotNone(last)
         self.assertEqual((last.speaker, last.text), ("assistant", "Hi there."))
 
+    def test_a_deferral_can_be_cancelled_by_more_speech(self):
+        class DeferringGate(PassThroughGate):
+            def evaluate(self, text, *, explicit=False):
+                return GateDecision(answer=True, defer_ms=300)
+
+        pipe = self.make(["should not be spoken"], gate=DeferringGate())
+        worker = threading.Thread(target=lambda: pipe._handle("hello", heard_at=0))
+        worker.start()
+        time.sleep(0.05)
+        self.asr.vad.on_speech_onset()  # a customer starts speaking during the deferral
+        worker.join(timeout=3)
+        self.assertEqual(self.llm.calls, [])
+        self.assertEqual(self.tts.spoken, [])
+
+    def test_a_deferral_without_more_speech_is_answered(self):
+        class DeferringGate(PassThroughGate):
+            def evaluate(self, text, *, explicit=False):
+                return GateDecision(answer=True, defer_ms=10)
+
+        pipe = self.make(["Spoken."], gate=DeferringGate())
+        pipe._handle("hello", heard_at=0)
+        self.assertEqual(self.tts.spoken, ["Spoken."])
+
     def test_promotion_hands_the_earlier_side_sentences_to_the_model(self):
         tracker = TopicTracker(ScriptedScorer([0.0], [0.0, 0.9]), promote_after=2)
         tracker.route("hello")
@@ -674,6 +697,16 @@ class TestFromConfig(unittest.TestCase):
         pipe = self.build(self.config.model_copy(update={"topic_tracking": tracking}))
         self.assertIsNotNone(pipe.topics)
         self.assertEqual(pipe.topics.threshold, 0.12)
+
+    def test_busy_mode_builds_the_addressee_gate(self):
+        from voxpipe.pipeline.attention.embeddings import HashingEmbedder
+
+        with patch("voxpipe.pipeline.attention.factory.create_embedder", return_value=HashingEmbedder()):
+            attention = self.config.attention.model_copy(update={"busy_mode": True, "examples_path": None})
+            pipe = self.build(self.config.model_copy(update={"attention": attention}))
+        self.assertIsInstance(pipe.gate, AddresseeGate)
+        self.assertIsNone(pipe.topics)
+        self.assertEqual(pipe.gate.defer_ms, 400)
 
     def test_hotkeys_can_be_disabled_or_overridden(self):
         disabled = self.config.model_copy(update={"hotkeys": self.config.hotkeys.model_copy(update={"enable": False})})
@@ -962,6 +995,11 @@ class TestStoppingAndFailing(PipelineCase):
 
 
 class TestCommandLine(unittest.TestCase):
+    def test_busy_flag_is_available(self):
+        from voxpipe.__main__ import _parse_args
+
+        self.assertTrue(_parse_args(["--busy"]).busy)
+
     def _specs(self, content):
         import json
 

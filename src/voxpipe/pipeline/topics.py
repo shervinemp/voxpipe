@@ -5,9 +5,13 @@ stays so existing imports keep working.
 """
 
 from .attention import (
+    AddresseeGate,
+    AddresseeModel,
     ConversationGate,
     DefaultFollowUpPolicy,
     EmbeddingScorer,
+    Example,
+    FloorState,
     FollowUpPolicy,
     GateDecision,
     KeywordFollowUpPolicy,
@@ -22,13 +26,18 @@ from .attention import (
     TopicDecision,
     TopicTracker,
     Utterance,
+    create_addressee_gate,
     create_tracker,
 )
 
 __all__ = [
+    "AddresseeGate",
+    "AddresseeModel",
     "ConversationGate",
     "DefaultFollowUpPolicy",
     "EmbeddingScorer",
+    "Example",
+    "FloorState",
     "FollowUpPolicy",
     "GateDecision",
     "KeywordFollowUpPolicy",
@@ -43,5 +52,6 @@ __all__ = [
     "TopicDecision",
     "TopicTracker",
     "Utterance",
+    "create_addressee_gate",
     "create_tracker",
 ]
