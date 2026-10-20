@@ -1,7 +1,7 @@
 """Tests for the transcript gate."""
 import unittest
 
-from voxpipe.pipeline.gate import qualify_transcript
+from voxpipe.pipeline.transcript import qualify_transcript
 
 
 class TestTranscriptGate(unittest.TestCase):

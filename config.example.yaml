@@ -37,3 +37,15 @@ conversation_history:
   db_path: "data/conversations.db"
   top_k: 2               # memories recalled per turn; 0 disables recall
   ttl_days: 30           # 0 keeps entries forever
+
+# Keep the active conversation apart from background speech. Disabled by
+# default: relatedness is a useful hint, not a substitute for a wake word.
+# topic_tracking:
+#   enabled: true
+#   backend: "embedding" # "lexical", "embedding" (voxpipe[embed]), or "laya" (voxpipe[laya])
+#   threshold: null      # null = per-backend default
+#   ttl_sentences: 10    # drop an unused side topic after this many utterances
+#   max_unrelated: 4     # side topics kept at once
+#   promote_after: 0     # N consecutive side utterances promote it; 0 = never (PTT already bypasses)
+#   embedding_model: "BAAI/bge-small-en-v1.5"
+#   laya_model: "auto"   # "auto", "english", "multilingual", "typed-decisions"

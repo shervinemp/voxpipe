@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Topic tracking.** An optional gate keeps the active conversation apart from
+  unrelated speech. Each recognised utterance is compared with the main topic
+  and with bounded side buffers; a sentence joins the closest buffer or starts
+  a new one. Side buffers expire after `topic_tracking.ttl_sentences` idle
+  utterances and are capped by `max_unrelated`. Only the main topic is answered
+  (unless `promote_after` promotes a side thread), and push-to-talk or typed
+  input bypasses the gate. Three pluggable scorers ship: dependency-free
+  lexical overlap, a small fastembed bi-encoder (`voxpipe[embed]`, recommended
+  for real-time use), and Laya's yes/no decision model (`voxpipe[laya]`).
+  Routing is visible through the `topic:routed` event.
+- **Pluggable gates and named buffers.** The pipeline now accepts any
+  `ConversationGate` through `Pipeline(gate=...)`; `TopicTracker` is one
+  implementation, and `PassThroughGate` is available as a null gate.
+  `gate:decided` reports every decision. Trackers can also route explicitly to
+  a named buffer (`route_to("table_4", ...)`), so workflow contexts do not have
+  to be inferred from topic similarity.
+
+### Changed
+
+- The attention layer now lives in `voxpipe.pipeline.attention`;
+  `voxpipe.pipeline.topics` remains as a compatibility import. Inferred side
+  buffers (TTL/LRU) are separate from named workflow buffers, so background
+  chatter cannot evict a table, ticket or action-item buffer.
+- Relevance scorers declare their own default threshold. A failing primary
+  scorer now uses a separate fallback threshold instead of the primary model's
+  scale, and malformed model responses trigger the fallback rather than being
+  treated as “unrelated”.
+- The follow-up heuristic is a replaceable `FollowUpPolicy`; the default is
+  still keywords plus the assistant-question rule.
+- Scoring runs outside the buffer lock. `reset()` and `close()` no longer wait
+  for a slow scorer, and a result that arrives after a reset is discarded.
+- Always-on audio commands now pass through the conversation gate; explicit
+  commands (typed text or push-to-talk) still run immediately.
+- The transcript filter moved to `voxpipe.pipeline.transcript`;
+  `voxpipe.pipeline.gate` remains as a compatibility import.
+
 ## 0.2.0
 
 A correctness and design pass over the whole package. Several public APIs

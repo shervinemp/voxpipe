@@ -62,6 +62,40 @@ class LLMConfig(_Section):
     litellm: Optional[LiteLLMConfig] = None
 
 
+class TopicTrackingConfig(_Section):
+    """Keep the active conversation apart from speech that belongs elsewhere.
+
+    ``backend`` selects how relatedness is judged: ``lexical`` needs no extra
+    packages, ``embedding`` uses a small fastembed model, and ``laya`` uses
+    the Laya decision model.  ``threshold`` is in the scorer's own 0..1 scale;
+    None picks a sensible default for the backend.
+    """
+
+    enabled: bool = False
+    backend: Literal["lexical", "embedding", "laya"] = "lexical"
+    threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    ttl_sentences: int = Field(
+        default=10, ge=1, description="Utterances an unused side buffer survives before it is dropped."
+    )
+    max_unrelated: int = Field(
+        default=4, ge=1, description="Side buffers kept at once; the least recently used is dropped."
+    )
+    history_sentences: int = Field(
+        default=8, ge=1, description="Recent utterances of a buffer compared with the new sentence."
+    )
+    promote_after: int = Field(
+        default=0,
+        ge=0,
+        description="Consecutive utterances in a side buffer before it becomes the active topic; 0 never promotes.",
+    )
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_cache_dir: Optional[str] = None
+    laya_model: Literal["auto", "english", "multilingual", "typed-decisions"] = "auto"
+    laya_device: Optional[str] = None
+    laya_preload: bool = False
+    laya_max_len: int = Field(default=1024, ge=64, le=8192)
+
+
 class TTSConfig(_Section):
     provider: str
     weights_dir: str
@@ -99,3 +133,4 @@ class AppConfig(_Section):
     asr: ASRConfig
     hotkeys: HotkeyConfig = Field(default_factory=HotkeyConfig)
     conversation_history: ConversationHistoryConfig = Field(default_factory=ConversationHistoryConfig)
+    topic_tracking: TopicTrackingConfig = Field(default_factory=TopicTrackingConfig)
