@@ -1,0 +1,9 @@
+items:
+  - name: Cheeseburger
+    aliases: ["burger", "cheese burger"]
+    price: 9.50
+  - name: Coke
+    aliases: ["cola"]
+    price: 2.00
+  - name: Fries
+    price: 3.00

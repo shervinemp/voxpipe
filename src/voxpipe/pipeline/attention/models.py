@@ -27,7 +27,7 @@ class FloorState:
 
     last_speaker: str = "assistant"
     awaiting_reply: bool = False
-    customer_present: bool = False
+    other_present: bool = False
     order_phase: Optional[str] = None
 
 

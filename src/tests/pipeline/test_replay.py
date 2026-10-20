@@ -19,7 +19,7 @@ class TestReplay(unittest.TestCase):
         return [
             {"type": "decision", "text": "add two burgers", "score": 0.9, "answer": True, "reason": "addressed"},
             {"type": "correction", "text": "add two burgers", "addressed": True},
-            {"type": "decision", "text": "would you like fries", "score": 0.2, "answer": False, "reason": "customer"},
+            {"type": "decision", "text": "would you like fries", "score": 0.2, "answer": False, "reason": "other"},
             {"type": "correction", "text": "would you like fries", "addressed": False},
             {"type": "decision", "text": "the sky is blue", "score": 0.6, "answer": False, "reason": "background"},
             {"type": "correction", "text": "the sky is blue", "addressed": False},

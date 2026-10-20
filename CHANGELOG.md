@@ -23,7 +23,7 @@
 - **Busy mode / addressee gate.** `attention.busy_mode: true` enables a
   silence-biased gate for shared spaces: an addressee classifier over your own
   labeled examples, a short deferral that cancels the reply if someone keeps
-  talking, named customer/background buffers, “not you” / “that was me”
+  talking, named other/background buffers, “not you” / “that was me”
   corrections, and a shadow mode. Embeddings use fastembed when installed and
   fall back to deterministic hashing. `attention.enabled` turns the gate on
   with explicit settings, and `voxpipe --busy` enables the preset for one run.
@@ -33,10 +33,10 @@
   appended to `attention.decision_log_path`; `scripts/replay_addressee.py`
   pairs them and sweeps speak/silence thresholds under a configurable
   false-positive budget. `AddresseeModel.clear()` removes learned examples.
-- **Optional order intake.** `Menu`, `MenuItem`, `Order`, `OrderItem` and
-  `OrderBook` provide a domain-neutral structured order model with menu/alias
-  matching, quantity and simple modifier parsing, summaries and confirmation.
-  It is not wired into the pipeline; applications choose whether to use it.
+- **Application example.** The restaurant menu/order workflow lives in
+  `examples/restaurant/` and is intentionally outside the core package. It
+  imports the voice layer and shows how to expose order operations as tools;
+  the core module does not depend on it.
 
 ### Changed
 

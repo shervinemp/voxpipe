@@ -87,7 +87,7 @@ attention:
   examples_path: "data/addressee_examples.jsonl"
   decision_log_path: null   # set a path (or enable shadow) to log decisions
   shadow: false
-  customer_ttl_sentences: 50
+  other_ttl_sentences: 50
   background_ttl_sentences: 10
   max_examples: 1000
   k_neighbors: 5

@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from voxpipe.pipeline.topics import Menu, MenuItem, OrderBook
+from orders import Menu, MenuItem, OrderBook
 
 
 class TestMenu(unittest.TestCase):

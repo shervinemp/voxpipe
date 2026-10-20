@@ -57,14 +57,14 @@ def create_addressee_gate(config: AttentionConfig) -> AddresseeGate:
     log = DecisionLog(log_path) if log_path else None
     gate = AddresseeGate(
         model,
-        # The tracker is a context store here: main is the AI thread, customer
+        # The tracker is a context store here: main is the AI thread, other
         # and background are named buffers.  Similarity routing is not used.
         tracker=TopicTracker(LexicalScorer()),
         defer_ms=defer_ms,
         speak_threshold=speak,
         silence_threshold=silence,
         shadow=config.shadow,
-        customer_ttl_sentences=config.customer_ttl_sentences,
+        other_ttl_sentences=config.other_ttl_sentences,
         background_ttl_sentences=config.background_ttl_sentences,
         decision_log=log,
     )

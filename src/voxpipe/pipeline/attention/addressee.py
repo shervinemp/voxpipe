@@ -29,8 +29,8 @@ _NEGATIVE_CORRECTIONS = frozenset(
     {
         "not you",
         "no not you",
-        "i was talking to the customer",
-        "that was for the customer",
+        "i was talking to someone else",
+        "that was for someone else",
         "not for you",
         "i was not talking to you",
     }
@@ -51,7 +51,7 @@ _AI_RE = re.compile(
     r"|^table\s+\w+|^order\s+\w+",
     re.IGNORECASE,
 )
-_CUSTOMER_RE = re.compile(
+_OTHER_RE = re.compile(
     r"^(hi|hello|hey|good (morning|afternoon|evening)|welcome)\b"
     r"|^(what can i get|what would you like|would you like|do you want|are you ready|for here|to go"
     r"|anything else|that'?ll be|your total|cash or card|here you go|thank you|have a (nice|good)|next)\b",
@@ -157,11 +157,11 @@ class AddresseeModel:
         if not normalized:
             return 0.5
         ai = bool(_AI_RE.search(normalized))
-        customer = bool(_CUSTOMER_RE.search(normalized))
-        score = 0.85 if ai and not customer else 0.15 if customer and not ai else 0.5
+        other = bool(_OTHER_RE.search(normalized))
+        score = 0.85 if ai and not other else 0.15 if other and not ai else 0.5
         if state.awaiting_reply and len(normalized.split()) <= 4 and len(words(normalized)) <= 2:
             score = max(score, 0.80)
-        if state.customer_present and not ai:
+        if state.other_present and not ai:
             score = min(score, 0.40)
         if state.order_phase in {"order", "upsell", "confirm", "payment"} and not ai:
             score = min(score, 0.30)
@@ -237,7 +237,7 @@ class AddresseeGate:
 
     Explicit input (push-to-talk/typed) always answers.  Everything else is
     scored by :class:`AddresseeModel`; high scores go to the main conversation,
-    low scores go to a customer buffer, and the ambiguous band is kept as
+    low scores go to an ``other`` buffer, and the ambiguous band is kept as
     background.  ``defer_ms`` asks the pipeline to wait for a possible reply
     before speaking.
     """
@@ -251,7 +251,7 @@ class AddresseeGate:
         speak_threshold: float = 0.70,
         silence_threshold: float = 0.35,
         shadow: bool = False,
-        customer_ttl_sentences: int = 50,
+        other_ttl_sentences: int = 50,
         background_ttl_sentences: int = 10,
         decision_log: Optional[DecisionLog] = None,
     ):
@@ -265,7 +265,7 @@ class AddresseeGate:
         self.speak_threshold = speak_threshold
         self.silence_threshold = silence_threshold
         self.shadow = shadow
-        self.customer_ttl_sentences = customer_ttl_sentences
+        self.other_ttl_sentences = other_ttl_sentences
         self.background_ttl_sentences = background_ttl_sentences
         self.state = FloorState()
         self._last_text: Optional[str] = None
@@ -319,8 +319,8 @@ class AddresseeGate:
                     defer_ms=self.defer_ms,
                 )
 
-            target = "customer" if score <= self.silence_threshold else "background"
-            ttl = self.customer_ttl_sentences if target == "customer" else self.background_ttl_sentences
+            target = "other" if score <= self.silence_threshold else "background"
+            ttl = self.other_ttl_sentences if target == "other" else self.background_ttl_sentences
             self.tracker.route_to(target, cleaned, ttl_sentences=ttl)
             return GateDecision(
                 answer=False,
@@ -364,9 +364,9 @@ class AddresseeGate:
             if not self._closed:
                 self.model.clear()
 
-    def set_customer_present(self, present: bool) -> None:
+    def set_other_present(self, present: bool) -> None:
         with self._lock:
-            self.state.customer_present = present
+            self.state.other_present = present
 
     def set_order_phase(self, phase: Optional[str]) -> None:
         with self._lock:

@@ -25,7 +25,7 @@ class TestAddresseeModel(unittest.TestCase):
         self.assertGreater(model.score("add two burgers for table four", FloorState()), 0.7)
         self.assertGreater(model.score("what's the total?", FloorState()), 0.7)
 
-    def test_customer_script_scores_low(self):
+    def test_other_script_scores_low(self):
         model = self.make()
         self.assertLess(model.score("would you like fries with that?", FloorState()), 0.35)
         self.assertLess(model.score("what can I get you?", FloorState()), 0.35)
@@ -34,7 +34,7 @@ class TestAddresseeModel(unittest.TestCase):
         model = self.make()
         self.assertGreater(model.score("Paris", FloorState(awaiting_reply=True)), 0.7)
 
-    def test_an_open_order_phase_biases_ambiguous_speech_to_customer(self):
+    def test_an_open_order_phase_biases_ambiguous_speech_to_other(self):
         model = self.make()
         self.assertLessEqual(model.score("the sky is blue", FloorState(order_phase="order")), 0.30)
 
@@ -111,14 +111,14 @@ class TestAddresseeGate(unittest.TestCase):
         self.assertEqual(decision.defer_ms, 250)
         self.assertEqual(decision.reason, "addressed")
 
-    def test_customer_speech_goes_to_the_customer_buffer(self):
+    def test_other_speech_goes_to_the_other_buffer(self):
         gate = self.make()
         decision = gate.evaluate("would you like fries with that?")
         self.assertFalse(decision.answer)
-        self.assertEqual(decision.reason, "customer")
-        customer = gate.buffer("customer")
-        self.assertIsNotNone(customer)
-        self.assertEqual([u.text for u in customer.utterances], ["would you like fries with that?"])
+        self.assertEqual(decision.reason, "other")
+        other = gate.buffer("other")
+        self.assertIsNotNone(other)
+        self.assertEqual([u.text for u in other.utterances], ["would you like fries with that?"])
         self.assertEqual([u.text for u in gate.tracker.main.utterances], [])
 
     def test_ambiguous_speech_goes_to_background_and_stays_silent(self):
@@ -157,11 +157,11 @@ class TestAddresseeGate(unittest.TestCase):
         self.assertEqual(correction.reason, "correction")
         self.assertTrue(gate.examples[0].addressed)
 
-    def test_customer_presence_and_order_phase_are_settable(self):
+    def test_other_presence_and_order_phase_are_settable(self):
         gate = self.make()
-        gate.set_customer_present(True)
+        gate.set_other_present(True)
         gate.set_order_phase("order")
-        self.assertTrue(gate.state.customer_present)
+        self.assertTrue(gate.state.other_present)
         self.assertEqual(gate.state.order_phase, "order")
 
     def test_decision_log_records_decisions_and_corrections(self):

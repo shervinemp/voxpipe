@@ -17,7 +17,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
-from .text import normalize_phrase
+
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().strip().rstrip(".!?,").split())
+
 
 _NUMBERS = {
     "one": 1,
@@ -132,10 +135,10 @@ class Menu:
         return cls.from_dict(data or [])
 
     def resolve(self, name: str) -> Optional[MenuItem]:
-        target = normalize_phrase(name)
+        target = _normalize(name)
         for item in self.items:
             names = [item.name, *item.aliases]
-            if any(normalize_phrase(candidate) == target for candidate in names):
+            if any(_normalize(candidate) == target for candidate in names):
                 return item
         return None
 

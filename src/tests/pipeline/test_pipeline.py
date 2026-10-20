@@ -587,7 +587,7 @@ class TestTopicGating(PipelineCase):
         worker = threading.Thread(target=lambda: pipe._handle("hello", heard_at=0))
         worker.start()
         time.sleep(0.05)
-        self.asr.vad.on_speech_onset()  # a customer starts speaking during the deferral
+        self.asr.vad.on_speech_onset()  # someone else starts speaking during the deferral
         worker.join(timeout=3)
         self.assertEqual(self.llm.calls, [])
         self.assertEqual(self.tts.spoken, [])

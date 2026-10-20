@@ -100,9 +100,9 @@ class AttentionConfig(_Section):
     """Addressee-aware floor control for busy, multi-person environments.
 
     ``busy_mode`` is the easy preset: it enables the addressee gate, waits for
-    a possible customer reply before speaking (``defer_ms``), and uses silence-
-    biased thresholds.  Every setting can still be overridden individually;
-    ``enabled`` turns the gate on without the busy preset.
+    a possible other-speaker reply before speaking (``defer_ms``), and uses
+    silence-biased thresholds.  Every setting can still be overridden
+    individually; ``enabled`` turns the gate on without the busy preset.
     """
 
     busy_mode: bool = False
@@ -117,7 +117,7 @@ class AttentionConfig(_Section):
     examples_path: Optional[str] = "data/addressee_examples.jsonl"
     decision_log_path: Optional[str] = None
     shadow: bool = Field(default=False, description="Decide but never speak; collect labels first.")
-    customer_ttl_sentences: int = Field(default=50, ge=1)
+    other_ttl_sentences: int = Field(default=50, ge=1)
     background_ttl_sentences: int = Field(default=10, ge=1)
     max_examples: int = Field(default=1000, ge=1)
     k_neighbors: int = Field(default=5, ge=1)

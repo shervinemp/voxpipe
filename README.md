@@ -126,8 +126,8 @@ src/
    push-to-talk mutes the microphone between presses
 2. **Transcript gate** drops noise before it reaches the LLM
 3. **Attention gate** (when enabled) decides whether an utterance is for the
-   assistant and routes it to the active conversation, a side topic, or a
-   customer/background buffer; non-addressed speech is not answered
+   assistant and routes it to the active conversation, a side topic, or an
+   other/background buffer; non-addressed speech is not answered
 4. **Memory** attaches relevant past turns to the new message as
    `(Earlier: ...)` context
 5. **LLM** answers, calling tools when it needs to
@@ -225,11 +225,11 @@ attention:
 or start with `voxpipe --busy`. It automatically:
 
 - enables an **addressee gate** instead of topic tracking,
-- waits **400 ms** for a possible customer reply before speaking; any new
-  utterance in that window cancels the reply,
+- waits **400 ms** for a possible other-speaker reply before speaking; any new
+  utterance or speech onset in that window cancels the reply,
 - uses silence-biased thresholds (**0.70** to speak, **0.35** to treat speech
-  as customer/background),
-- keeps customer speech in a named `customer` buffer and ambiguous speech in
+  as other/background),
+- keeps other-directed speech in a named `other` buffer and ambiguous speech in
   `background`, never in the AI thread,
 - uses a small embedding model to compare the utterance with your own labeled
   examples; fastembed is used when installed, with a deterministic lexical
@@ -237,7 +237,7 @@ or start with `voxpipe --busy`. It automatically:
 - learns from corrections. Say “not you” or “that was me” after an utterance to
   label it and improve the next decision; examples are stored in
   `attention.examples_path` (`data/addressee_examples.jsonl` by default). Call
-  `gate.clear_examples()` or delete that file to remove them. Customer and
+  `gate.clear_examples()` or delete that file to remove them. Other and
   background buffers stay in memory and expire; only corrections are persisted.
 
 `attention.shadow: true` runs the gate without ever speaking, so you can collect
@@ -266,41 +266,20 @@ If both `attention` and `topic_tracking` are enabled, the addressee gate wins.
 Use topic tracking when you want one speaker’s conversation split into topics;
 use busy mode when the hard problem is deciding who the speaker is talking to.
 
-### Order intake
+### Application examples
 
-`voxpipe.pipeline.attention` also ships an optional, domain-neutral order model.
-It is not wired into the pipeline automatically; an application can feed it
-customer text or structured items:
+`voxpipe` stays a general voice-assistant module. Domain workflows live in
+`examples/` and use the same extension points as any other application:
 
-```python
-from voxpipe.pipeline.attention import Menu, OrderBook
+- `examples/restaurant/` — menu matching, tables, orders, confirmation, and how
+  to expose them as `Tool`s. It imports the voice layer; the voice layer does
+  not import it.
 
-menu = Menu.from_file("menu.yaml")
-orders = OrderBook(menu)
+Run the example tests separately:
 
-orders.add_text("4", "two cheeseburgers no pickles and a coke")
-print(orders.summary("4"))
-# Table 4: 2 x Cheeseburger (no pickles), 1 x Coke — total 21.00
-
-orders.confirm("4")
-orders.close("4")
+```bash
+uv run pytest examples/restaurant
 ```
-
-`menu.yaml` is a simple list:
-
-```yaml
-items:
-  - name: Cheeseburger
-    aliases: ["burger", "cheese burger"]
-    price: 9.50
-  - name: Coke
-    aliases: ["cola"]
-    price: 2.00
-```
-
-`add_text` is a deterministic convenience parser for clean menu-matched speech.
-For messy language, extract items with the LLM and call `add_item(table, name,
-quantity, modifiers)` directly. Always confirm before submitting to a POS.
 
 ### Using the pieces directly
 
