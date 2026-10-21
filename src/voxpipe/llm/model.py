@@ -133,16 +133,18 @@ class GGUFLLM(LLM):
         if entry.type_v:
             options["type_v"] = cls._GGML_CACHE_TYPES.get(entry.type_v, entry.type_v)
 
-        attempts = [
-            dict(n_gpu_layers=-1, flash_attn=True),
-            dict(n_gpu_layers=0, flash_attn=True),
-            dict(n_gpu_layers=0, flash_attn=False),
+        attempts: List[Dict[str, Any]] = [
+            {"n_gpu_layers": -1, "flash_attn": True},
+            {"n_gpu_layers": 0, "flash_attn": True},
+            {"n_gpu_layers": 0, "flash_attn": False},
         ]
         logger.info("Loading model...")
         last_error: Optional[Exception] = None
         for attempt in attempts:
             try:
-                model = Llama(**options, **attempt)
+                kwargs = dict(options)
+                kwargs.update(attempt)
+                model = Llama(**kwargs)
             except Exception as e:  # noqa: BLE001 - llama.cpp reports load failures as assorted types
                 logger.warning("Model load failed with %s: %s", attempt, e)
                 last_error = e
