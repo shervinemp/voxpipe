@@ -19,11 +19,9 @@ _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 class TextEmbedder(Protocol):
-    def embed(self, texts: Sequence[str]) -> Sequence[np.ndarray]:
-        ...
+    def embed(self, texts: Sequence[str]) -> Sequence[np.ndarray]: ...
 
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
 
 class FastEmbedder:
@@ -33,9 +31,7 @@ class FastEmbedder:
         try:
             from fastembed import TextEmbedding
         except ImportError as e:
-            raise ConfigError(
-                "The addressee embedding backend needs fastembed: pip install 'voxpipe[embed]'."
-            ) from e
+            raise ConfigError("The addressee embedding backend needs fastembed: pip install 'voxpipe[embed]'.") from e
         try:
             self._model = TextEmbedding(model_name=model, cache_dir=cache_dir)
         except Exception as e:  # noqa: BLE001 - a missing or corrupt model is a configuration problem

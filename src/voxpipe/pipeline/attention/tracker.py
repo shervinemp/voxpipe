@@ -144,9 +144,7 @@ class TopicTracker:
         with self._route_lock:
             with self._lock:
                 if self._closed:
-                    return TopicDecision(
-                        text=cleaned, answer=False, buffer_id=-1, kind=RouteKind.RESET, score=0.0
-                    )
+                    return TopicDecision(text=cleaned, answer=False, buffer_id=-1, kind=RouteKind.RESET, score=0.0)
                 if not cleaned:
                     return TopicDecision(
                         text="", answer=True, buffer_id=self._store.main.id, kind=RouteKind.EMPTY, score=1.0
@@ -249,9 +247,7 @@ class TopicTracker:
         with self._route_lock:
             with self._lock:
                 if self._closed:
-                    return TopicDecision(
-                        text=cleaned, answer=False, buffer_id=-1, kind=RouteKind.RESET, score=0.0
-                    )
+                    return TopicDecision(text=cleaned, answer=False, buffer_id=-1, kind=RouteKind.RESET, score=0.0)
                 if not cleaned:
                     return TopicDecision(
                         text="", answer=True, buffer_id=self._store.main.id, kind=RouteKind.EMPTY, score=1.0

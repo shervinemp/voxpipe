@@ -152,9 +152,7 @@ class AddresseeModel:
                 total = float(weights.sum())
                 if total <= 0.0:
                     return heuristic
-                positive = float(
-                    sum(weight for weight, index in zip(weights, best) if self._examples[index].addressed)
-                )
+                positive = float(sum(weight for weight, index in zip(weights, best) if self._examples[index].addressed))
                 knn = (positive + 1.0) / (total + 2.0)  # Laplace smoothing
             return max(0.0, min(1.0, 0.7 * knn + 0.3 * heuristic))
 

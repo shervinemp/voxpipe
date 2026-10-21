@@ -130,9 +130,7 @@ class EmbeddingScorer:
             except Exception as e:  # noqa: BLE001 - surfaced to the tracker, which can fall back
                 raise RuntimeError(f"Topic embedding failed: {e}") from e
             if len(produced) != len(missing):
-                raise RuntimeError(
-                    f"Topic embedding returned {len(produced)} vectors for {len(missing)} sentences."
-                )
+                raise RuntimeError(f"Topic embedding returned {len(produced)} vectors for {len(missing)} sentences.")
             for sentence, vector in zip(missing, produced):
                 unit = _unit(vector)
                 batch[sentence] = unit
@@ -211,9 +209,7 @@ class LayaScorer:
         try:
             from laya import Router
         except ImportError as e:
-            raise ConfigError(
-                "The 'laya' topic backend needs the laya package: pip install 'voxpipe[laya]'."
-            ) from e
+            raise ConfigError("The 'laya' topic backend needs the laya package: pip install 'voxpipe[laya]'.") from e
         options: Dict[str, Any] = {}
         if device:
             options["device"] = device

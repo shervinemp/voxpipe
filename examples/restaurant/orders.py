@@ -1,9 +1,9 @@
 """Optional structured order intake for restaurant/retail workflows.
 
 This module is intentionally separate from the attention gate.  The gate can
-keep customer speech in a `customer` buffer; an application can feed that text
-to an :class:`OrderBook`, or use the LLM to produce structured items and call
-``add_item`` directly.
+keep other-directed speech in its `other` buffer; an application can feed that
+text to an :class:`OrderBook`, or use the LLM to produce structured items and
+call ``add_item`` directly.
 
 The text parser is deliberately small and deterministic: it matches menu names
 and aliases, quantities and simple modifiers.  Use the LLM for messy language;

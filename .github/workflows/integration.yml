@@ -33,15 +33,15 @@ jobs:
         run: uv sync --locked --extra dev --extra asr --extra tts --extra embed
 
       - name: Pre-download TTS weights
-        run: uv run python -m voxpipe.tts.download
+        run: uv run --no-sync python -m voxpipe.tts.download
 
       - name: Pre-download ASR weights
         run: |
-          uv run python -c "from onnx_asr import load_model; load_model('nemo-parakeet-tdt-0.6b-v2', quantization='int8')"
+          uv run --no-sync python -c "from onnx_asr import load_model; load_model('nemo-parakeet-tdt-0.6b-v2', quantization='int8')"
 
       - name: Pre-download embedding model
         run: |
-          uv run python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
+          uv run --no-sync python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
 
       - name: Run the generated-voice mixed-audio scenario
-        run: uv run pytest src/tests/pipeline/test_restaurant_scenario.py -m integration -v
+        run: uv run --no-sync pytest src/tests/pipeline/test_restaurant_scenario.py -m integration -v

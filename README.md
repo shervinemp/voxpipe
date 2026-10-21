@@ -407,6 +407,13 @@ uvx ruff check src
 uv run --with mypy mypy
 ```
 
+The integration suite includes a synthetic multi-voice scenario
+(`src/tests/pipeline/test_restaurant_scenario.py`): five Kokoro voices, a mixed
+track, Silero VAD, Parakeet ASR and the attention gate. It is a plumbing and
+switch-point regression test, not a real-world accuracy benchmark. For
+deployment, replay consented recordings and use the shadow-mode decision log
+and `scripts/replay_addressee.py` to calibrate the thresholds.
+
 ## License
 
 MIT

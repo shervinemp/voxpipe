@@ -14,15 +14,13 @@ class RelatednessScorer(Protocol):
 
     default_threshold: float
 
-    def scores(self, text: str, candidates: Sequence[Sequence[Utterance]]) -> Sequence[float]:
-        ...
+    def scores(self, text: str, candidates: Sequence[Sequence[Utterance]]) -> Sequence[float]: ...
 
 
 class FollowUpPolicy(Protocol):
     """Decides whether an utterance is a short reply to the assistant's question."""
 
-    def is_followup(self, text: str, main: TopicBuffer) -> bool:
-        ...
+    def is_followup(self, text: str, main: TopicBuffer) -> bool: ...
 
 
 class ConversationGate(Protocol):

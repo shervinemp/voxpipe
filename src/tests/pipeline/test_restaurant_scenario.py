@@ -187,6 +187,9 @@ class TestRestaurantScenario(unittest.TestCase):
         except Exception as e:  # noqa: BLE001 - a missing cached model should skip, not fail the suite
             self.skipTest(f"fastembed model unavailable: {e}")
 
+        # This is a path/regression test for the real embedding + personal-kNN
+        # path, not an accuracy benchmark: the examples deliberately include the
+        # scenario utterances.
         model = AddresseeModel(embedder, examples_path=None)
         for text, addressed in [
             ("Add two burgers for table four.", True),
