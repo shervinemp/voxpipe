@@ -79,6 +79,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.llm.local["Gemma4_12B"].decoder, "legacy_xml")
         self.assertEqual(config.llm.local["Gemma4_12B"].n_ctx, 8192)
         self.assertIsNone(config.asr.sound_device)
+        self.assertFalse(config.topic_tracking.enabled, "topic tracking is opt-in")
+        self.assertFalse(config.attention.busy_mode, "busy mode is opt-in")
+        self.assertFalse(config.attention.enabled)
 
     def test_user_file_overrides_defaults_key_by_key(self):
         path = self._write("llm:\n  max_turns: 7\n  local:\n    Mine:\n      model_path: m.gguf\nasr:\n  vad_threshold: 0.9\n")

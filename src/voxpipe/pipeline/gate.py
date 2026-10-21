@@ -1,14 +1,9 @@
-"""The transcript gate: decides whether recognised text is something a person said."""
+"""Compatibility import for the transcript filter.
 
-from typing import Optional
+The implementation lives in :mod:`voxpipe.pipeline.transcript`; this module
+stays so existing imports keep working.
+"""
 
+from .transcript import qualify_transcript
 
-def qualify_transcript(text: str) -> Optional[str]:
-    """The transcript tidied up, or None when there is nothing in it to answer.
-
-    A recogniser returns bare punctuation, or nothing at all, for a cough or a
-    click.  Anything with a letter or a digit in it counts as speech: "42" is
-    as much an answer as "yes".
-    """
-    cleaned = (text or "").strip()
-    return cleaned if any(character.isalnum() for character in cleaned) else None
+__all__ = ["qualify_transcript"]

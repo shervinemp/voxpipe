@@ -14,9 +14,11 @@ from voxpipe.llm.context import MemoryHandler
 from voxpipe.llm.session import Session
 from voxpipe.llm.tools import Tool, ToolCall
 from voxpipe.pipeline.pipeline import Pipeline
+from voxpipe.pipeline.topics import AddresseeGate, GateDecision, PassThroughGate, TopicTracker
 from voxpipe.storage import RAMStorage, SQLiteStorage
 
 from ..llm._fakes import ScriptedLLM
+from ._topic_fakes import ScriptedScorer
 
 
 class FakeTTS:
@@ -486,6 +488,145 @@ class TestMemory(PipelineCase):
         )
 
 
+class TestTopicGating(PipelineCase):
+    def test_an_unrelated_utterance_is_buffered_instead_of_answered(self):
+        tracker = TopicTracker(ScriptedScorer([0.0]))
+        tracker.route("hello")
+        pipe = self.make(["should not be spoken"], topics=tracker)
+        routed = []
+        pipe.events.on("topic:routed", lambda text, decision: routed.append((text, decision)))
+
+        pipe._handle("the stock market fell today", heard_at=0)
+
+        self.assertEqual(self.llm.calls, [])
+        self.assertEqual(self.tts.spoken, [])
+        self.assertEqual(len(tracker.unrelated), 1)
+        self.assertEqual(routed[0][0], "the stock market fell today")
+        self.assertFalse(routed[0][1].answer)
+
+    def test_a_related_utterance_reaches_the_llm(self):
+        tracker = TopicTracker(ScriptedScorer([0.9]))
+        tracker.route("hello")
+        pipe = self.make(["Of course."], topics=tracker)
+
+        pipe._handle("open the kitchen door", heard_at=0)
+
+        self.assertEqual(self.tts.spoken, ["Of course."])
+        self.assertEqual(self.last_prompt(), "open the kitchen door")
+
+    def test_a_custom_gate_can_replace_the_topic_tracker(self):
+        pipe = self.make(["Custom answer."], gate=PassThroughGate())
+        decisions = []
+        pipe.events.on("gate:decided", lambda text, decision: decisions.append(decision))
+
+        pipe._handle("anything at all", heard_at=0)
+
+        self.assertEqual(self.tts.spoken, ["Custom answer."])
+        self.assertIsNone(pipe.topics)
+        self.assertTrue(decisions[0].answer)
+        self.assertIsNone(decisions[0].route)
+
+    def test_typed_text_bypasses_the_topic_gate(self):
+        tracker = TopicTracker(ScriptedScorer([0.0]))
+        tracker.route("hello")
+        pipe = self.make(["Typed answer."], topics=tracker)
+
+        pipe.handle_transcript("something unrelated typed by the user")
+
+        self.assertEqual(self.tts.spoken, ["Typed answer."])
+        self.assertEqual(tracker.unrelated, [])
+        self.assertEqual(
+            [u.text for u in tracker.main.utterances],
+            ["hello", "something unrelated typed by the user", "Typed answer."],
+        )
+
+    def test_push_to_talk_bypasses_the_topic_gate(self):
+        tracker = TopicTracker(ScriptedScorer([0.0]))
+        pipe = self.make(
+            ["Held the key."], topics=tracker, hotkeys=FakeHotkeys(), push_to_talk="<f8>"
+        )
+
+        pipe._handle("a brand new topic", heard_at=0)
+
+        self.assertEqual(self.tts.spoken, ["Held the key."])
+        self.assertEqual(tracker.unrelated, [])
+        self.assertEqual([u.text for u in tracker.main.utterances], ["a brand new topic", "Held the key."])
+
+    def test_commands_from_audio_are_gated_but_explicit_commands_are_not(self):
+        tracker = TopicTracker(ScriptedScorer([0.0]))
+        tracker.route("hello")
+        pipe = self.make(["unused"], topics=tracker)
+        fired = []
+        pipe.register_command("stop listening", lambda: fired.append(1))
+
+        pipe._handle("stop listening", heard_at=0)  # background audio: gated out
+        self.assertEqual(fired, [])
+        self.assertEqual(self.llm.calls, [])
+
+        pipe.handle_transcript("stop listening")  # explicit: always runs
+        self.assertEqual(fired, [1])
+        self.assertNotIn("stop listening", [u.text for u in tracker.main.utterances])
+
+    def test_the_assistant_reply_is_recorded_in_the_active_topic(self):
+        tracker = TopicTracker(ScriptedScorer([0.9]))
+        tracker.route("hello")
+        pipe = self.make(["Hi there. "], topics=tracker)
+
+        pipe._handle("how are you", heard_at=0)
+
+        last = tracker.main.last
+        self.assertIsNotNone(last)
+        self.assertEqual((last.speaker, last.text), ("assistant", "Hi there."))
+
+    def test_a_deferral_can_be_cancelled_by_more_speech(self):
+        class DeferringGate(PassThroughGate):
+            def evaluate(self, text, *, explicit=False):
+                return GateDecision(answer=True, defer_ms=300)
+
+        pipe = self.make(["should not be spoken"], gate=DeferringGate())
+        worker = threading.Thread(target=lambda: pipe._handle("hello", heard_at=0))
+        worker.start()
+        time.sleep(0.05)
+        self.asr.vad.on_speech_onset()  # someone else starts speaking during the deferral
+        worker.join(timeout=3)
+        self.assertEqual(self.llm.calls, [])
+        self.assertEqual(self.tts.spoken, [])
+
+    def test_a_deferral_without_more_speech_is_answered(self):
+        class DeferringGate(PassThroughGate):
+            def evaluate(self, text, *, explicit=False):
+                return GateDecision(answer=True, defer_ms=10)
+
+        pipe = self.make(["Spoken."], gate=DeferringGate())
+        pipe._handle("hello", heard_at=0)
+        self.assertEqual(self.tts.spoken, ["Spoken."])
+
+    def test_promotion_hands_the_earlier_side_sentences_to_the_model(self):
+        tracker = TopicTracker(ScriptedScorer([0.0], [0.0, 0.9]), promote_after=2)
+        tracker.route("hello")
+        tracker.record_reply("Hi.")
+        pipe = self.make(["The market is down."], topics=tracker)
+
+        pipe._handle("the stock market fell", heard_at=0)
+        self.assertEqual(self.llm.calls, [], "the first side utterance is not answered")
+        pipe._handle("interest rates are rising", heard_at=0)
+
+        self.assertEqual(self.tts.spoken, ["The market is down."])
+        self.assertIn("Earlier in this thread", self.last_prompt())
+        self.assertIn("the stock market fell", self.last_prompt())
+
+    def test_reset_clears_the_topic_buffers(self):
+        tracker = TopicTracker(ScriptedScorer([0.0]))
+        tracker.route("hello")
+        pipe = self.make(["unused"], topics=tracker)
+        pipe._handle("the stock market fell", heard_at=0)
+
+        pipe.reset()
+
+        self.assertEqual([u.text for u in tracker.main.utterances], [])
+        self.assertEqual(tracker.unrelated, [])
+
+
 class TestFromConfig(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -527,6 +668,7 @@ class TestFromConfig(unittest.TestCase):
         self.assertIsInstance(pipe.memory, SQLiteStorage)
         self.assertIs(handler.memory, pipe.memory)
         self.assertEqual(handler.recall_top_k, 5)
+        self.assertIsNone(pipe.topics, "topic tracking is off unless configured")
         self.assertEqual(pipe.push_to_talk, "<f8>")
         self.assertTrue(self.asr.is_muted)
 
@@ -549,6 +691,22 @@ class TestFromConfig(unittest.TestCase):
         self.assertIsNone(pipe.memory)
         self.assertIsNone(pipe.session.context_handler.memory)
         self.assertFalse(os.path.exists(os.path.dirname(history.db_path)))
+
+    def test_topic_tracking_can_be_enabled(self):
+        tracking = self.config.topic_tracking.model_copy(update={"enabled": True, "backend": "lexical"})
+        pipe = self.build(self.config.model_copy(update={"topic_tracking": tracking}))
+        self.assertIsNotNone(pipe.topics)
+        self.assertEqual(pipe.topics.threshold, 0.12)
+
+    def test_busy_mode_builds_the_addressee_gate(self):
+        from voxpipe.pipeline.attention.embeddings import HashingEmbedder
+
+        with patch("voxpipe.pipeline.attention.factory.create_embedder", return_value=HashingEmbedder()):
+            attention = self.config.attention.model_copy(update={"busy_mode": True, "examples_path": None})
+            pipe = self.build(self.config.model_copy(update={"attention": attention}))
+        self.assertIsInstance(pipe.gate, AddresseeGate)
+        self.assertIsNone(pipe.topics)
+        self.assertEqual(pipe.gate.defer_ms, 400)
 
     def test_hotkeys_can_be_disabled_or_overridden(self):
         disabled = self.config.model_copy(update={"hotkeys": self.config.hotkeys.model_copy(update={"enable": False})})
@@ -837,6 +995,11 @@ class TestStoppingAndFailing(PipelineCase):
 
 
 class TestCommandLine(unittest.TestCase):
+    def test_busy_flag_is_available(self):
+        from voxpipe.__main__ import _parse_args
+
+        self.assertTrue(_parse_args(["--busy"]).busy)
+
     def _specs(self, content):
         import json
 

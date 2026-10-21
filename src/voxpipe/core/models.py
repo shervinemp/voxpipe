@@ -62,6 +62,75 @@ class LLMConfig(_Section):
     litellm: Optional[LiteLLMConfig] = None
 
 
+class TopicTrackingConfig(_Section):
+    """Keep the active conversation apart from speech that belongs elsewhere.
+
+    ``backend`` selects how relatedness is judged: ``lexical`` needs no extra
+    packages, ``embedding`` uses a small fastembed model, and ``laya`` uses
+    the Laya decision model.  ``threshold`` is in the scorer's own 0..1 scale;
+    None picks a sensible default for the backend.
+    """
+
+    enabled: bool = False
+    backend: Literal["lexical", "embedding", "laya"] = "lexical"
+    threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    ttl_sentences: int = Field(
+        default=10, ge=1, description="Utterances an unused side buffer survives before it is dropped."
+    )
+    max_unrelated: int = Field(
+        default=4, ge=1, description="Side buffers kept at once; the least recently used is dropped."
+    )
+    history_sentences: int = Field(
+        default=8, ge=1, description="Recent utterances of a buffer compared with the new sentence."
+    )
+    promote_after: int = Field(
+        default=0,
+        ge=0,
+        description="Consecutive utterances in a side buffer before it becomes the active topic; 0 never promotes.",
+    )
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_cache_dir: Optional[str] = None
+    laya_model: Literal["auto", "english", "multilingual", "typed-decisions"] = "auto"
+    laya_device: Optional[str] = None
+    laya_preload: bool = False
+    laya_max_len: int = Field(default=1024, ge=64, le=8192)
+
+
+class AttentionConfig(_Section):
+    """Addressee-aware floor control for busy, multi-person environments.
+
+    ``busy_mode`` is the easy preset: it enables the addressee gate, waits for
+    a possible other-speaker reply before speaking (``defer_ms``), and uses
+    silence-biased thresholds.  Every setting can still be overridden
+    individually; ``enabled`` turns the gate on without the busy preset.
+    """
+
+    busy_mode: bool = False
+    enabled: bool = False
+    defer_ms: Optional[int] = Field(
+        default=None, ge=0, le=5000, description="Wait this long for a possible reply before speaking."
+    )
+    speak_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    silence_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_cache_dir: Optional[str] = None
+    examples_path: Optional[str] = "data/addressee_examples.jsonl"
+    decision_log_path: Optional[str] = None
+    shadow: bool = Field(default=False, description="Decide but never speak; collect labels first.")
+    other_ttl_sentences: int = Field(default=50, ge=1)
+    background_ttl_sentences: int = Field(default=10, ge=1)
+    max_examples: int = Field(default=1000, ge=1)
+    k_neighbors: int = Field(default=5, ge=1)
+
+    @model_validator(mode="after")
+    def _thresholds_make_sense(self) -> "AttentionConfig":
+        speak = self.speak_threshold if self.speak_threshold is not None else 0.70
+        silence = self.silence_threshold if self.silence_threshold is not None else 0.35
+        if silence >= speak:
+            raise ValueError("silence_threshold must be lower than speak_threshold")
+        return self
+
+
 class TTSConfig(_Section):
     provider: str
     weights_dir: str
@@ -99,3 +168,5 @@ class AppConfig(_Section):
     asr: ASRConfig
     hotkeys: HotkeyConfig = Field(default_factory=HotkeyConfig)
     conversation_history: ConversationHistoryConfig = Field(default_factory=ConversationHistoryConfig)
+    topic_tracking: TopicTrackingConfig = Field(default_factory=TopicTrackingConfig)
+    attention: AttentionConfig = Field(default_factory=AttentionConfig)

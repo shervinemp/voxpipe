@@ -37,3 +37,31 @@ conversation_history:
   db_path: "data/conversations.db"
   top_k: 2               # memories recalled per turn; 0 disables recall
   ttl_days: 30           # 0 keeps entries forever
+
+# Keep the active conversation apart from background speech. Disabled by
+# default: relatedness is a useful hint, not a substitute for a wake word.
+# topic_tracking:
+#   enabled: true
+#   backend: "embedding" # "lexical", "embedding" (voxpipe[embed]), or "laya" (voxpipe[laya])
+#   threshold: null      # null = per-backend default
+#   ttl_sentences: 10    # drop an unused side topic after this many utterances
+#   max_unrelated: 4     # side topics kept at once
+#   promote_after: 0     # N consecutive side utterances promote it; 0 = never (PTT already bypasses)
+#   embedding_model: "BAAI/bge-small-en-v1.5"
+#   laya_model: "auto"   # "auto", "english", "multilingual", "typed-decisions"
+
+# One-switch preset for busy, multi-person environments (restaurant counter,
+# open office, shared workshop). It enables an addressee gate: high-confidence
+# AI-directed speech is answered, customer/background speech goes to named
+# buffers, and the assistant waits briefly for a possible reply before speaking.
+# Install the embedding extra for the best accuracy; without it, a lexical
+# hashing fallback keeps the gate usable. If both blocks are enabled, attention
+# takes precedence over topic_tracking.
+# attention:
+#   busy_mode: true
+#   examples_path: "data/addressee_examples.jsonl"  # corrections accumulate here
+#   decision_log_path: "data/attention_decisions.jsonl"  # replay in shadow mode
+#   shadow: false          # true = decide but never speak; collect labels first
+#   defer_ms: null         # null = 400 ms in busy mode
+#   speak_threshold: null  # null = 0.70
+#   silence_threshold: null # null = 0.35
