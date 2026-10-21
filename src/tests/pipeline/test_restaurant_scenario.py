@@ -10,12 +10,13 @@ AI-directed utterance is answered.
 import os
 import tempfile
 import unittest
+from importlib.util import find_spec
 
 import numpy as np
 
 from voxpipe.asr.vad import Silero
 from voxpipe.pipeline.attention.addressee import AddresseeGate, AddresseeModel
-from voxpipe.pipeline.attention.embeddings import HashingEmbedder
+from voxpipe.pipeline.attention.embeddings import FastEmbedder, HashingEmbedder
 
 from .._integration import KOKORO, PARAKEET, requires_model, transcribe, tts
 
@@ -87,15 +88,21 @@ class TestRestaurantScenario(unittest.TestCase):
         vad.close()
         return [segment for segment in vad if len(segment)]
 
-    def test_only_the_ai_directed_utterance_is_answered(self):
-        segments = self._segments()
-        self.assertTrue(segments, "VAD found no speech in the mixed track")
+    def _transcripts(self) -> list[str]:
+        cls = type(self)
+        if getattr(cls, "_transcript_cache", None) is None:
+            segments = self._segments()
+            self.assertTrue(segments, "VAD found no speech in the mixed track")
+            transcripts = []
+            for segment in segments:
+                text = transcribe(segment, self.vad_rate)
+                if text.strip():
+                    transcripts.append(text.strip())
+            cls._transcript_cache = transcripts
+        return cls._transcript_cache
 
-        transcripts = []
-        for segment in segments:
-            text = transcribe(segment, self.vad_rate)
-            if text.strip():
-                transcripts.append(text.strip())
+    def test_only_the_ai_directed_utterance_is_answered(self):
+        transcripts = self._transcripts()
         print("\nscenario transcripts:")
         for text in transcripts:
             print(f"  {text}")
@@ -123,6 +130,13 @@ class TestRestaurantScenario(unittest.TestCase):
         print("\nscenario decisions:")
         for text, decision in decisions:
             print(f"  answer={decision.answer!s:<5} p={decision.confidence:.2f} reason={decision.reason:<10} {text}")
+
+        actual = ["ai" if decision.answer else decision.reason for _, decision in decisions]
+        self.assertEqual(
+            actual,
+            ["background", "ai", "other", "other", "background", "ai"],
+            "the six expected utterances and switch points should be heard in order",
+        )
 
         answered = [(text, decision) for text, decision in decisions if decision.answer]
         self.assertEqual(len(answered), 2, f"expected two AI-directed answers, got {answered}")
@@ -165,6 +179,37 @@ class TestRestaurantScenario(unittest.TestCase):
             any("game" in text.lower() or "kitchen" in text.lower() for text in background_texts),
             background_texts,
         )
+
+    @unittest.skipUnless(find_spec("fastembed") is not None, "fastembed is not installed")
+    def test_fastembed_gate_on_the_same_transcripts(self):
+        try:
+            embedder = FastEmbedder("BAAI/bge-small-en-v1.5")
+        except Exception as e:  # noqa: BLE001 - a missing cached model should skip, not fail the suite
+            self.skipTest(f"fastembed model unavailable: {e}")
+
+        model = AddresseeModel(embedder, examples_path=None)
+        for text, addressed in [
+            ("Add two burgers for table four.", True),
+            ("Would you like fries with that?", False),
+            ("Yes, and a coke.", False),
+            ("Would you like the salmon?", False),
+            ("No, just water.", False),
+            ("The kitchen is slammed tonight.", False),
+            ("What's the total for table four?", True),
+        ]:
+            model.learn(text, addressed)
+
+        gate = AddresseeGate(model, defer_ms=400, speak_threshold=0.70, silence_threshold=0.35)
+        self.addCleanup(gate.close)
+        decisions = [(text, gate.evaluate(text)) for text in self._transcripts()]
+        answered = [(text, decision) for text, decision in decisions if decision.answer]
+        self.assertEqual(len(answered), 2, answered)
+        answered_text = " ".join(text.lower() for text, _ in answered)
+        self.assertIn("add", answered_text)
+        self.assertIn("total", answered_text)
+        for text, decision in decisions:
+            if "fries" in text.lower() or "salmon" in text.lower():
+                self.assertFalse(decision.answer)
 
 
 if __name__ == "__main__":
