@@ -48,6 +48,8 @@
   scorer now uses a separate fallback threshold instead of the primary model's
   scale, and malformed model responses trigger the fallback rather than being
   treated as “unrelated”.
+- The personal addressee model lets a very close learned example decide
+  directly instead of diluting it across several less relevant neighbours.
 - The follow-up heuristic is a replaceable `FollowUpPolicy`; the default is
   still keywords plus the assistant-question rule.
 - Scoring runs outside the buffer lock. `reset()` and `close()` no longer wait

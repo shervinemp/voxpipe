@@ -44,6 +44,7 @@ _POSITIVE_CORRECTIONS = frozenset(
         "i meant you",
     }
 )
+_NEAREST_THRESHOLD = 0.90
 
 _AI_RE = re.compile(
     r"^(add|note|check|remove|undo|cancel|print|send|tell|remind|set|show|find|look up|calculate)\b"
@@ -139,14 +140,22 @@ class AddresseeModel:
             if target is None or vectors is None:
                 return heuristic
             similarities = vectors @ target[0]
-            count = min(self.k_neighbors, len(similarities))
-            best = np.argsort(similarities)[-count:]
-            weights = np.maximum(0.0, similarities[best])
-            total = float(weights.sum())
-            if total <= 0.0:
-                return heuristic
-            positive = float(sum(weight for weight, index in zip(weights, best) if self._examples[index].addressed))
-            knn = (positive + 1.0) / (total + 2.0)  # Laplace smoothing
+            nearest = int(np.argmax(similarities))
+            if float(similarities[nearest]) >= _NEAREST_THRESHOLD:
+                # A personal example this close should decide the case directly,
+                # rather than being diluted by five less relevant neighbours.
+                knn = 1.0 if self._examples[nearest].addressed else 0.0
+            else:
+                count = min(self.k_neighbors, len(similarities))
+                best = np.argsort(similarities)[-count:]
+                weights = np.maximum(0.0, similarities[best])
+                total = float(weights.sum())
+                if total <= 0.0:
+                    return heuristic
+                positive = float(
+                    sum(weight for weight, index in zip(weights, best) if self._examples[index].addressed)
+                )
+                knn = (positive + 1.0) / (total + 2.0)  # Laplace smoothing
             return max(0.0, min(1.0, 0.7 * knn + 0.3 * heuristic))
 
     def close(self) -> None:
